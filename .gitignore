@@ -1,7 +1,5 @@
 node_modules/
 build/
-!build/icon.icns
-!build/icon.png
 dist/
 release/
 coverage/

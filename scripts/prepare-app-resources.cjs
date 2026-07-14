@@ -67,8 +67,6 @@ mustExist(path.join(root, "dist", "server.cjs"), "dist/server.cjs");
 mustExist(path.join(root, "dist", "index.html"), "dist/index.html");
 mustExist(siteSrc, "venv site-packages");
 mustExist(path.join(qwenSrc, "tts_server.py"), "tts_server.py");
-mustExist(path.join(qwenSrc, "models"), "models");
-
 // Frontend + bundled server
 fs.cpSync(path.join(root, "dist"), path.join(out, "dist"), { recursive: true });
 
@@ -78,17 +76,14 @@ const frameworkDst = path.join(out, "python", "Python.framework");
 console.log("[prepare-app-resources] Copying Python.framework from", frameworkSrc);
 fs.cpSync(frameworkSrc, frameworkDst, { recursive: true, dereference: true });
 
-// Qwen app code + models + site-packages (no fragile venv symlinks)
+// Qwen runtime (models are downloaded on first launch into userData)
 const qwenDst = path.join(out, "qwen3-tts-apple-silicon");
 fs.mkdirSync(qwenDst, { recursive: true });
 for (const file of ["tts_server.py", "requirements.txt", "main.py", "README.md"]) {
   const src = path.join(qwenSrc, file);
   if (fs.existsSync(src)) fs.copyFileSync(src, path.join(qwenDst, file));
 }
-console.log("[prepare-app-resources] Copying models...");
-fs.cpSync(path.join(qwenSrc, "models"), path.join(qwenDst, "models"), {
-  recursive: true,
-});
+console.log("[prepare-app-resources] Skipping models/ (downloaded on first launch)");
 console.log("[prepare-app-resources] Copying site-packages...");
 copyFiltered(siteSrc, path.join(qwenDst, "site-packages"));
 

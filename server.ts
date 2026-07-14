@@ -9,6 +9,14 @@ import * as lamejs from "@breezystack/lamejs";
 import { PDFDocument } from "pdf-lib";
 // @ts-ignore
 import { EPub } from "epub2";
+import {
+  cancelModelDownload,
+  deleteModels,
+  downloadMissingModels,
+  getModelsStatus as getModelsStatusFromManager,
+  isModelDownloadActive,
+  resolveModelsDir,
+} from "./modelManager";
 
 /** Packaged app root (Resources/aura) or project cwd. */
 const AURA_ROOT = process.env.AURA_ROOT
@@ -64,12 +72,14 @@ function resolveQwenLaunch(): {
   const bundledPython = path.join(pythonHome, "bin", "python3.12");
   const venvPython = path.join(qwenDir, ".venv", "bin", "python");
 
+  const modelsDir = resolveModelsDir(AURA_ROOT, AURA_DATA_DIR);
   const baseEnv: NodeJS.ProcessEnv = {
     ...process.env,
     QWEN_TTS_PORT: String(TTS_PORT),
     TTS_PORT: String(TTS_PORT),
     QWEN_TTS_PRELOAD: process.env.QWEN_TTS_PRELOAD ?? "0",
     VOICE_PREVIEW_DIR: previewDir,
+    QWEN_TTS_MODELS_DIR: modelsDir,
   };
 
   // Packaged layout: framework python + copied site-packages (relocatable).
@@ -102,6 +112,10 @@ function resolveQwenLaunch(): {
   );
 }
 
+function getModelsStatus() {
+  return getModelsStatusFromManager(AURA_ROOT, AURA_DATA_DIR);
+}
+
 async function isTtsProcessReady(): Promise<boolean> {
   try {
     const ttsRes = await fetch(`${TTS_URL}/health`);
@@ -123,6 +137,13 @@ async function ensureTtsRunning(timeoutMs = 90_000): Promise<void> {
 
   ttsStartPromise = (async () => {
     if (await isTtsProcessReady()) return;
+
+    const status = getModelsStatus();
+    if (!status.ready) {
+      throw new Error(
+        "Modelos TTS ainda não foram baixados. Abra a tela de instalação dos modelos."
+      );
+    }
 
     const launch = resolveQwenLaunch();
 
@@ -980,10 +1001,100 @@ app.post("/api/voice-preview", async (req, res) => {
   }
 });
 
+// TTS model install status (Base + CustomVoice)
+app.get("/api/models/status", (_req, res) => {
+  try {
+    res.json(getModelsStatus());
+  } catch (err: any) {
+    res.status(500).json({ ready: false, error: err?.message || String(err) });
+  }
+});
+
+// Download missing models; streams NDJSON progress events (TS/fetch, not Python)
+app.post("/api/models/download", async (req, res) => {
+  if (isModelDownloadActive()) {
+    res.status(409).json({ error: "Download já em andamento." });
+    return;
+  }
+
+  const status = getModelsStatus();
+  if (status.ready) {
+    res.json({ ready: true, skipped: true, modelsDir: status.modelsDir });
+    return;
+  }
+
+  res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  if (typeof (res as any).flushHeaders === "function") {
+    (res as any).flushHeaders();
+  }
+
+  const writeEvent = (payload: Record<string, unknown>) => {
+    if (!res.writableEnded) {
+      res.write(`${JSON.stringify(payload)}\n`);
+    }
+  };
+
+  try {
+    await downloadMissingModels({
+      auraRoot: AURA_ROOT,
+      auraDataDir: AURA_DATA_DIR,
+      onEvent: writeEvent,
+    });
+  } catch (err: any) {
+    if (!res.writableEnded) {
+      writeEvent({
+        type: "error",
+        message: err?.message || String(err),
+        ready: getModelsStatus().ready,
+      });
+    }
+  } finally {
+    if (!res.writableEnded) res.end();
+  }
+});
+
+app.post("/api/models/download/cancel", (_req, res) => {
+  const cancelled = cancelModelDownload();
+  res.json({
+    success: cancelled,
+    message: cancelled ? "Cancelamento solicitado." : "Nenhum download em andamento.",
+  });
+});
+
+app.delete("/api/models", async (req, res) => {
+  try {
+    if (isModelDownloadActive()) {
+      return res.status(409).json({ error: "Cancele o download antes de excluir modelos." });
+    }
+    // Free GPU/RAM if TTS was using the weights
+    stopManagedTts();
+    await unloadTtsModel().catch(() => undefined);
+
+    const idsRaw = req.query.id;
+    const ids = Array.isArray(idsRaw)
+      ? idsRaw.map(String)
+      : typeof idsRaw === "string" && idsRaw.length
+        ? idsRaw.split(",").map((s) => s.trim()).filter(Boolean)
+        : undefined;
+
+    const result = deleteModels(AURA_ROOT, AURA_DATA_DIR, ids);
+    res.json({
+      success: true,
+      ...result,
+      status: getModelsStatus(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
 // Health Check API
 app.get("/api/health", async (req, res) => {
   let ttsReady = false;
   let modelLoaded = false;
+  const models = getModelsStatus();
   try {
     const ttsRes = await fetch(`${TTS_URL}/health`);
     if (ttsRes.ok) {
@@ -998,6 +1109,7 @@ app.get("/api/health", async (req, res) => {
   res.json({
     status: "ok",
     time: new Date().toISOString(),
+    models,
     tts: { provider: "qwen3-tts", url: TTS_URL, ready: ttsReady, modelLoaded },
   });
 });

@@ -48,7 +48,7 @@
     "productName": "AuraReader",
     "directories": {
       "output": "release",
-      "buildResources": "build"
+      "buildResources": "assets"
     },
     "files": [
       "electron/**/*",
@@ -59,11 +59,15 @@
       {
         "from": "build/app-resources",
         "to": "aura"
+      },
+      {
+        "from": "assets/icon.png",
+        "to": "icon.png"
       }
     ],
     "mac": {
       "category": "public.app-category.productivity",
-      "icon": "build/icon.icns",
+      "icon": "icon.icns",
       "target": [
         "dir",
         "dmg"

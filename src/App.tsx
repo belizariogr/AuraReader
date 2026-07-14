@@ -60,7 +60,7 @@ function loadSavedVoice(): string {
   return "Vivian";
 }
 
-export default function App() {
+export default function App({ onManageModels }: { onManageModels?: () => void }) {
   // File Upload State
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [fileBase64, setFileBase64] = useState<string>("");
@@ -820,9 +820,14 @@ export default function App() {
               <p className="text-xs text-slate-400">PDF e EPUB em narração natural com IA</p>
             </div>
           </div>
-          <div className="text-xs font-mono text-slate-300 bg-white/5 border border-white/10 px-3 py-1.5 rounded-full">
+          <button
+            type="button"
+            onClick={() => onManageModels?.()}
+            title="Gerenciar modelos TTS"
+            className="text-xs font-mono text-slate-300 bg-white/5 border border-white/10 px-3 py-1.5 rounded-full hover:bg-white/10 hover:text-white hover:border-white/20 transition-colors"
+          >
             Qwen3 TTS · local (Lite)
-          </div>
+          </button>
         </div>
       </header>
 

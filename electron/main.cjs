@@ -219,8 +219,9 @@ function shutdown(code = 0) {
 function appIconPath() {
   const candidates = [
     path.join(process.resourcesPath || "", "icon.png"),
-    path.join(__dirname, "..", "build", "icon.png"),
-    path.join(__dirname, "..", "build", "icon.icns"),
+    path.join(process.resourcesPath || "", "icon.icns"),
+    path.join(__dirname, "..", "assets", "icon.png"),
+    path.join(__dirname, "..", "assets", "icon.icns"),
   ];
   return candidates.find((p) => p && fs.existsSync(p));
 }
@@ -322,6 +323,8 @@ async function startBackend(auraRoot) {
     "Versions",
     "3.12"
   );
+  const modelsDir = path.join(dataDir, "models");
+  fs.mkdirSync(modelsDir, { recursive: true });
 
   const runner = resolveServerRunner(auraRoot);
   spawnInherit(runner.command, runner.args, {
@@ -335,6 +338,7 @@ async function startBackend(auraRoot) {
       AURA_ROOT: auraRoot,
       AURA_DATA_DIR: dataDir,
       AURA_PYTHON_HOME: fs.existsSync(pythonHome) ? pythonHome : "",
+      QWEN_TTS_MODELS_DIR: modelsDir,
       TTS_URL,
       TTS_PORT: String(TTS_PORT),
       PORT: String(APP_PORT),

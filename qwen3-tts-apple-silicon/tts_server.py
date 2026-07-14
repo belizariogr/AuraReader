@@ -35,10 +35,12 @@ PORT = int(os.environ.get("QWEN_TTS_PORT", os.environ.get("DIA_PORT", "8765")))
 HOST = os.environ.get("QWEN_TTS_HOST", "127.0.0.1")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
-MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
-
 BASE_MODEL_FOLDER = "Qwen3-TTS-12Hz-0.6B-Base-8bit"
 CUSTOM_MODEL_FOLDER = "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit"
+MODELS_DIR = os.environ.get(
+    "QWEN_TTS_MODELS_DIR",
+    os.path.join(SCRIPT_DIR, "models"),
+)
 
 
 def resolve_default_model_folder() -> str:
