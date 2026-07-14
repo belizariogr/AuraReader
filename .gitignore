@@ -1,0 +1,17 @@
+node_modules/
+build/
+dist/
+release/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+cache/
+qwen3-tts-apple-silicon/.venv/
+qwen3-tts-apple-silicon/models/
+qwen3-tts-apple-silicon/outputs/
+qwen3-tts-apple-silicon/__pycache__/
+qwen3-tts-apple-silicon/**/__pycache__/
+*.pyc
+.venv/

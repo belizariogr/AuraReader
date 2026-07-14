@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+html {
+  overflow-x: clip;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  background-color: #020617; /* slate-950 */
+}
+
+body {
+  margin: 0;
+}
