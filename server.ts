@@ -3,7 +3,6 @@ import path from "path";
 import fs from "fs";
 import os from "os";
 import { spawn, type ChildProcess } from "child_process";
-import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import * as lamejs from "@breezystack/lamejs";
@@ -11,6 +10,17 @@ import { PDFDocument } from "pdf-lib";
 // @ts-ignore
 import { EPub } from "epub2";
 
+/** Packaged app root (Resources/aura) or project cwd. */
+const AURA_ROOT = process.env.AURA_ROOT
+  ? path.resolve(process.env.AURA_ROOT)
+  : process.cwd();
+/** Writable data (cache, .env) — userData when packaged, else project root. */
+const AURA_DATA_DIR = process.env.AURA_DATA_DIR
+  ? path.resolve(process.env.AURA_DATA_DIR)
+  : AURA_ROOT;
+
+dotenv.config({ path: path.join(AURA_DATA_DIR, ".env") });
+dotenv.config({ path: path.join(AURA_ROOT, ".env") });
 dotenv.config();
 
 const app = express();
@@ -39,6 +49,59 @@ const TTS_LANGUAGE = process.env.QWEN_TTS_LANGUAGE || "Auto";
 let ttsChild: ChildProcess | null = null;
 let ttsStartPromise: Promise<void> | null = null;
 
+function resolveQwenLaunch(): {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+} {
+  const qwenDir = path.join(AURA_ROOT, "qwen3-tts-apple-silicon");
+  const previewDir = path.join(AURA_DATA_DIR, "cache", "voice-previews");
+  const sitePackages = path.join(qwenDir, "site-packages");
+  const pythonHome =
+    process.env.AURA_PYTHON_HOME ||
+    path.join(AURA_ROOT, "python", "Python.framework", "Versions", "3.12");
+  const bundledPython = path.join(pythonHome, "bin", "python3.12");
+  const venvPython = path.join(qwenDir, ".venv", "bin", "python");
+
+  const baseEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    QWEN_TTS_PORT: String(TTS_PORT),
+    TTS_PORT: String(TTS_PORT),
+    QWEN_TTS_PRELOAD: process.env.QWEN_TTS_PRELOAD ?? "0",
+    VOICE_PREVIEW_DIR: previewDir,
+  };
+
+  // Packaged layout: framework python + copied site-packages (relocatable).
+  if (fs.existsSync(bundledPython) && fs.existsSync(sitePackages)) {
+    return {
+      command: bundledPython,
+      args: ["tts_server.py", "--host", "127.0.0.1", "--port", String(TTS_PORT)],
+      cwd: qwenDir,
+      env: {
+        ...baseEnv,
+        PYTHONHOME: pythonHome,
+        PYTHONPATH: sitePackages,
+        PYTHONNOUSERSITE: "1",
+      },
+    };
+  }
+
+  // Dev / checkout layout: project venv.
+  if (fs.existsSync(venvPython)) {
+    return {
+      command: venvPython,
+      args: ["tts_server.py", "--host", "127.0.0.1", "--port", String(TTS_PORT)],
+      cwd: qwenDir,
+      env: baseEnv,
+    };
+  }
+
+  throw new Error(
+    `Qwen TTS runtime não encontrado em ${qwenDir} (site-packages ou .venv).`
+  );
+}
+
 async function isTtsProcessReady(): Promise<boolean> {
   try {
     const ttsRes = await fetch(`${TTS_URL}/health`);
@@ -61,31 +124,15 @@ async function ensureTtsRunning(timeoutMs = 90_000): Promise<void> {
   ttsStartPromise = (async () => {
     if (await isTtsProcessReady()) return;
 
-    const qwenDir = path.join(process.cwd(), "qwen3-tts-apple-silicon");
-    const qwenPython = path.join(qwenDir, ".venv", "bin", "python");
-    if (!fs.existsSync(qwenPython)) {
-      throw new Error(
-        `Python venv do Qwen TTS não encontrado em ${qwenPython}. Configure o venv conforme o README.`
-      );
-    }
+    const launch = resolveQwenLaunch();
 
     if (!ttsChild || ttsChild.killed || ttsChild.exitCode !== null) {
       console.log(`[TTS] Starting Qwen3 TTS lazily on port ${TTS_PORT}...`);
-      ttsChild = spawn(
-        qwenPython,
-        ["tts_server.py", "--host", "127.0.0.1", "--port", String(TTS_PORT)],
-        {
-          cwd: qwenDir,
-          env: {
-            ...process.env,
-            QWEN_TTS_PORT: String(TTS_PORT),
-            TTS_PORT: String(TTS_PORT),
-            // Keep process boot fast; weights load on first /tts.
-            QWEN_TTS_PRELOAD: process.env.QWEN_TTS_PRELOAD ?? "0",
-          },
-          stdio: "inherit",
-        }
-      );
+      ttsChild = spawn(launch.command, launch.args, {
+        cwd: launch.cwd,
+        env: launch.env,
+        stdio: "inherit",
+      });
       ttsChild.on("exit", (code, signal) => {
         console.warn(`[TTS] qwen-tts exited (code=${code}, signal=${signal})`);
         ttsChild = null;
@@ -736,7 +783,7 @@ const VOICE_PREVIEW_TEXT =
 /** Bump when preview text or TTS settings change so old disk samples are ignored. */
 const VOICE_PREVIEW_CACHE_VERSION = process.env.QWEN_TTS_PREVIEW_CACHE_VERSION || "en-v2";
 /** WAV + transcript used as voice-reference (ref_audio / ref_text for ICL). */
-const VOICE_PREVIEW_DIR = path.join(process.cwd(), "cache", "voice-previews");
+const VOICE_PREVIEW_DIR = path.join(AURA_DATA_DIR, "cache", "voice-previews");
 /** In-memory WAV previews (base64) layered on disk cache. */
 const voicePreviewCache = new Map<string, string>();
 
@@ -1434,13 +1481,14 @@ app.post("/api/narrate", async (req, res) => {
 // Configure Vite middleware in development or serve static built files in production
 async function start() {
   if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), "dist");
+    const distPath = path.join(AURA_ROOT, "dist");
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));

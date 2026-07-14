@@ -1,12 +1,13 @@
 /**
  * Electron main process for AuraReader.
- * Starts Express quickly and opens a native window; Qwen TTS starts on first use.
+ * Packaged builds use Resources/aura (self-contained). Dev uses the project tree.
  */
 const { app, BrowserWindow, dialog, Menu, shell } = require("electron");
 const { spawn, execSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const http = require("http");
+const os = require("os");
 
 const APP_PORT = process.env.PORT || "3000";
 const APP_URL = `http://127.0.0.1:${APP_PORT}`;
@@ -17,35 +18,78 @@ const children = [];
 let shuttingDown = false;
 let mainWindow = null;
 
-function resolveRoot() {
-  if (process.env.AURA_ROOT) {
-    return path.resolve(process.env.AURA_ROOT);
-  }
+function log(...args) {
+  console.log("[electron]", ...args);
+}
 
-  const fromMain = path.resolve(__dirname, "..");
-  if (hasProjectRoot(fromMain)) {
-    return fromMain;
-  }
+function hasBundledAura(dir) {
+  return (
+    fs.existsSync(path.join(dir, "dist", "server.cjs")) &&
+    fs.existsSync(path.join(dir, "dist", "index.html")) &&
+    fs.existsSync(path.join(dir, "qwen3-tts-apple-silicon", "tts_server.py")) &&
+    (fs.existsSync(path.join(dir, "qwen3-tts-apple-silicon", "site-packages")) ||
+      fs.existsSync(
+        path.join(dir, "qwen3-tts-apple-silicon", ".venv", "bin", "python")
+      ))
+  );
+}
 
-  if (app.isPackaged) {
-    let dir = path.dirname(process.execPath);
-    for (let i = 0; i < 8; i++) {
-      dir = path.dirname(dir);
-      if (hasProjectRoot(dir)) {
-        return dir;
+function hasProjectRoot(dir) {
+  if (!dir || dir.includes(".asar")) return false;
+  return fs.existsSync(
+    path.join(dir, "qwen3-tts-apple-silicon", ".venv", "bin", "python")
+  );
+}
+
+function seedDataFromBundle(auraRoot, dataDir) {
+  const seed = path.join(auraRoot, "cache", "voice-previews");
+  const dest = path.join(dataDir, "cache", "voice-previews");
+  if (fs.existsSync(seed)) {
+    fs.mkdirSync(dest, { recursive: true });
+    for (const name of fs.readdirSync(seed)) {
+      const from = path.join(seed, name);
+      const to = path.join(dest, name);
+      if (!fs.existsSync(to)) {
+        fs.copyFileSync(from, to);
       }
     }
   }
 
-  return fromMain;
+  const envSeed = path.join(auraRoot, ".env");
+  const envDest = path.join(dataDir, ".env");
+  if (fs.existsSync(envSeed) && !fs.existsSync(envDest)) {
+    fs.copyFileSync(envSeed, envDest);
+  }
 }
 
-function hasProjectRoot(dir) {
-  return fs.existsSync(path.join(dir, "qwen3-tts-apple-silicon", ".venv", "bin", "python"));
+function resolveAuraRoot() {
+  if (process.env.AURA_ROOT) {
+    return path.resolve(process.env.AURA_ROOT);
+  }
+
+  if (app.isPackaged) {
+    const bundled = path.join(process.resourcesPath, "aura");
+    if (hasBundledAura(bundled)) return bundled;
+    throw new Error(
+      `Runtime embutido não encontrado em:\n${bundled}\n\nGere o app com: bun run dist:mac`
+    );
+  }
+
+  const fromMain = path.resolve(__dirname, "..");
+  if (hasBundledAura(fromMain) || hasProjectRoot(fromMain)) return fromMain;
+
+  throw new Error("Pasta do projeto AuraReader não encontrada.");
 }
 
-function log(...args) {
-  console.log("[electron]", ...args);
+function guiPath() {
+  const extras = [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    path.join(os.homedir(), ".bun", "bin"),
+    path.join(os.homedir(), ".local", "bin"),
+  ];
+  const current = process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin";
+  return [...extras, current].filter(Boolean).join(":");
 }
 
 function spawnInherit(command, args, { cwd, env, name }) {
@@ -108,31 +152,51 @@ function waitForUrl(url, timeoutMs, label) {
   });
 }
 
-function resolveNodeRunner(root) {
+function resolveServerRunner(auraRoot) {
+  const serverJs = path.join(auraRoot, "dist", "server.cjs");
+
+  // Prefer Electron-as-Node so the .app does not depend on system bun/node.
+  if (app.isPackaged || process.env.AURA_USE_ELECTRON_NODE === "1") {
+    return {
+      command: process.execPath,
+      args: [serverJs],
+      envExtra: { ELECTRON_RUN_AS_NODE: "1" },
+    };
+  }
+
+  const pathEnv = guiPath();
+  const candidates = [
+    "/opt/homebrew/bin/bun",
+    path.join(os.homedir(), ".bun", "bin", "bun"),
+    "/usr/local/bin/bun",
+    path.join(auraRoot, "node_modules", ".bin", "bun"),
+    "/opt/homebrew/bin/node",
+    "/usr/local/bin/node",
+  ];
+  for (const command of candidates) {
+    if (fs.existsSync(command)) {
+      return { command, args: [serverJs], envExtra: { PATH: pathEnv } };
+    }
+  }
+
   try {
-    const bun = execSync("which bun", { encoding: "utf8" }).trim();
+    const bun = execSync("which bun", {
+      encoding: "utf8",
+      env: { ...process.env, PATH: pathEnv },
+    }).trim();
     if (bun && fs.existsSync(bun)) {
-      return { command: bun, args: ["dist/server.cjs"] };
+      return { command: bun, args: [serverJs], envExtra: { PATH: pathEnv } };
     }
   } catch {
     // fall through
   }
 
-  try {
-    const node = execSync("which node", { encoding: "utf8" }).trim();
-    if (node && fs.existsSync(node)) {
-      return { command: node, args: ["dist/server.cjs"] };
-    }
-  } catch {
-    // fall through
-  }
-
-  const bunLocal = path.join(root, "node_modules", ".bin", "bun");
-  if (fs.existsSync(bunLocal)) {
-    return { command: bunLocal, args: ["dist/server.cjs"] };
-  }
-
-  throw new Error("Neither bun nor node found on PATH. Install Node.js or Bun to run AuraReader.");
+  // Last resort: Electron as Node even in dev
+  return {
+    command: process.execPath,
+    args: [serverJs],
+    envExtra: { ELECTRON_RUN_AS_NODE: "1", PATH: pathEnv },
+  };
 }
 
 function shutdown(code = 0) {
@@ -242,34 +306,40 @@ function buildMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
-async function startBackend(root) {
-  const qwenPython = path.join(root, "qwen3-tts-apple-silicon", ".venv", "bin", "python");
-  const serverJs = path.join(root, "dist", "server.cjs");
-  const distIndex = path.join(root, "dist", "index.html");
-
-  if (!fs.existsSync(qwenPython)) {
-    throw new Error(
-      `Python venv não encontrado em:\n${qwenPython}\n\nDefina AURA_ROOT para a pasta do projeto AuraReader (com qwen3-tts-apple-silicon/.venv).`
-    );
-  }
-  if (!fs.existsSync(serverJs) || !fs.existsSync(distIndex)) {
-    throw new Error(
-      `Build de produção ausente em ${path.join(root, "dist")}.\nRode: bun run build`
-    );
+async function startBackend(auraRoot) {
+  if (!hasBundledAura(auraRoot) && !hasProjectRoot(auraRoot)) {
+    throw new Error(`Runtime incompleto em:\n${auraRoot}`);
   }
 
-  // TTS starts lazily inside the Express server on first narrate/preview.
-  const runner = resolveNodeRunner(root);
+  const dataDir = app.getPath("userData");
+  fs.mkdirSync(path.join(dataDir, "cache", "voice-previews"), { recursive: true });
+  seedDataFromBundle(auraRoot, dataDir);
+
+  const pythonHome = path.join(
+    auraRoot,
+    "python",
+    "Python.framework",
+    "Versions",
+    "3.12"
+  );
+
+  const runner = resolveServerRunner(auraRoot);
   spawnInherit(runner.command, runner.args, {
-    cwd: root,
+    cwd: auraRoot,
     name: "aura-app",
     env: {
       ...process.env,
+      PATH: guiPath(),
+      ...(runner.envExtra || {}),
       NODE_ENV: "production",
+      AURA_ROOT: auraRoot,
+      AURA_DATA_DIR: dataDir,
+      AURA_PYTHON_HOME: fs.existsSync(pythonHome) ? pythonHome : "",
       TTS_URL,
       TTS_PORT: String(TTS_PORT),
       PORT: String(APP_PORT),
       QWEN_TTS_PRELOAD: process.env.QWEN_TTS_PRELOAD ?? "0",
+      VOICE_PREVIEW_DIR: path.join(dataDir, "cache", "voice-previews"),
     },
   });
 
@@ -279,11 +349,10 @@ async function startBackend(root) {
 app.whenReady().then(async () => {
   buildMenu();
 
-  const root = resolveRoot();
-  log(`project root: ${root}`);
-
   try {
-    await startBackend(root);
+    const auraRoot = resolveAuraRoot();
+    log(`aura root: ${auraRoot}`);
+    await startBackend(auraRoot);
     createWindow();
   } catch (err) {
     console.error("[electron] failed to start:", err);
