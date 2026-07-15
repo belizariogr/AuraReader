@@ -176,6 +176,16 @@ export default function ModelSetup({
     kokoroAccelProp
   );
   const [switching, setSwitching] = useState(false);
+  const [warming, setWarming] = useState(false);
+  const [warmup, setWarmup] = useState<{
+    running?: boolean;
+    done?: boolean;
+    current?: number;
+    total?: number;
+    phase?: string;
+    error?: string | null;
+    elapsedMs?: number;
+  } | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressState>(emptyProgress);
   const [overall, setOverall] = useState({ current: 0, total: models.length });
@@ -305,6 +315,41 @@ export default function ModelSetup({
       setError(err?.message || String(err));
     } finally {
       setSwitching(false);
+    }
+  }
+
+  async function startKokoroWarmup() {
+    if (warming || downloading || switching) return;
+    if (engine !== "kokoro" || kokoroDevice !== "gpu") return;
+    setWarming(true);
+    setError(null);
+    setWarmup({ running: true, done: false, current: 0, total: 6, phase: "Iniciando…" });
+    try {
+      const res = await fetch("/api/tts/kokoro-warmup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+      setWarmup(body);
+
+      // Poll until compile finishes (can take many minutes).
+      const started = Date.now();
+      while (Date.now() - started < 45 * 60_000) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const st = await fetch("/api/tts/kokoro-warmup");
+        const status = await st.json();
+        if (!st.ok) throw new Error(status.error || `HTTP ${st.status}`);
+        setWarmup(status);
+        if (status.error) throw new Error(status.error);
+        if (status.done) break;
+        if (!status.running && status.current > 0) break;
+      }
+    } catch (err: any) {
+      setError(err?.message || String(err));
+    } finally {
+      setWarming(false);
     }
   }
 
@@ -666,9 +711,49 @@ export default function ModelSetup({
                 </div>
               )}
               {kokoroDevice === "gpu" && kokoroAccel?.gpuReady && (
-                <p className="text-[11px] text-emerald-300/90 leading-relaxed">
-                  Runtime GPU pronto ({kokoroAccel.availableProviders.filter((p) => p !== "CPUExecutionProvider").join(", ") || "GPU"}).
-                </p>
+                <div className="space-y-2">
+                  <p className="text-[11px] text-emerald-300/90 leading-relaxed">
+                    Runtime GPU pronto (
+                    {kokoroAccel.availableProviders
+                      .filter((p) => p !== "CPUExecutionProvider")
+                      .join(", ") || "GPU"}
+                    ).
+                  </p>
+                  <button
+                    type="button"
+                    disabled={warming || downloading || switching}
+                    onClick={() => startKokoroWarmup()}
+                    className="w-full inline-flex items-center justify-center gap-2 rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-100 hover:bg-emerald-500/20 disabled:opacity-50 transition-colors"
+                  >
+                    {warming ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        Aquecendo GPU…
+                      </>
+                    ) : (
+                      "Aquecer GPU (pré-compilar)"
+                    )}
+                  </button>
+                  <p className="text-[11px] text-slate-500 leading-relaxed">
+                    Compila vários tamanhos de texto com todas as cores da CPU (
+                    <span className="font-mono">MIGRAPHX_GPU_COMPILE_PARALLEL</span>
+                    ). Pode levar vários minutos na 1ª vez; depois a narração fica bem mais rápida.
+                  </p>
+                  {(warming || warmup) && (
+                    <div className="rounded-xl border border-white/10 bg-slate-950/50 px-3 py-2 text-[11px] text-slate-300 space-y-1">
+                      <p>{warmup?.phase || "…"}</p>
+                      {typeof warmup?.current === "number" && typeof warmup?.total === "number" && warmup.total > 0 && (
+                        <p className="font-mono text-slate-400">
+                          {warmup.current}/{warmup.total}
+                          {warmup.elapsedMs
+                            ? ` · ${(warmup.elapsedMs / 1000).toFixed(0)}s`
+                            : ""}
+                          {warmup.done ? " · pronto" : ""}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           )}

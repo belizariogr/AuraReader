@@ -155,6 +155,10 @@ function resolveKokoroLaunch(): {
     // MIGraphX libs live under /opt/rocm/lib — ensure the loader can find them.
     const libPath = kokoroGpuLibraryPath();
     if (libPath) baseEnv.LD_LIBRARY_PATH = libPath;
+    // Parallel MIGraphX GPU kernel compile across CPU cores.
+    if (!baseEnv.MIGRAPHX_GPU_COMPILE_PARALLEL) {
+      baseEnv.MIGRAPHX_GPU_COMPILE_PARALLEL = String(Math.max(1, os.cpus().length));
+    }
   }
 
   const pythonHome =
@@ -1344,6 +1348,63 @@ app.post("/api/tts-engine", async (req, res) => {
       kokoroAccel: status.kokoroAccel,
       restarted: needRestart,
     });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
+/** Precompile Kokoro MIGraphX graphs for several input lengths (GPU only). */
+app.get("/api/tts/kokoro-warmup", async (_req, res) => {
+  try {
+    if (activeTtsEngine() !== "kokoro") {
+      return res.json({
+        running: false,
+        done: false,
+        skipped: true,
+        message: "Motor ativo não é Kokoro.",
+      });
+    }
+    if (!(await isTtsProcessReady("kokoro"))) {
+      return res.json({
+        running: false,
+        done: false,
+        serverReady: false,
+        phase: "Servidor Kokoro ainda não iniciado.",
+      });
+    }
+    const ttsRes = await fetch(`${TTS_URL}/tts/warmup`);
+    const body = await ttsRes.json();
+    if (!ttsRes.ok) {
+      return res.status(ttsRes.status).json(body);
+    }
+    res.json(body);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
+app.post("/api/tts/kokoro-warmup", async (req, res) => {
+  try {
+    if (activeTtsEngine() !== "kokoro") {
+      return res.status(400).json({ error: "Selecione o motor Kokoro antes de aquecer a GPU." });
+    }
+    if (readKokoroDevice(AURA_DATA_DIR) !== "gpu") {
+      return res.status(400).json({
+        error: "Warm-up só se aplica com Aceleração Kokoro = GPU.",
+      });
+    }
+    // Compiles can take many minutes — allow a long client wait if they poll status instead.
+    await ensureTtsRunning(120_000);
+    const ttsRes = await fetch(`${TTS_URL}/tts/warmup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ voice: req.body?.voice || undefined }),
+    });
+    const body = await ttsRes.json();
+    if (!ttsRes.ok) {
+      return res.status(ttsRes.status).json(body);
+    }
+    res.json(body);
   } catch (err: any) {
     res.status(500).json({ error: err?.message || String(err) });
   }

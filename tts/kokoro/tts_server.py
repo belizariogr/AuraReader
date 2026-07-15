@@ -15,6 +15,7 @@ import argparse
 import base64
 import os
 import threading
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -80,6 +81,58 @@ _active_providers: list[str] = []
 _model_lock = threading.Lock()
 _cancel_jobs: set[str] = set()
 _cancel_lock = threading.Lock()
+_warmup_lock = threading.Lock()
+_warmup_state: dict[str, Any] = {
+    "running": False,
+    "done": False,
+    "current": 0,
+    "total": 0,
+    "phase": "",
+    "steps": [],
+    "error": None,
+    "elapsedMs": 0,
+}
+
+# English snippets of increasing length → different ONNX token shapes for MIGraphX cache.
+_WARMUP_TEXTS = [
+    "Hi.",
+    "Hello there, how are you today?",
+    (
+        "The quick brown fox jumps over the lazy dog near the river bank "
+        "while birds sing in the morning light."
+    ),
+    (
+        "Once upon a time in a quiet town by the sea, a young reader opened a book "
+        "and heard every page spoken aloud with care, patience, and a steady voice "
+        "that carried through the evening air."
+    ),
+    (
+        "Chapter one begins with a long stretch of narrative prose intended to exercise "
+        "the text to speech pipeline across a broader phoneme window. We mention rivers, "
+        "mountains, markets, libraries, and distant cities so the model sees varied "
+        "sounds. The goal is simply to precompile common input lengths for the GPU graph "
+        "so later narration feels responsive instead of stuck on Model Compile Begin."
+    ),
+    (
+        "In the second half of this longer warm-up paragraph we keep adding clauses so "
+        "the tokenizer produces a denser sequence. Names like Michael, Sarah, Bella, and "
+        "Adam appear alongside places such as London, Boston, and Kyoto. Numbers one two "
+        "three four five six seven eight nine ten help fill the remaining room without "
+        "needing meaning. This should cover chunk sizes typical of AuraReader narration."
+    ),
+]
+
+
+def _ensure_compile_parallel_env() -> None:
+    """Use all CPU cores for MIGraphX GPU code compilation when unset."""
+    if os.environ.get("MIGRAPHX_GPU_COMPILE_PARALLEL"):
+        return
+    try:
+        n = os.cpu_count() or 4
+    except Exception:
+        n = 4
+    os.environ["MIGRAPHX_GPU_COMPILE_PARALLEL"] = str(max(1, n))
+    print(f"[kokoro] MIGRAPHX_GPU_COMPILE_PARALLEL={os.environ['MIGRAPHX_GPU_COMPILE_PARALLEL']}")
 
 
 def onnx_path() -> str:
@@ -162,6 +215,7 @@ def provider_label(providers: list[str]) -> str:
 
 def build_provider_list(providers: list[str]) -> list:
     """ORT providers list; attach MIGraphX cache dir so compile is reused."""
+    _ensure_compile_parallel_env()
     cache_dir = (
         os.environ.get("ORT_MIGRAPHX_MODEL_CACHE_PATH")
         or os.environ.get("ORT_MIGRAPHX_CACHE_PATH")
@@ -189,7 +243,7 @@ def build_provider_list(providers: list[str]) -> list:
             print(
                 "[kokoro] Nota: a 1ª inferência (e cada tamanho de input novo) "
                 "compila o grafo — pode demorar minutos com pouca uso de GPU. "
-                "Depois do cache, fica bem mais rápido. Se continuar lento, use CPU."
+                "Use POST /tts/warmup (ou Aquecer GPU na UI) para pré-compilar."
             )
         else:
             out.append(name)
@@ -292,6 +346,80 @@ class TtsRequest(BaseModel):
     seed: Optional[int] = None
 
 
+def run_warmup(voice: Optional[str] = None) -> dict[str, Any]:
+    """Synthesize several lengths to populate MIGraphX shape caches."""
+    with _warmup_lock:
+        if _warmup_state.get("running"):
+            return {"started": False, "alreadyRunning": True, **warmup_status()}
+        _warmup_state.update(
+            {
+                "running": True,
+                "done": False,
+                "current": 0,
+                "total": len(_WARMUP_TEXTS),
+                "phase": "Carregando modelo…",
+                "steps": [],
+                "error": None,
+                "elapsedMs": 0,
+            }
+        )
+
+    voice_id = resolve_voice(voice)
+    started = time.time()
+
+    def worker() -> None:
+        try:
+            ensure_model()
+            steps: list[dict[str, Any]] = []
+            for i, text in enumerate(_WARMUP_TEXTS):
+                _warmup_state["current"] = i + 1
+                _warmup_state["phase"] = (
+                    f"Compilando tamanho {i + 1}/{len(_WARMUP_TEXTS)} "
+                    f"({len(text)} chars)…"
+                )
+                print(f"[kokoro] warmup {i + 1}/{len(_WARMUP_TEXTS)} chars={len(text)}")
+                t0 = time.time()
+                synthesize(text, voice_id, DEFAULT_SPEED)
+                ms = int((time.time() - t0) * 1000)
+                steps.append({"index": i + 1, "chars": len(text), "ms": ms})
+                _warmup_state["steps"] = list(steps)
+                _warmup_state["elapsedMs"] = int((time.time() - started) * 1000)
+                print(f"[kokoro] warmup step {i + 1} done in {ms}ms")
+            _warmup_state["phase"] = "Concluído"
+            _warmup_state["done"] = True
+            _warmup_state["error"] = None
+        except Exception as exc:
+            _warmup_state["error"] = str(exc)
+            _warmup_state["phase"] = "Falhou"
+            _warmup_state["done"] = False
+            print(f"[kokoro] warmup failed: {exc}")
+        finally:
+            _warmup_state["running"] = False
+            _warmup_state["elapsedMs"] = int((time.time() - started) * 1000)
+
+    threading.Thread(target=worker, name="kokoro-warmup", daemon=True).start()
+    return {"started": True, "alreadyRunning": False, **warmup_status()}
+
+
+def warmup_status() -> dict[str, Any]:
+    return {
+        "running": bool(_warmup_state.get("running")),
+        "done": bool(_warmup_state.get("done")),
+        "current": int(_warmup_state.get("current") or 0),
+        "total": int(_warmup_state.get("total") or 0),
+        "phase": str(_warmup_state.get("phase") or ""),
+        "steps": list(_warmup_state.get("steps") or []),
+        "error": _warmup_state.get("error"),
+        "elapsedMs": int(_warmup_state.get("elapsedMs") or 0),
+        "device": provider_label(_active_providers or resolve_providers()),
+        "onnxProviders": list(_active_providers or []),
+    }
+
+
+class WarmupRequest(BaseModel):
+    voice: Optional[str] = None
+
+
 class CancelRequest(BaseModel):
     jobId: Optional[str] = None
 
@@ -338,7 +466,26 @@ def health() -> dict[str, Any]:
         "speakers": sorted(SPEAKERS),
         "modelDir": MODEL_DIR,
         "assetsReady": assets_ready(),
+        "warmup": warmup_status(),
     }
+
+
+@app.get("/tts/warmup")
+def tts_warmup_get() -> dict[str, Any]:
+    return warmup_status()
+
+
+@app.post("/tts/warmup")
+def tts_warmup_post(req: WarmupRequest = WarmupRequest()) -> dict[str, Any]:
+    device_pref = (os.environ.get("KOKORO_DEVICE") or "gpu").strip().lower()
+    if device_pref == "cpu":
+        return {
+            "started": False,
+            "skipped": True,
+            "message": "Warm-up de GPU ignorado (KOKORO_DEVICE=cpu).",
+            **warmup_status(),
+        }
+    return run_warmup(req.voice)
 
 
 @app.post("/tts")

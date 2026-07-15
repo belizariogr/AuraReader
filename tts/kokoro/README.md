@@ -54,4 +54,15 @@ tts/kokoro/.venv/bin/python tts/kokoro/tts_server.py
 curl -s http://127.0.0.1:8765/health | jq .device,.onnxProviders
 ```
 
-No app, escolha **Kokoro** na tela de modelos (`POST /api/tts-engine`).
+## Warm-up GPU (AMD MIGraphX)
+
+Na UI: **Aquecer GPU (pré-compilar)** — ou:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/tts/kokoro-warmup
+# progresso:
+curl -s http://127.0.0.1:3000/api/tts/kokoro-warmup | jq
+```
+
+Isso sintetiza vários tamanhos de texto para popular o cache `.mxr` e define
+`MIGRAPHX_GPU_COMPILE_PARALLEL` = nº de cores da CPU.
