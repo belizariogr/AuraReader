@@ -205,14 +205,17 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   };
 
   const saveAudioToDownloads = async (
-    audioData: string,
-    fileName: string
+    opts: { audioId?: string; audioData?: string; fileName: string }
   ): Promise<{ fileName: string; path: string } | null> => {
     try {
       const res = await fetch("/api/save-to-downloads", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ audioData, fileName }),
+        body: JSON.stringify({
+          audioId: opts.audioId,
+          audioData: opts.audioData,
+          fileName: opts.fileName,
+        }),
       });
       const payload = await res.json();
       if (!res.ok) {
@@ -684,27 +687,41 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
             setProgressStep("done");
             gotDone = true;
 
-            const binary = atob(payload.audioData);
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) {
-              bytes[i] = binary.charCodeAt(i);
-            }
-            const blob = new Blob([bytes], { type: "audio/mp3" });
-            const url = URL.createObjectURL(blob);
             const pagesNarrated = payload.pagesNarrated || doc.pagesNarrated;
+            let url: string | null = null;
+
+            if (typeof payload.audioUrl === "string" && payload.audioUrl) {
+              const audioRes = await fetch(payload.audioUrl);
+              if (!audioRes.ok) {
+                throw new Error(`${doc.file.name}: falha ao baixar o áudio gerado.`);
+              }
+              const blob = await audioRes.blob();
+              url = URL.createObjectURL(blob);
+            } else if (typeof payload.audioData === "string" && payload.audioData) {
+              // Legacy base64 fallback
+              const binary = atob(payload.audioData);
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              const blob = new Blob([bytes], { type: "audio/mp3" });
+              url = URL.createObjectURL(blob);
+            } else {
+              throw new Error(`${doc.file.name}: resposta sem áudio.`);
+            }
 
             updateDoc(doc.id, {
-              audioBase64: payload.audioData,
-              extractedText: payload.extractedText,
+              audioBase64: null,
+              extractedText: payload.extractedText ?? doc.extractedText,
               pagesNarrated,
               audioUrl: url,
             });
 
-            // Persist immediately to Downloads as each file completes
-            const saved = await saveAudioToDownloads(
-              payload.audioData,
-              buildDownloadFileName(doc, pagesNarrated)
-            );
+            const saved = await saveAudioToDownloads({
+              audioId: typeof payload.audioId === "string" ? payload.audioId : undefined,
+              audioData: typeof payload.audioData === "string" ? payload.audioData : undefined,
+              fileName: buildDownloadFileName(doc, pagesNarrated),
+            });
             if (saved) {
               setLastSavedFileName(saved.fileName);
               setSavedFilesCount((n) => n + 1);

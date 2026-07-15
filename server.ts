@@ -2,6 +2,7 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import os from "os";
+import { once } from "events";
 import { spawn, type ChildProcess } from "child_process";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
@@ -1024,11 +1025,11 @@ function splitTextIntoChunks(text: string, maxChunkLength = 240): string[] {
   return chunks;
 }
 
-// Helper: Convert PCM samples to MP3 using lamejs
+// Helper: Convert PCM samples to MP3 using lamejs (small clips / voice previews)
 function encodePcmToMp3(samples: Int16Array, sampleRate = 24000, kbps = 128): Buffer {
   const mp3encoder = new Mp3Encoder(1, sampleRate, kbps);
   const mp3Data: Buffer[] = [];
-  
+
   const sampleBlockSize = 1152;
   for (let i = 0; i < samples.length; i += sampleBlockSize) {
     const sampleChunk = samples.subarray(i, i + sampleBlockSize);
@@ -1037,13 +1038,89 @@ function encodePcmToMp3(samples: Int16Array, sampleRate = 24000, kbps = 128): Bu
       mp3Data.push(Buffer.from(mp3buf));
     }
   }
-  
+
   const mp3buf = mp3encoder.flush();
   if (mp3buf.length > 0) {
     mp3Data.push(Buffer.from(mp3buf));
   }
-  
+
   return Buffer.concat(mp3Data);
+}
+
+type NarrationArtifact = {
+  mp3Path: string;
+  pcmPath: string;
+  fileName: string;
+  createdAt: number;
+};
+
+const narrationArtifacts = new Map<string, NarrationArtifact>();
+const NARRATION_TMP_DIR = path.join(AURA_DATA_DIR, "tmp", "narration");
+
+function ensureNarrationTmpDir() {
+  fs.mkdirSync(NARRATION_TMP_DIR, { recursive: true });
+}
+
+function newNarrationId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** Stream-encode a PCM s16le file to MP3 on disk (avoids holding the whole book in RAM). */
+async function encodePcmFileToMp3File(
+  pcmPath: string,
+  mp3Path: string,
+  sampleRate = 24000,
+  kbps = 128
+): Promise<number> {
+  const mp3encoder = new Mp3Encoder(1, sampleRate, kbps);
+  const out = fs.createWriteStream(mp3Path);
+  const sampleBlockSize = 1152;
+  const bytesPerBlock = sampleBlockSize * 2;
+  const fd = await fs.promises.open(pcmPath, "r");
+  let written = 0;
+  try {
+    const buf = Buffer.alloc(bytesPerBlock);
+    let position = 0;
+    const stat = await fd.stat();
+    while (position < stat.size) {
+      const { bytesRead } = await fd.read(buf, 0, bytesPerBlock, position);
+      if (bytesRead <= 0) break;
+      position += bytesRead;
+      const usable = bytesRead - (bytesRead % 2);
+      if (usable <= 0) continue;
+      const samples = new Int16Array(usable / 2);
+      for (let i = 0; i < samples.length; i++) {
+        samples[i] = buf.readInt16LE(i * 2);
+      }
+      const mp3buf = mp3encoder.encodeBuffer(samples);
+      if (mp3buf.length > 0) {
+        const chunk = Buffer.from(mp3buf);
+        written += chunk.length;
+        if (!out.write(chunk)) await once(out, "drain");
+      }
+    }
+    const flush = mp3encoder.flush();
+    if (flush.length > 0) {
+      const chunk = Buffer.from(flush);
+      written += chunk.length;
+      if (!out.write(chunk)) await once(out, "drain");
+    }
+  } finally {
+    await fd.close();
+    await new Promise<void>((resolve, reject) => {
+      out.end(() => resolve());
+      out.on("error", reject);
+    });
+  }
+  return written;
+}
+
+async function cleanupNarrationArtifact(id: string) {
+  const art = narrationArtifacts.get(id);
+  if (!art) return;
+  narrationArtifacts.delete(id);
+  await fs.promises.unlink(art.mp3Path).catch(() => undefined);
+  await fs.promises.unlink(art.pcmPath).catch(() => undefined);
 }
 
 const VOICE_PREVIEW_TEXT =
@@ -1581,17 +1658,35 @@ function uniqueDownloadPath(dir: string, baseName: string): string {
 // Save a completed MP3 into the user's Downloads folder as soon as narration finishes
 app.post("/api/save-to-downloads", async (req, res) => {
   try {
-    const { audioData, fileName } = req.body as {
+    const { audioData, audioId, fileName } = req.body as {
       audioData?: string;
+      audioId?: string;
       fileName?: string;
     };
 
-    if (!audioData || typeof audioData !== "string") {
-      return res.status(400).json({ error: "audioData (base64) é obrigatório." });
-    }
-
     const downloadsDir = resolveDownloadsDir();
     const destPath = uniqueDownloadPath(downloadsDir, fileName || "narracao.mp3");
+
+    if (audioId && typeof audioId === "string") {
+      const art = narrationArtifacts.get(audioId);
+      if (!art || !fs.existsSync(art.mp3Path)) {
+        return res.status(404).json({ error: "Áudio não encontrado (expirou ou id inválido)." });
+      }
+      await fs.promises.copyFile(art.mp3Path, destPath);
+      const st = await fs.promises.stat(destPath);
+      console.log(`[SaveDownloads] Copied ${st.size} bytes → ${destPath}`);
+      return res.json({
+        success: true,
+        path: destPath,
+        fileName: path.basename(destPath),
+        directory: downloadsDir,
+      });
+    }
+
+    if (!audioData || typeof audioData !== "string") {
+      return res.status(400).json({ error: "audioId ou audioData (base64) é obrigatório." });
+    }
+
     const buffer = Buffer.from(audioData, "base64");
     if (buffer.length === 0) {
       return res.status(400).json({ error: "Áudio vazio — nada para salvar." });
@@ -1610,6 +1705,33 @@ app.post("/api/save-to-downloads", async (req, res) => {
     return res.status(500).json({
       error: err?.message || "Não foi possível salvar o áudio em Downloads.",
     });
+  }
+});
+
+/** Stream a narration MP3 from disk (no base64 / no full-file RAM load on the SSE path). */
+app.get("/api/narration-audio/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id || "");
+    const art = narrationArtifacts.get(id);
+    if (!art || !fs.existsSync(art.mp3Path)) {
+      return res.status(404).json({ error: "Áudio não encontrado." });
+    }
+    const st = await fs.promises.stat(art.mp3Path);
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Length", String(st.size));
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename="${sanitizeDownloadBaseName(art.fileName)}.mp3"`
+    );
+    const stream = fs.createReadStream(art.mp3Path);
+    stream.on("error", (err) => {
+      console.error("[NarrationAudio] stream error:", err);
+      if (!res.headersSent) res.status(500).end();
+      else res.end();
+    });
+    stream.pipe(res);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "Falha ao servir áudio." });
   }
 });
 
@@ -1879,13 +2001,18 @@ app.post("/api/narrate-stream", async (req, res) => {
       }
     }
 
-    // Run Text-To-Speech via local engine for each chunk
-    const pcmChunks: Buffer[] = [];
+    // Run Text-To-Speech via local engine for each chunk — PCM goes to disk
+    ensureNarrationTmpDir();
+    const audioId = newNarrationId();
+    const pcmPath = path.join(NARRATION_TMP_DIR, `${audioId}.pcm`);
+    const mp3Path = path.join(NARRATION_TMP_DIR, `${audioId}.mp3`);
+    let pcmBytes = 0;
+    let pcmParts = 0;
     let sampleRate = 24000;
     let wasStoppedEarly = false;
     const taskAbort = taskId ? activeTasks.get(taskId)?.abort : undefined;
     const engineLabel = engine === "kokoro" ? "Kokoro" : "Qwen3";
-    
+
     for (let i = 0; i < totalChunks; i++) {
       // Check if task has been cancelled / stopped
       if (taskId) {
@@ -1899,13 +2026,13 @@ app.post("/api/narrate-stream", async (req, res) => {
 
       const chunk = textChunks[i];
       const partNum = i + 1;
-      
-      sendEvent({ 
-        type: "status", 
-        step: "tts", 
-        current: partNum, 
-        total: totalChunks, 
-        message: `Narrando parte ${partNum} de ${totalChunks} (${engineLabel})...` 
+
+      sendEvent({
+        type: "status",
+        step: "tts",
+        current: partNum,
+        total: totalChunks,
+        message: `Narrando parte ${partNum} de ${totalChunks} (${engineLabel})...`,
       });
 
       const heartbeat = setInterval(() => {
@@ -1944,7 +2071,9 @@ app.post("/api/narrate-stream", async (req, res) => {
           );
         }
         if (pcm.length > 0) {
-          pcmChunks.push(pcm);
+          await fs.promises.appendFile(pcmPath, pcm);
+          pcmBytes += pcm.length;
+          pcmParts += 1;
         }
         if (cancelled) {
           console.log(`[NarrateStream] TTS cancelled mid-chunk at index ${i}.`);
@@ -1962,7 +2091,8 @@ app.post("/api/narrate-stream", async (req, res) => {
       }
     }
 
-    if (pcmChunks.length === 0) {
+    if (pcmParts === 0 || pcmBytes === 0) {
+      await fs.promises.unlink(pcmPath).catch(() => undefined);
       if (wasStoppedEarly) {
         sendEvent({ type: "error", error: "A geração de áudio foi interrompida pelo usuário antes que qualquer parte pudesse ser narrada." });
       } else {
@@ -1974,34 +2104,43 @@ app.post("/api/narrate-stream", async (req, res) => {
       return res.end();
     }
 
-    sendEvent({ 
-      type: "status", 
-      step: "encoding", 
-      current: pcmChunks.length,
+    sendEvent({
+      type: "status",
+      step: "encoding",
+      current: pcmParts,
       total: totalChunks,
-      message: wasStoppedEarly 
+      message: wasStoppedEarly
         ? "Geração interrompida. Codificando áudio gerado até o momento..."
-        : "Codificando e compactando áudio para o formato MP3..." 
+        : "Codificando e compactando áudio para o formato MP3...",
     });
 
-    // Combine all PCM chunks and convert to MP3
-    const combinedPcm = Buffer.concat(pcmChunks);
-    const samplesCount = combinedPcm.length / 2;
-    const samples = new Int16Array(samplesCount);
-    for (let i = 0; i < samplesCount; i++) {
-      samples[i] = combinedPcm.readInt16LE(i * 2);
-    }
+    const mp3Bytes = await encodePcmFileToMp3File(pcmPath, mp3Path, sampleRate, 128);
+    console.log(
+      `[NarrateStream] Encoded MP3 ${mp3Bytes} bytes from ${pcmBytes} PCM bytes (${pcmParts} parts)`
+    );
 
-    const mp3Buffer = encodePcmToMp3(samples, sampleRate, 128);
+    const downloadBase = sanitizeDownloadBaseName(
+      wasStoppedEarly
+        ? `${pagesLabel} (Interrompido na parte ${pcmParts} de ${totalChunks})`
+        : pagesLabel
+    );
+    narrationArtifacts.set(audioId, {
+      mp3Path,
+      pcmPath,
+      fileName: downloadBase,
+      createdAt: Date.now(),
+    });
+    // PCM no longer needed after encode
+    await fs.promises.unlink(pcmPath).catch(() => undefined);
 
     sendEvent({
       type: "done",
-      audioData: mp3Buffer.toString("base64"),
-      extractedText: extractedText,
+      audioId,
+      audioUrl: `/api/narration-audio/${audioId}`,
       voiceName: voice,
-      pagesNarrated: wasStoppedEarly 
-        ? `${pagesLabel} (Interrompido na parte ${pcmChunks.length} de ${totalChunks})`
-        : pagesLabel
+      pagesNarrated: wasStoppedEarly
+        ? `${pagesLabel} (Interrompido na parte ${pcmParts} de ${totalChunks})`
+        : pagesLabel,
     });
 
     res.end();
@@ -2011,7 +2150,11 @@ app.post("/api/narrate-stream", async (req, res) => {
     if (tempPath) {
       await fs.promises.unlink(tempPath).catch(() => {});
     }
-    sendEvent({ type: "error", error: err.message || "Ocorreu um erro interno ao processar o áudio." });
+    try {
+      sendEvent({ type: "error", error: err.message || "Ocorreu um erro interno ao processar o áudio." });
+    } catch {
+      // response may already be broken (e.g. OOM)
+    }
     res.end();
   } finally {
     await unloadTtsModel();
@@ -2049,9 +2192,13 @@ app.post("/api/narrate", async (req, res) => {
     if (engine === "qwen3") {
       voiceAnchor = await ensureVoicePreview(voice);
     }
-    const pcmChunks: Buffer[] = [];
+    ensureNarrationTmpDir();
+    const audioId = newNarrationId();
+    const pcmPath = path.join(NARRATION_TMP_DIR, `${audioId}.pcm`);
+    const mp3Path = path.join(NARRATION_TMP_DIR, `${audioId}.mp3`);
+    let pcmBytes = 0;
     let sampleRate = 24000;
-    
+
     for (let i = 0; i < textChunks.length; i++) {
       const chunk = textChunks[i];
       try {
@@ -2069,30 +2216,33 @@ app.post("/api/narrate", async (req, res) => {
         );
         sampleRate = sr;
         if (pcm.length > 0) {
-          pcmChunks.push(pcm);
+          await fs.promises.appendFile(pcmPath, pcm);
+          pcmBytes += pcm.length;
         }
       } catch (ttsErr: any) {
         console.warn(`[Narrate Legacy] Chunk ${i + 1} failed:`, ttsErr?.message || ttsErr);
       }
     }
 
-    if (pcmChunks.length === 0) {
+    if (pcmBytes === 0) {
+      await fs.promises.unlink(pcmPath).catch(() => undefined);
       return res.status(500).json({
         error: `A geração de áudio falhou para todas as partes do texto. Verifique se o servidor ${engine === "kokoro" ? "Kokoro" : "Qwen3"} TTS está rodando.`,
       });
     }
 
-    const combinedPcm = Buffer.concat(pcmChunks);
-    const samplesCount = combinedPcm.length / 2;
-    const samples = new Int16Array(samplesCount);
-    for (let i = 0; i < samplesCount; i++) {
-      samples[i] = combinedPcm.readInt16LE(i * 2);
-    }
-
-    const mp3Buffer = encodePcmToMp3(samples, sampleRate, 128);
+    await encodePcmFileToMp3File(pcmPath, mp3Path, sampleRate, 128);
+    await fs.promises.unlink(pcmPath).catch(() => undefined);
+    narrationArtifacts.set(audioId, {
+      mp3Path,
+      pcmPath,
+      fileName: sanitizeDownloadBaseName(pagesNarrated),
+      createdAt: Date.now(),
+    });
 
     res.json({
-      audioData: mp3Buffer.toString("base64"),
+      audioId,
+      audioUrl: `/api/narration-audio/${audioId}`,
       extractedText: extractedText,
       voiceName: voice,
       pagesNarrated
