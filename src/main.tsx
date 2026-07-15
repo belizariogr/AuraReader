@@ -18,6 +18,8 @@ type EngineId = "qwen3" | "kokoro";
 
 type EngineInfo = {
   ready: boolean;
+  modelsReady?: boolean;
+  runtimeReady?: boolean;
   modelsDir: string;
   label: string;
   description: string;
@@ -32,6 +34,8 @@ type EngineInfo = {
 
 type ModelsStatus = {
   ready: boolean;
+  modelsReady?: boolean;
+  runtimeReady?: boolean;
   modelsDir: string;
   engine?: EngineId;
   kokoroDevice?: "cpu" | "gpu";
@@ -129,6 +133,7 @@ function Root() {
         engines={status.engines}
         kokoroDevice={status.kokoroDevice || "gpu"}
         kokoroAccel={status.kokoroAccel}
+        runtimeReady={status.runtimeReady !== false}
         onStatusChange={(models, modelsDir, extra) => {
           setStatus((s) =>
             s
@@ -136,7 +141,16 @@ function Root() {
                   ...s,
                   models,
                   modelsDir,
-                  ready: models.every((m) => m.present),
+                  ready:
+                    typeof extra?.ready === "boolean"
+                      ? extra.ready
+                      : models.every((m) => m.present),
+                  ...(extra?.modelsReady !== undefined
+                    ? { modelsReady: extra.modelsReady }
+                    : {}),
+                  ...(extra?.runtimeReady !== undefined
+                    ? { runtimeReady: extra.runtimeReady }
+                    : {}),
                   ...(extra?.gpu !== undefined ? { gpu: extra.gpu ?? undefined } : {}),
                   ...(extra?.backend
                     ? { backend: extra.backend as ModelsStatus["backend"] }

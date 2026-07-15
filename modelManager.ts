@@ -15,6 +15,11 @@ import {
   type TtsEngineId,
   voicesForEngine,
 } from "./ttsEngine";
+import {
+  cancelRuntimeSetup,
+  ensureEngineRuntime,
+  isEngineRuntimeReady,
+} from "./ttsRuntime";
 
 export type ModelSpec = {
   id: string;
@@ -121,6 +126,7 @@ export function isModelDownloadActive(): boolean {
 }
 
 export function cancelModelDownload(): boolean {
+  cancelRuntimeSetup();
   if (!downloadAbort) return false;
   downloadAbort.abort();
   return true;
@@ -236,8 +242,12 @@ function engineStatusBlock(
       path: folderPath,
     };
   });
+  const runtimeReady = isEngineRuntimeReady(auraRoot, engine);
+  const modelsReady = models.every((m) => m.present);
   return {
-    ready: models.every((m) => m.present),
+    ready: modelsReady && runtimeReady,
+    modelsReady,
+    runtimeReady,
     modelsDir,
     models,
     voices: voicesForEngine(engine),
@@ -253,6 +263,8 @@ export function getModelsStatus(auraRoot: string, auraDataDir: string) {
   const gpu: GpuDetectResult = detectGpu(auraRoot);
   return {
     ready: active.ready,
+    modelsReady: active.modelsReady,
+    runtimeReady: active.runtimeReady,
     engine,
     kokoroDevice,
     modelsDir: active.modelsDir,
@@ -260,6 +272,8 @@ export function getModelsStatus(auraRoot: string, auraDataDir: string) {
     engines: {
       qwen3: {
         ready: qwen3.ready,
+        modelsReady: qwen3.modelsReady,
+        runtimeReady: qwen3.runtimeReady,
         modelsDir: qwen3.modelsDir,
         models: qwen3.models,
         voices: qwen3.voices,
@@ -268,6 +282,8 @@ export function getModelsStatus(auraRoot: string, auraDataDir: string) {
       },
       kokoro: {
         ready: kokoro.ready,
+        modelsReady: kokoro.modelsReady,
+        runtimeReady: kokoro.runtimeReady,
         modelsDir: kokoro.modelsDir,
         models: kokoro.models,
         voices: kokoro.voices,
@@ -447,6 +463,14 @@ export async function downloadMissingModels(options: {
       },
       true
     );
+
+    // Create/repair the Python runtime (venv / onnxruntime / torch) before weights.
+    await ensureEngineRuntime({
+      auraRoot: options.auraRoot,
+      engine,
+      signal: abort.signal,
+      onEvent: (evt) => emit(evt, true),
+    });
 
     for (const spec of getRequiredModels(engine)) {
       if (abort.signal.aborted) throw new Error("Download cancelado.");
@@ -704,6 +728,9 @@ export async function downloadMissingModels(options: {
     const status = getModelsStatus(options.auraRoot, options.auraDataDir);
     emit({ type: "done", ready: status.ready, modelsDir: status.modelsDir, engine }, true);
     if (!status.ready && status.engine === engine) {
+      if (!status.runtimeReady) {
+        throw new Error("Download terminou, mas o runtime TTS ainda está incompleto.");
+      }
       throw new Error("Download terminou, mas os modelos ainda estão incompletos.");
     }
   } catch (err: any) {

@@ -6,7 +6,8 @@ Runtime leve (`kokoro-onnx` + `onnxruntime`) com a mesma API HTTP do Qwen
 
 ## Setup
 
-Na raiz do repo:
+Na raiz do repo (ou pela UI do AuraReader ao instalar o modelo — o app
+também prepara o runtime automaticamente):
 
 ```bash
 # Detecta GPU (AMD → MIGraphX/ROCm, NVIDIA → CUDA, senão CPU)

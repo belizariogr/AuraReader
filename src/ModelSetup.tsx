@@ -20,6 +20,9 @@ type ModelInfo = {
   approxBytes: number;
 };
 
+type EngineId = "qwen3" | "kokoro";
+type KokoroDeviceId = "cpu" | "gpu";
+
 type GpuInfo = {
   supported: boolean;
   devices: Array<{ name: string; vendor: string }>;
@@ -39,6 +42,8 @@ type KokoroAccelInfo = {
 
 type EngineInfo = {
   ready: boolean;
+  modelsReady?: boolean;
+  runtimeReady?: boolean;
   modelsDir: string;
   label: string;
   description: string;
@@ -128,6 +133,7 @@ export default function ModelSetup({
   engines: enginesProp,
   kokoroDevice: kokoroDeviceProp = "gpu",
   kokoroAccel: kokoroAccelProp,
+  runtimeReady: runtimeReadyProp = true,
   onComplete,
   onStatusChange,
 }: {
@@ -139,6 +145,7 @@ export default function ModelSetup({
   engines?: { qwen3: EngineInfo; kokoro: EngineInfo };
   kokoroDevice?: KokoroDeviceId;
   kokoroAccel?: KokoroAccelInfo | null;
+  runtimeReady?: boolean;
   onComplete: () => void;
   onStatusChange?: (
     models: ModelInfo[],
@@ -150,6 +157,9 @@ export default function ModelSetup({
       engines?: { qwen3: EngineInfo; kokoro: EngineInfo };
       kokoroDevice?: KokoroDeviceId;
       kokoroAccel?: KokoroAccelInfo | null;
+      ready?: boolean;
+      modelsReady?: boolean;
+      runtimeReady?: boolean;
     }
   ) => void;
 }) {
@@ -157,6 +167,7 @@ export default function ModelSetup({
   const [error, setError] = useState<string | null>(null);
   const [localModels, setLocalModels] = useState(models);
   const [localDir, setLocalDir] = useState(modelsDir);
+  const [runtimeReady, setRuntimeReady] = useState(runtimeReadyProp);
   const [gpu, setGpu] = useState<GpuInfo | null | undefined>(gpuProp);
   const [engine, setEngine] = useState<EngineId>(engineProp);
   const [engines, setEngines] = useState(enginesProp);
@@ -188,6 +199,10 @@ export default function ModelSetup({
   useEffect(() => {
     setKokoroAccel(kokoroAccelProp);
   }, [kokoroAccelProp]);
+
+  useEffect(() => {
+    setRuntimeReady(runtimeReadyProp);
+  }, [runtimeReadyProp]);
 
   useEffect(() => {
     setLocalModels(models);
@@ -223,12 +238,16 @@ export default function ModelSetup({
         engines: body.engines,
         kokoroDevice: body.kokoroDevice,
         kokoroAccel: body.kokoroAccel ?? null,
+        ready: body.ready,
+        modelsReady: body.modelsReady,
+        runtimeReady: body.runtimeReady,
       });
     }
     if (body.modelsDir) setLocalDir(body.modelsDir);
     if (body.gpu) setGpu(body.gpu);
     if (body.engine) setEngine(body.engine);
     if (body.engines) setEngines(body.engines);
+    if (typeof body.runtimeReady === "boolean") setRuntimeReady(body.runtimeReady);
     if (body.kokoroDevice === "cpu" || body.kokoroDevice === "gpu") {
       setKokoroDevice(body.kokoroDevice);
     }
@@ -236,7 +255,8 @@ export default function ModelSetup({
     return body;
   }
 
-  const allReady = localModels.every((m) => m.present);
+  const modelsReady = localModels.every((m) => m.present);
+  const allReady = modelsReady && runtimeReady;
 
   async function selectEngine(next: EngineId) {
     if (next === engine || downloading || switching) return;
@@ -340,7 +360,10 @@ export default function ModelSetup({
     setError(null);
     setProgress({
       ...emptyProgress(),
-      phase: engine === "kokoro" ? "Conectando ao download do Kokoro…" : "Conectando ao Hugging Face…",
+      phase:
+        engine === "kokoro"
+          ? "Preparando Kokoro e baixando modelos…"
+          : "Preparando runtime e baixando modelos…",
     });
     setOverall({ current: 0, total: Math.max(1, missing.length || localModels.length) });
 
@@ -370,6 +393,23 @@ export default function ModelSetup({
           try {
             evt = JSON.parse(line);
           } catch {
+            continue;
+          }
+
+          if (
+            evt.type === "runtime_start" ||
+            evt.type === "runtime_log" ||
+            evt.type === "runtime_skip" ||
+            evt.type === "runtime_done"
+          ) {
+            if (evt.type === "runtime_done" || evt.type === "runtime_skip") {
+              setRuntimeReady(true);
+            }
+            setProgress((prev) => ({
+              ...prev,
+              phase: String(evt.phase || evt.line || "Preparando runtime…"),
+              percent: evt.type === "runtime_done" || evt.type === "runtime_skip" ? prev.percent : 0,
+            }));
             continue;
           }
 
@@ -468,7 +508,11 @@ export default function ModelSetup({
       const finalStatus = await refreshStatus();
       setDownloading(false);
       if (!finalStatus.ready) {
-        throw new Error("Download terminou, mas os modelos ainda estão incompletos.");
+        throw new Error(
+          !finalStatus.runtimeReady
+            ? "A preparação do runtime TTS ainda está incompleta."
+            : "Download terminou, mas os modelos ainda estão incompletos."
+        );
       }
     } catch (err: any) {
       setError(err?.message || String(err));
@@ -509,8 +553,8 @@ export default function ModelSetup({
             <div>
               <h2 className="text-xl font-bold text-white mb-1">Motor de voz</h2>
               <p className="text-sm text-slate-300 leading-relaxed">
-                Escolha Qwen3 (qualidade / clonagem) ou Kokoro (rápido e leve). Cada um baixa só
-                os arquivos necessários (~
+                Escolha Qwen3 (qualidade / clonagem) ou Kokoro (rápido e leve). A instalação
+                prepara o runtime Python e baixa só os arquivos necessários (~
                 {formatBytes(
                   approxTotal ||
                     (engine === "kokoro" ? 350_000_000 : 4_000_000_000)
@@ -787,7 +831,7 @@ export default function ModelSetup({
                 className="w-full inline-flex items-center justify-center gap-2.5 rounded-2xl border border-rose-400/30 bg-rose-500/10 hover:bg-rose-500/20 text-rose-100 font-semibold px-5 py-3.5 transition-colors"
               >
                 <CircleStop className="w-5 h-5 shrink-0" strokeWidth={2.25} />
-                Cancelar download
+                Cancelar instalação
               </button>
             ) : (
               <div className="flex flex-col sm:flex-row gap-3">
@@ -808,7 +852,9 @@ export default function ModelSetup({
                     className="w-full inline-flex items-center justify-center gap-2.5 rounded-2xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 disabled:opacity-60 disabled:cursor-not-allowed text-white font-semibold px-5 py-3.5 transition-colors"
                   >
                     <Download className="w-5 h-5 shrink-0" strokeWidth={2.25} />
-                    Baixar modelos agora
+                    {modelsReady && !runtimeReady
+                      ? "Preparar runtime agora"
+                      : "Baixar e preparar agora"}
                   </button>
                 )}
 
@@ -832,11 +878,11 @@ export default function ModelSetup({
           </div>
 
           <p className="text-center text-[11px] text-slate-500 mt-4">
-            Requer internet na primeira instalação.
+            Na instalação o app prepara o runtime Python e baixa os pesos (precisa de internet).
             {engine === "kokoro"
-              ? " Kokoro usa ONNX (CPU) — rápido mesmo sem CUDA/ROCm."
+              ? " Kokoro usa ONNX — rápido mesmo sem CUDA/ROCm."
               : isTorch
-                ? " Windows/Linux: use o instalador CUDA (NVIDIA) ou ROCm (AMD) correspondente à sua GPU."
+                ? " Windows/Linux: o setup escolhe CUDA (NVIDIA), ROCm (AMD) ou CPU automaticamente."
                 : " Apple Silicon recomendado."}
             {engines?.qwen3?.ready && engines?.kokoro?.ready
               ? " Ambos os motores estão instalados — troque acima a qualquer momento."
