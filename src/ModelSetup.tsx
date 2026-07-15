@@ -29,6 +29,22 @@ type GpuInfo = {
   summary: string;
 };
 
+type KokoroAccelInfo = {
+  requested: KokoroDeviceId;
+  effective: "gpu" | "cpu";
+  gpuReady: boolean;
+  availableProviders: string[];
+  hint: string | null;
+};
+
+type EngineInfo = {
+  ready: boolean;
+  modelsDir: string;
+  label: string;
+  description: string;
+  models: ModelInfo[];
+};
+
 type ProgressState = {
   modelId?: string;
   modelLabel?: string;
@@ -108,18 +124,33 @@ export default function ModelSetup({
   modelsDir,
   gpu: gpuProp,
   backend,
+  engine: engineProp = "qwen3",
+  engines: enginesProp,
+  kokoroDevice: kokoroDeviceProp = "gpu",
+  kokoroAccel: kokoroAccelProp,
   onComplete,
   onStatusChange,
 }: {
   models: ModelInfo[];
   modelsDir: string;
   gpu?: GpuInfo | null;
-  backend?: "torch" | "mlx";
+  backend?: "torch" | "mlx" | "onnx";
+  engine?: EngineId;
+  engines?: { qwen3: EngineInfo; kokoro: EngineInfo };
+  kokoroDevice?: KokoroDeviceId;
+  kokoroAccel?: KokoroAccelInfo | null;
   onComplete: () => void;
   onStatusChange?: (
     models: ModelInfo[],
     modelsDir: string,
-    extra?: { gpu?: GpuInfo | null; backend?: string }
+    extra?: {
+      gpu?: GpuInfo | null;
+      backend?: string;
+      engine?: EngineId;
+      engines?: { qwen3: EngineInfo; kokoro: EngineInfo };
+      kokoroDevice?: KokoroDeviceId;
+      kokoroAccel?: KokoroAccelInfo | null;
+    }
   ) => void;
 }) {
   const [downloading, setDownloading] = useState(false);
@@ -127,6 +158,13 @@ export default function ModelSetup({
   const [localModels, setLocalModels] = useState(models);
   const [localDir, setLocalDir] = useState(modelsDir);
   const [gpu, setGpu] = useState<GpuInfo | null | undefined>(gpuProp);
+  const [engine, setEngine] = useState<EngineId>(engineProp);
+  const [engines, setEngines] = useState(enginesProp);
+  const [kokoroDevice, setKokoroDevice] = useState<KokoroDeviceId>(kokoroDeviceProp);
+  const [kokoroAccel, setKokoroAccel] = useState<KokoroAccelInfo | null | undefined>(
+    kokoroAccelProp
+  );
+  const [switching, setSwitching] = useState(false);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressState>(emptyProgress);
   const [overall, setOverall] = useState({ current: 0, total: models.length });
@@ -135,6 +173,27 @@ export default function ModelSetup({
     setGpu(gpuProp);
   }, [gpuProp]);
 
+  useEffect(() => {
+    setEngine(engineProp);
+  }, [engineProp]);
+
+  useEffect(() => {
+    setEngines(enginesProp);
+  }, [enginesProp]);
+
+  useEffect(() => {
+    setKokoroDevice(kokoroDeviceProp);
+  }, [kokoroDeviceProp]);
+
+  useEffect(() => {
+    setKokoroAccel(kokoroAccelProp);
+  }, [kokoroAccelProp]);
+
+  useEffect(() => {
+    setLocalModels(models);
+    setLocalDir(modelsDir);
+  }, [models, modelsDir]);
+
   const missing = useMemo(() => localModels.filter((m) => !m.present), [localModels]);
   const present = useMemo(() => localModels.filter((m) => m.present), [localModels]);
   const approxTotal = useMemo(
@@ -142,8 +201,8 @@ export default function ModelSetup({
     [missing]
   );
 
-  const showGpu = Boolean(gpu?.supported);
-  const isTorch = backend === "torch" || showGpu;
+  const showGpu = Boolean(gpu?.supported) && engine === "qwen3";
+  const isTorch = backend === "torch" || (showGpu && engine === "qwen3");
   const badge = vendorBadge(gpu?.primary ?? null);
   const accelMismatch =
     showGpu &&
@@ -160,14 +219,74 @@ export default function ModelSetup({
       onStatusChange?.(body.models, body.modelsDir || localDir, {
         gpu: body.gpu ?? null,
         backend: body.backend,
+        engine: body.engine,
+        engines: body.engines,
+        kokoroDevice: body.kokoroDevice,
+        kokoroAccel: body.kokoroAccel ?? null,
       });
     }
     if (body.modelsDir) setLocalDir(body.modelsDir);
     if (body.gpu) setGpu(body.gpu);
+    if (body.engine) setEngine(body.engine);
+    if (body.engines) setEngines(body.engines);
+    if (body.kokoroDevice === "cpu" || body.kokoroDevice === "gpu") {
+      setKokoroDevice(body.kokoroDevice);
+    }
+    if (body.kokoroAccel) setKokoroAccel(body.kokoroAccel);
     return body;
   }
 
   const allReady = localModels.every((m) => m.present);
+
+  async function selectEngine(next: EngineId) {
+    if (next === engine || downloading || switching) return;
+    setSwitching(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/tts-engine", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ engine: next }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+      await refreshStatus();
+      setProgress(emptyProgress());
+    } catch (err: any) {
+      setError(err?.message || String(err));
+    } finally {
+      setSwitching(false);
+    }
+  }
+
+  async function selectKokoroDevice(next: KokoroDeviceId) {
+    if (next === kokoroDevice || downloading || switching) return;
+    setSwitching(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/tts-engine", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kokoroDevice: next }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+      setKokoroDevice(next);
+      if (body.kokoroAccel) setKokoroAccel(body.kokoroAccel);
+      onStatusChange?.(localModels, localDir, {
+        gpu: gpu ?? null,
+        backend,
+        engine,
+        engines,
+        kokoroDevice: next,
+        kokoroAccel: body.kokoroAccel ?? null,
+      });
+    } catch (err: any) {
+      setError(err?.message || String(err));
+    } finally {
+      setSwitching(false);
+    }
+  }
 
   async function cancelDownload() {
     try {
@@ -196,10 +315,18 @@ export default function ModelSetup({
         onStatusChange?.(body.status.models, body.status.modelsDir || localDir, {
           gpu: body.status.gpu ?? gpu ?? null,
           backend: body.status.backend,
+          engine: body.status.engine,
+          engines: body.status.engines,
+          kokoroDevice: body.status.kokoroDevice,
         });
       }
       if (body.status?.modelsDir) setLocalDir(body.status.modelsDir);
       if (body.status?.gpu) setGpu(body.status.gpu);
+      if (body.status?.engine) setEngine(body.status.engine);
+      if (body.status?.engines) setEngines(body.status.engines);
+      if (body.status?.kokoroDevice === "cpu" || body.status?.kokoroDevice === "gpu") {
+        setKokoroDevice(body.status.kokoroDevice);
+      }
       setProgress(emptyProgress());
     } catch (err: any) {
       setError(err?.message || String(err));
@@ -213,7 +340,7 @@ export default function ModelSetup({
     setError(null);
     setProgress({
       ...emptyProgress(),
-      phase: "Conectando ao Hugging Face…",
+      phase: engine === "kokoro" ? "Conectando ao download do Kokoro…" : "Conectando ao Hugging Face…",
     });
     setOverall({ current: 0, total: Math.max(1, missing.length || localModels.length) });
 
@@ -380,18 +507,129 @@ export default function ModelSetup({
               <HardDrive className="w-5 h-5" />
             </div>
             <div>
-              <h2 className="text-xl font-bold text-white mb-1">Modelos TTS necessários</h2>
+              <h2 className="text-xl font-bold text-white mb-1">Motor de voz</h2>
               <p className="text-sm text-slate-300 leading-relaxed">
-                Os pesos do Qwen3-TTS não vêm no aplicativo. Na primeira vez é preciso baixá-los
-                (~{formatBytes(approxTotal || 4_000_000_000)})
-                {isTorch ? " para este computador" : " para o seu Mac"}. Depois ficam salvos
-                localmente e não precisam ser baixados de novo.
+                Escolha Qwen3 (qualidade / clonagem) ou Kokoro (rápido e leve). Cada um baixa só
+                os arquivos necessários (~
+                {formatBytes(
+                  approxTotal ||
+                    (engine === "kokoro" ? 350_000_000 : 4_000_000_000)
+                )}
+                ).
               </p>
             </div>
           </div>
 
-          {showGpu && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-6">
+            {(
+              [
+                {
+                  id: "qwen3" as const,
+                  title: engines?.qwen3?.label || "Qwen3-TTS",
+                  desc:
+                    engines?.qwen3?.description ||
+                    "Alta qualidade com clonagem de voz (ICL).",
+                  ready: engines?.qwen3?.ready,
+                },
+                {
+                  id: "kokoro" as const,
+                  title: engines?.kokoro?.label || "Kokoro",
+                  desc:
+                    engines?.kokoro?.description ||
+                    "Rápido e leve (ONNX) — ideal em AMD/CPU.",
+                  ready: engines?.kokoro?.ready,
+                },
+              ] as const
+            ).map((opt) => {
+              const selected = engine === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  disabled={downloading || switching}
+                  onClick={() => selectEngine(opt.id)}
+                  className={`text-left rounded-2xl border px-4 py-3 transition-colors disabled:opacity-50 ${
+                    selected
+                      ? "border-blue-400/50 bg-blue-500/15"
+                      : "border-white/10 bg-slate-900/40 hover:bg-white/5"
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <span className="text-sm font-semibold text-white">{opt.title}</span>
+                    {opt.ready ? (
+                      <span className="text-[10px] text-emerald-300">instalado</span>
+                    ) : (
+                      <span className="text-[10px] text-amber-200/80">não instalado</span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-400 leading-relaxed">{opt.desc}</p>
+                  {selected && (
+                    <p className="text-[11px] text-blue-300 mt-2">Selecionado</p>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          {engine === "kokoro" && (
             <div className="mb-6 rounded-2xl border border-white/10 bg-slate-900/50 p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <Cpu className="w-3.5 h-3.5 text-slate-400" />
+                <span className="text-xs text-slate-300 font-medium">Aceleração Kokoro</span>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                {(
+                  [
+                    {
+                      id: "gpu" as const,
+                      title: "GPU",
+                      desc: "MIGraphX / CUDA / DirectML quando disponível",
+                    },
+                    {
+                      id: "cpu" as const,
+                      title: "CPU",
+                      desc: "Mais estável; sem dependência de ROCm/CUDA",
+                    },
+                  ] as const
+                ).map((opt) => {
+                  const selected = kokoroDevice === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      disabled={downloading || switching}
+                      onClick={() => selectKokoroDevice(opt.id)}
+                      className={`text-left rounded-xl border px-3 py-2.5 transition-colors disabled:opacity-50 ${
+                        selected
+                          ? "border-emerald-400/45 bg-emerald-500/10"
+                          : "border-white/10 bg-slate-950/40 hover:bg-white/5"
+                      }`}
+                    >
+                      <span className="text-sm font-semibold text-white">{opt.title}</span>
+                      <p className="text-[11px] text-slate-400 leading-snug mt-0.5">{opt.desc}</p>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[11px] text-slate-500 leading-relaxed">
+                Em AMD, GPU exige o pacote de sistema <span className="font-mono">migraphx</span>.
+                Sem ele, o Kokoro cai automaticamente para CPU.
+              </p>
+              {kokoroDevice === "gpu" && kokoroAccel && !kokoroAccel.gpuReady && (
+                <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100 leading-relaxed">
+                  <p className="font-semibold text-amber-50 mb-1">GPU marcada, mas ainda no CPU</p>
+                  <p>{kokoroAccel.hint || "Dependências de GPU não estão prontas."}</p>
+                </div>
+              )}
+              {kokoroDevice === "gpu" && kokoroAccel?.gpuReady && (
+                <p className="text-[11px] text-emerald-300/90 leading-relaxed">
+                  Runtime GPU pronto ({kokoroAccel.availableProviders.filter((p) => p !== "CPUExecutionProvider").join(", ") || "GPU"}).
+                </p>
+              )}
+            </div>
+          )}
+
+          {showGpu && (            <div className="mb-6 rounded-2xl border border-white/10 bg-slate-900/50 p-4 space-y-3">
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="inline-flex items-center gap-1.5 text-xs text-slate-400">
                   <Cpu className="w-3.5 h-3.5" />
@@ -595,9 +833,14 @@ export default function ModelSetup({
 
           <p className="text-center text-[11px] text-slate-500 mt-4">
             Requer internet na primeira instalação.
-            {isTorch
-              ? " Windows/Linux: use o instalador CUDA (NVIDIA) ou ROCm (AMD) correspondente à sua GPU."
-              : " Apple Silicon recomendado."}
+            {engine === "kokoro"
+              ? " Kokoro usa ONNX (CPU) — rápido mesmo sem CUDA/ROCm."
+              : isTorch
+                ? " Windows/Linux: use o instalador CUDA (NVIDIA) ou ROCm (AMD) correspondente à sua GPU."
+                : " Apple Silicon recomendado."}
+            {engines?.qwen3?.ready && engines?.kokoro?.ready
+              ? " Ambos os motores estão instalados — troque acima a qualquer momento."
+              : ""}
           </p>
         </motion.div>
       </main>

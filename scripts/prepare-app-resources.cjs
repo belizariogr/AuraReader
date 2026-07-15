@@ -23,6 +23,7 @@ const root = path.resolve(__dirname, "..");
 const out = path.join(root, "build", "app-resources");
 const qwenSrc = path.join(root, "qwen3-tts-apple-silicon");
 const torchSrc = path.join(root, "tts", "torch");
+const kokoroSrc = path.join(root, "tts", "kokoro");
 const cacheDir = path.join(root, "build", "cache");
 
 /** Pinned portable CPython 3.12 (python-build-standalone). */
@@ -152,6 +153,9 @@ function prepareDarwin() {
   console.log("[prepare-app-resources] Copying site-packages...");
   copyFiltered(siteSrc, path.join(qwenDst, "site-packages"));
 
+  ensureKokoroVenv("darwin", "cpu");
+  bundleKokoroRuntime("darwin");
+
   const pyBin = path.join(frameworkDst, "Versions", "3.12", "bin", "python3.12");
   mustExist(pyBin, "bundled python3.12");
   try {
@@ -163,6 +167,19 @@ function prepareDarwin() {
           ...process.env,
           PYTHONHOME: path.join(frameworkDst, "Versions", "3.12"),
           PYTHONPATH: path.join(qwenDst, "site-packages"),
+          PYTHONNOUSERSITE: "1",
+        },
+        stdio: "inherit",
+      }
+    );
+    execFileSync(
+      pyBin,
+      ["-c", "import fastapi, onnxruntime, kokoro_onnx; print('kokoro ok')"],
+      {
+        env: {
+          ...process.env,
+          PYTHONHOME: path.join(frameworkDst, "Versions", "3.12"),
+          PYTHONPATH: path.join(out, "tts", "kokoro", "site-packages"),
           PYTHONNOUSERSITE: "1",
         },
         stdio: "inherit",
@@ -397,6 +414,62 @@ function bundlePortablePython(pythonPrefix) {
   return pyBin;
 }
 
+function kokoroVenvPython(platform) {
+  return platform === "win32"
+    ? path.join(kokoroSrc, ".venv", "Scripts", "python.exe")
+    : path.join(kokoroSrc, ".venv", "bin", "python");
+}
+
+function kokoroSitePackages(platform) {
+  const lib = path.join(kokoroSrc, ".venv", "lib");
+  if (platform === "win32") {
+    return path.join(kokoroSrc, ".venv", "Lib", "site-packages");
+  }
+  if (!fs.existsSync(lib)) return path.join(lib, "python3.12", "site-packages");
+  const preferred = fs
+    .readdirSync(lib)
+    .find((n) => n.startsWith("python3."));
+  if (!preferred) {
+    return path.join(kokoroSrc, ".venv", "lib", "python3.12", "site-packages");
+  }
+  return path.join(lib, preferred, "site-packages");
+}
+
+function ensureKokoroVenv(platform, accel = "cpu") {
+  const kokoroAccel =
+    accel === "rocm" ? "rocm" : accel === "cuda" ? "cuda" : "cpu";
+  // Prefer the dedicated setup script so ORT GPU wheels stay in one place.
+  console.log(
+    `[prepare-app-resources] Ensuring tts/kokoro/.venv (accel=${kokoroAccel}) via setup-kokoro-tts…`
+  );
+  const setup = spawnSync(
+    process.execPath,
+    [path.join(__dirname, "setup-kokoro-tts.cjs"), `--accel=${kokoroAccel}`],
+    { cwd: root, stdio: "inherit", env: process.env }
+  );
+  if (setup.status !== 0) {
+    throw new Error("setup-kokoro-tts.cjs failed while preparing Kokoro runtime");
+  }
+  const venvPy = kokoroVenvPython(platform);
+  mustExist(venvPy, "kokoro venv python");
+  return venvPy;
+}
+
+function bundleKokoroRuntime(platform) {
+  mustExist(path.join(kokoroSrc, "tts_server.py"), "tts/kokoro/tts_server.py");
+  const siteSrc = kokoroSitePackages(platform);
+  mustExist(siteSrc, "tts/kokoro/.venv site-packages");
+
+  const kokoroDst = path.join(out, "tts", "kokoro");
+  fs.mkdirSync(kokoroDst, { recursive: true });
+  for (const file of ["tts_server.py", "requirements.txt", "README.md"]) {
+    const src = path.join(kokoroSrc, file);
+    if (fs.existsSync(src)) fs.copyFileSync(src, path.join(kokoroDst, file));
+  }
+  console.log("[prepare-app-resources] Copying kokoro site-packages...");
+  copyFiltered(siteSrc, path.join(kokoroDst, "site-packages"));
+}
+
 async function prepareWinLinux(platform, accel) {
   if (platform !== process.platform) {
     throw new Error(
@@ -411,7 +484,7 @@ async function prepareWinLinux(platform, accel) {
   const venvPy = ensureTorchVenv(platform, accel, portablePy);
   const siteSrc = torchSitePackages(platform);
   mustExist(siteSrc, "tts/torch/.venv site-packages");
-
+  ensureKokoroVenv(platform, accel);
   const pyBin = bundlePortablePython(pythonPrefix);
   console.log("[prepare-app-resources] Bundled python:", pyBin);
 
@@ -432,6 +505,7 @@ async function prepareWinLinux(platform, accel) {
   console.log("[prepare-app-resources] Skipping models/ (downloaded on first launch)");
   console.log("[prepare-app-resources] Copying torch site-packages...");
   copyFiltered(siteSrc, path.join(torchDst, "site-packages"));
+  bundleKokoroRuntime(platform);
 
   const pythonHome = path.join(out, "python");
   try {
@@ -451,9 +525,22 @@ async function prepareWinLinux(platform, accel) {
         stdio: "inherit",
       }
     );
+    execFileSync(
+      pyBin,
+      ["-c", "import fastapi, onnxruntime, kokoro_onnx; print('kokoro ok')"],
+      {
+        env: {
+          ...process.env,
+          PYTHONHOME: pythonHome,
+          PYTHONPATH: path.join(out, "tts", "kokoro", "site-packages"),
+          PYTHONNOUSERSITE: "1",
+        },
+        stdio: "inherit",
+      }
+    );
   } catch (err) {
     throw new Error(
-      "[prepare-app-resources] Bundled Python failed to import Torch TTS deps. " +
+      "[prepare-app-resources] Bundled Python failed to import TTS deps. " +
         (err?.message || err)
     );
   }

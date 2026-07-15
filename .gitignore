@@ -17,6 +17,11 @@ tts/torch/.venv/
 tts/torch/models/
 tts/torch/__pycache__/
 tts/torch/**/__pycache__/
+tts/kokoro/.venv/
+tts/kokoro/models/
+tts/kokoro/__pycache__/
+tts/kokoro/**/__pycache__/
 tts-accel.json
+tts-engine.json
 *.pyc
 .venv/

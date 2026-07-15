@@ -24,7 +24,7 @@ import {
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
-// Qwen3-TTS CustomVoice speakers (Lite 0.6B)
+// Voice catalog loaded from active TTS engine
 interface Voice {
   id: string;
   name: string;
@@ -33,7 +33,7 @@ interface Voice {
   icon: string;
 }
 
-const VOICES: Voice[] = [
+const FALLBACK_QWEN_VOICES: Voice[] = [
   { id: "Vivian", name: "Vivian", gender: "Feminino", description: "Narração clara e calorosa — boa para romances e não-ficção.", icon: "👩" },
   { id: "Serena", name: "Serena", gender: "Feminino", description: "Timbre suave, adequada para leituras longas.", icon: "👩‍🦰" },
   { id: "Sohee", name: "Sohee", gender: "Feminino", description: "Voz expressiva e natural.", icon: "🧑" },
@@ -46,18 +46,39 @@ const VOICES: Voice[] = [
 ];
 
 const VOICE_STORAGE_KEY = "aura-reader-voice";
+const ENGINE_VOICE_STORAGE_KEY = "aura-reader-voice-by-engine";
 
-function loadSavedVoice(): string {
+function loadSavedVoice(voices: Voice[], engine: string): string {
   try {
+    const byEngine = JSON.parse(localStorage.getItem(ENGINE_VOICE_STORAGE_KEY) || "{}") as Record<
+      string,
+      string
+    >;
+    if (byEngine[engine] && voices.some((v) => v.id === byEngine[engine])) {
+      return byEngine[engine];
+    }
     const saved = localStorage.getItem(VOICE_STORAGE_KEY);
-    if (saved && VOICES.some((v) => v.id === saved)) return saved;
-    // Migrate removed voices from older builds
-    if (saved === "Ethan") return "Eric";
-    if (saved === "Chelsie") return "Sohee";
+    if (saved && voices.some((v) => v.id === saved)) return saved;
+    if (saved === "Ethan") return voices.find((v) => v.id === "Eric")?.id || voices[0]?.id || "Vivian";
+    if (saved === "Chelsie") return voices.find((v) => v.id === "Sohee")?.id || voices[0]?.id || "Vivian";
   } catch {
     // ignore
   }
-  return "Vivian";
+  return voices[0]?.id || (engine === "kokoro" ? "af_heart" : "Vivian");
+}
+
+function persistVoice(engine: string, voiceId: string) {
+  try {
+    localStorage.setItem(VOICE_STORAGE_KEY, voiceId);
+    const byEngine = JSON.parse(localStorage.getItem(ENGINE_VOICE_STORAGE_KEY) || "{}") as Record<
+      string,
+      string
+    >;
+    byEngine[engine] = voiceId;
+    localStorage.setItem(ENGINE_VOICE_STORAGE_KEY, JSON.stringify(byEngine));
+  } catch {
+    // ignore
+  }
 }
 
 export default function App({ onManageModels }: { onManageModels?: () => void }) {
@@ -70,11 +91,47 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   // Configuration State
   const [startPage, setStartPage] = useState<number>(1);
   const [endPage, setEndPage] = useState<string>("");
-  const [selectedVoice, setSelectedVoice] = useState<string>(loadSavedVoice);
+  const [voices, setVoices] = useState<Voice[]>(FALLBACK_QWEN_VOICES);
+  const [ttsEngine, setTtsEngine] = useState<"qwen3" | "kokoro">("qwen3");
+  const [kokoroDevice, setKokoroDevice] = useState<"cpu" | "gpu">("gpu");
+  const [selectedVoice, setSelectedVoice] = useState<string>("Vivian");
   const [pdfPageCount, setPdfPageCount] = useState<number | null>(null);
   const [epubChapters, setEpubChapters] = useState<{ index: number; id: string; title: string }[]>([]);
   const [docInfoLoading, setDocInfoLoading] = useState(false);
   const [docInfoMessage, setDocInfoMessage] = useState<string>("");
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/tts-engine");
+        const body = await res.json();
+        if (cancelled || !res.ok) return;
+        const engine = body.engine === "kokoro" ? "kokoro" : "qwen3";
+        const list = Array.isArray(body.voices) && body.voices.length
+          ? (body.voices as Voice[])
+          : FALLBACK_QWEN_VOICES;
+        setTtsEngine(engine);
+        if (body.kokoroDevice === "cpu" || body.kokoroDevice === "gpu") {
+          setKokoroDevice(body.kokoroDevice);
+        }
+        setVoices(list);
+        setSelectedVoice((prev) => {
+          if (list.some((v) => v.id === prev)) return prev;
+          return loadSavedVoice(list, engine);
+        });
+      } catch {
+        // keep fallbacks
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    persistVoice(ttsEngine, selectedVoice);
+  }, [selectedVoice, ttsEngine]);
 
   // Processing & Result State
   const [loading, setLoading] = useState<boolean>(false);
@@ -826,7 +883,9 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
             title="Gerenciar modelos TTS"
             className="text-xs font-mono text-slate-300 bg-white/5 border border-white/10 px-3 py-1.5 rounded-full hover:bg-white/10 hover:text-white hover:border-white/20 transition-colors"
           >
-            Qwen3 TTS · local (Lite)
+            {ttsEngine === "kokoro"
+              ? `Kokoro · ${kokoroDevice === "gpu" ? "GPU" : "CPU"}`
+              : "Qwen3 TTS · local"}
           </button>
         </div>
       </header>
@@ -1001,7 +1060,9 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                         <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                       )}
                       <span className={progressStep === "tts" ? "text-white font-medium animate-pulse" : ["pre_tts", "chunks"].includes(progressStep) ? "text-slate-500" : "text-slate-400"}>
-                        Narrando com Inteligência Artificial (Qwen3 TTS)
+                        Narrando com Inteligência Artificial (
+                          {ttsEngine === "kokoro" ? "Kokoro" : "Qwen3 TTS"}
+                        )
                       </span>
                     </div>
 
@@ -1288,7 +1349,9 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                     <span>{uploadedFile ? "3. Voz do Narrador" : "2. Voz do Narrador"}</span>
                   </h2>
                   <p className="text-xs text-slate-400 mb-4">
-                    Escolha a voz neural. A prévia em cache mantém o mesmo tom em toda a narração.
+                    {ttsEngine === "kokoro"
+                      ? `Kokoro (${kokoroDevice === "gpu" ? "GPU" : "CPU"}). Escolha a voz neural para a narração.`
+                      : "Motor Qwen3. A prévia em cache mantém o mesmo tom em toda a narração."}
                   </p>
 
                   {previewError && (
@@ -1300,7 +1363,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
 
                   <div className="space-y-4">
                     {(["Feminino", "Masculino"] as const).map((gender) => {
-                      const voices = VOICES.filter((v) => v.gender === gender);
+                      const genderVoices = voices.filter((v) => v.gender === gender);
                       return (
                         <div key={gender}>
                           <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500 mb-2 px-0.5">
@@ -1311,7 +1374,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                             role="radiogroup"
                             aria-label={`Vozes ${gender.toLowerCase()}s`}
                           >
-                            {voices.map((voice) => {
+                            {genderVoices.map((voice) => {
                               const isSelected = selectedVoice === voice.id;
                               const isLoadingPreview = previewLoadingVoice === voice.id;
                               const isPlayingPreview = previewPlayingVoice === voice.id;

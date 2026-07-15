@@ -5,7 +5,7 @@ import os from "os";
 import { spawn, type ChildProcess } from "child_process";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
-import * as lamejs from "@breezystack/lamejs";
+import { Mp3Encoder } from "./lamejsBridge";
 import { PDFDocument } from "pdf-lib";
 // @ts-ignore
 import { EPub } from "epub2";
@@ -18,6 +18,16 @@ import {
   resolveModelsDir,
 } from "./modelManager";
 import { detectGpu } from "./gpuDetect";
+import { kokoroGpuLibraryPath, probeKokoroAccel } from "./kokoroAccel";
+import {
+  isTtsEngineId,
+  readTtsEngine,
+  writeTtsEngine,
+  readKokoroDevice,
+  writeKokoroDevice,
+  isKokoroDeviceId,
+  type TtsEngineId,
+} from "./ttsEngine";
 
 /** Packaged app root (Resources/aura) or project cwd. */
 const AURA_ROOT = process.env.AURA_ROOT
@@ -57,6 +67,8 @@ const TTS_LANGUAGE = process.env.QWEN_TTS_LANGUAGE || "Auto";
 
 let ttsChild: ChildProcess | null = null;
 let ttsStartPromise: Promise<void> | null = null;
+/** Engine currently bound to ttsChild (if any). */
+let ttsRunningEngine: TtsEngineId | null = null;
 
 type TtsAccel = "cuda" | "rocm" | "cpu" | "mlx";
 
@@ -104,6 +116,96 @@ function rocmSpawnEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
+function activeTtsEngine(): TtsEngineId {
+  return readTtsEngine(AURA_DATA_DIR);
+}
+
+function resolveKokoroLaunch(): {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+} {
+  const ttsDir = path.join(AURA_ROOT, "tts", "kokoro");
+  const sitePackages = path.join(ttsDir, "site-packages");
+  const modelsDir = resolveModelsDir(AURA_ROOT, AURA_DATA_DIR, "kokoro");
+  const cacheRoot = path.join(AURA_DATA_DIR, "kokoro-ort-cache");
+  const kokoroDevice = readKokoroDevice(AURA_DATA_DIR);
+  const baseEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    // AMD RDNA2 + MIGraphX / ROCm (same overrides as Qwen torch).
+    ...(kokoroDevice === "gpu" ? rocmSpawnEnv() : {}),
+    QWEN_TTS_PORT: String(TTS_PORT),
+    TTS_PORT: String(TTS_PORT),
+    QWEN_TTS_PRELOAD: process.env.QWEN_TTS_PRELOAD ?? "0",
+    KOKORO_MODEL_DIR: modelsDir,
+    KOKORO_DEVICE: kokoroDevice,
+    // Persist MIGraphX compile cache across runs (first load can be slow).
+    ORT_MIGRAPHX_CACHE_PATH: process.env.ORT_MIGRAPHX_CACHE_PATH || cacheRoot,
+    ORT_MIGRAPHX_MODEL_CACHE_PATH:
+      process.env.ORT_MIGRAPHX_MODEL_CACHE_PATH || cacheRoot,
+  };
+  // Force CPU EP when the user picks CPU; otherwise clear overrides so GPU EPs win.
+  if (kokoroDevice === "cpu") {
+    baseEnv.AURA_ONNX_PROVIDER = "CPUExecutionProvider";
+    baseEnv.ONNX_PROVIDER = "CPUExecutionProvider";
+  } else {
+    delete baseEnv.AURA_ONNX_PROVIDER;
+    delete baseEnv.ONNX_PROVIDER;
+    // MIGraphX libs live under /opt/rocm/lib — ensure the loader can find them.
+    const libPath = kokoroGpuLibraryPath();
+    if (libPath) baseEnv.LD_LIBRARY_PATH = libPath;
+  }
+
+  const pythonHome =
+    process.env.AURA_PYTHON_HOME || path.join(AURA_ROOT, "python");
+  const bundledCandidates = [
+    path.join(pythonHome, "python.exe"),
+    path.join(pythonHome, "bin", "python3.12"),
+    path.join(pythonHome, "bin", "python3"),
+    path.join(pythonHome, "bin", "python"),
+    // mac packaged framework (shared with MLX builds)
+    path.join(AURA_ROOT, "python", "Python.framework", "Versions", "3.12", "bin", "python3.12"),
+  ];
+  const bundledPython = bundledCandidates.find((p) => fs.existsSync(p));
+  const venvCandidates = [
+    path.join(ttsDir, ".venv", "Scripts", "python.exe"),
+    path.join(ttsDir, ".venv", "bin", "python"),
+  ];
+  const venvPython = venvCandidates.find((p) => fs.existsSync(p));
+
+  if (bundledPython && fs.existsSync(sitePackages)) {
+    return {
+      command: bundledPython,
+      args: ["tts_server.py", "--host", "127.0.0.1", "--port", String(TTS_PORT)],
+      cwd: ttsDir,
+      env: {
+        ...baseEnv,
+        PYTHONHOME:
+          bundledPython.includes("Python.framework")
+            ? path.join(AURA_ROOT, "python", "Python.framework", "Versions", "3.12")
+            : pythonHome,
+        PYTHONPATH: sitePackages,
+        PYTHONNOUSERSITE: "1",
+      },
+    };
+  }
+
+  if (venvPython) {
+    return {
+      command: venvPython,
+      args: ["tts_server.py", "--host", "127.0.0.1", "--port", String(TTS_PORT)],
+      cwd: ttsDir,
+      env: baseEnv,
+    };
+  }
+
+  throw new Error(
+    `Kokoro TTS runtime não encontrado em ${ttsDir} (site-packages ou .venv).\n` +
+      `Configure com: bun run setup:tts:kokoro`
+  );
+}
+
 function resolveQwenLaunch(): {
   command: string;
   args: string[];
@@ -111,7 +213,7 @@ function resolveQwenLaunch(): {
   env: NodeJS.ProcessEnv;
 } {
   const previewDir = path.join(AURA_ROOT, "assets", "voice-previews");
-  const modelsDir = resolveModelsDir(AURA_ROOT, AURA_DATA_DIR);
+  const modelsDir = resolveModelsDir(AURA_ROOT, AURA_DATA_DIR, "qwen3");
   const accel = readTtsAccel();
   const useTorch = process.platform === "win32" || process.platform === "linux";
   const ttsDir = useTorch
@@ -183,7 +285,6 @@ function resolveQwenLaunch(): {
   const bundledPython = path.join(pythonHome, "bin", "python3.12");
   const venvPython = path.join(ttsDir, ".venv", "bin", "python");
 
-  // Packaged layout: framework python + copied site-packages (relocatable).
   if (fs.existsSync(bundledPython) && fs.existsSync(sitePackages)) {
     return {
       command: bundledPython,
@@ -198,7 +299,6 @@ function resolveQwenLaunch(): {
     };
   }
 
-  // Dev / checkout layout: project venv.
   if (fs.existsSync(venvPython)) {
     return {
       command: venvPython,
@@ -213,31 +313,58 @@ function resolveQwenLaunch(): {
   );
 }
 
+function resolveTtsLaunch(engine: TtsEngineId = activeTtsEngine()): {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  engine: TtsEngineId;
+} {
+  if (engine === "kokoro") {
+    return { ...resolveKokoroLaunch(), engine };
+  }
+  return { ...resolveQwenLaunch(), engine };
+}
+
 function getModelsStatus() {
   return getModelsStatusFromManager(AURA_ROOT, AURA_DATA_DIR);
 }
 
-async function isTtsProcessReady(): Promise<boolean> {
+async function isTtsProcessReady(engine?: TtsEngineId): Promise<boolean> {
+  const want = engine ?? activeTtsEngine();
+  if (ttsRunningEngine && ttsRunningEngine !== want) return false;
   try {
     const ttsRes = await fetch(`${TTS_URL}/health`);
     if (!ttsRes.ok) return false;
-    const body = (await ttsRes.json()) as { ready?: boolean };
-    return body.ready !== false;
+    const body = (await ttsRes.json()) as { ready?: boolean; provider?: string };
+    if (body.ready === false) return false;
+    if (want === "kokoro" && body.provider && body.provider !== "kokoro") return false;
+    if (want === "qwen3" && body.provider === "kokoro") return false;
+    return true;
   } catch {
     return false;
   }
 }
 
-/** Start the Qwen TTS process on first need (preview / narrate). */
+/** Start the active TTS process on first need (preview / narrate). */
 async function ensureTtsRunning(timeoutMs = 90_000): Promise<void> {
-  if (await isTtsProcessReady()) return;
+  const engine = activeTtsEngine();
+  if (await isTtsProcessReady(engine)) return;
   if (ttsStartPromise) {
     await ttsStartPromise;
     return;
   }
 
   ttsStartPromise = (async () => {
-    if (await isTtsProcessReady()) return;
+    if (await isTtsProcessReady(engine)) return;
+
+    // Wrong engine still listening — stop before respawn.
+    if (ttsChild || (await isTtsProcessAlive())) {
+      console.log(`[TTS] Restarting for engine=${engine} (was ${ttsRunningEngine || "unknown"})`);
+      await unloadTtsModel().catch(() => undefined);
+      stopManagedTts();
+      await new Promise((r) => setTimeout(r, 400));
+    }
 
     const status = getModelsStatus();
     if (!status.ready) {
@@ -246,40 +373,52 @@ async function ensureTtsRunning(timeoutMs = 90_000): Promise<void> {
       );
     }
 
-    const launch = resolveQwenLaunch();
+    const launch = resolveTtsLaunch(engine);
+    const label = engine === "kokoro" ? "Kokoro" : "Qwen3";
 
     if (!ttsChild || ttsChild.killed || ttsChild.exitCode !== null) {
-      console.log(`[TTS] Starting Qwen3 TTS lazily on port ${TTS_PORT}...`);
+      console.log(`[TTS] Starting ${label} TTS lazily on port ${TTS_PORT}...`);
+      ttsRunningEngine = engine;
       ttsChild = spawn(launch.command, launch.args, {
         cwd: launch.cwd,
         env: launch.env,
         stdio: "inherit",
       });
       ttsChild.on("exit", (code, signal) => {
-        console.warn(`[TTS] qwen-tts exited (code=${code}, signal=${signal})`);
+        console.warn(`[TTS] ${label} exited (code=${code}, signal=${signal})`);
         ttsChild = null;
+        ttsRunningEngine = null;
       });
     }
 
     const started = Date.now();
     let lastLog = 0;
     while (Date.now() - started < timeoutMs) {
-      if (await isTtsProcessReady()) {
-        console.log("[TTS] Qwen3 TTS is ready (model loads on first conversion).");
+      if (await isTtsProcessReady(engine)) {
+        console.log(`[TTS] ${label} TTS is ready (model loads on first conversion).`);
         return;
       }
       if (Date.now() - lastLog > 5_000) {
-        console.log("[TTS] still waiting for Qwen TTS server...");
+        console.log(`[TTS] still waiting for ${label} TTS server...`);
         lastLog = Date.now();
       }
       await new Promise((r) => setTimeout(r, 400));
     }
-    throw new Error(`Qwen3 TTS did not become ready within ${timeoutMs / 1000}s`);
+    throw new Error(`${label} TTS did not become ready within ${timeoutMs / 1000}s`);
   })().finally(() => {
     ttsStartPromise = null;
   });
 
   await ttsStartPromise;
+}
+
+async function isTtsProcessAlive(): Promise<boolean> {
+  try {
+    const ttsRes = await fetch(`${TTS_URL}/health`);
+    return ttsRes.ok;
+  } catch {
+    return false;
+  }
 }
 
 function stopManagedTts() {
@@ -291,6 +430,7 @@ function stopManagedTts() {
     }
   }
   ttsChild = null;
+  ttsRunningEngine = null;
 }
 
 process.on("exit", stopManagedTts);
@@ -645,9 +785,9 @@ async function cancelTtsJob(jobId: string): Promise<void> {
   }
 }
 
-/** Release Qwen TTS weights from memory (no-op if TTS is not running). */
+/** Release TTS weights from memory (no-op if TTS is not running). */
 async function unloadTtsModel(): Promise<void> {
-  if (!(await isTtsProcessReady())) return;
+  if (!(await isTtsProcessAlive())) return;
   try {
     const res = await fetch(`${TTS_URL}/tts/unload`, { method: "POST" });
     if (!res.ok) {
@@ -882,7 +1022,7 @@ function splitTextIntoChunks(text: string, maxChunkLength = 240): string[] {
 
 // Helper: Convert PCM samples to MP3 using lamejs
 function encodePcmToMp3(samples: Int16Array, sampleRate = 24000, kbps = 128): Buffer {
-  const mp3encoder = new lamejs.Mp3Encoder(1, sampleRate, kbps);
+  const mp3encoder = new Mp3Encoder(1, sampleRate, kbps);
   const mp3Data: Buffer[] = [];
   
   const sampleBlockSize = 1152;
@@ -1045,7 +1185,40 @@ async function ensureVoicePreview(
 app.post("/api/voice-preview", async (req, res) => {
   let didGenerate = false;
   try {
-    const voiceName = String(req.body?.voiceName || "").trim() || "Vivian";
+    const engine = activeTtsEngine();
+    const voiceName =
+      String(req.body?.voiceName || "").trim() ||
+      (engine === "kokoro" ? "af_heart" : "Vivian");
+
+    // Kokoro: synthesize a short clip on the fly (no ICL disk anchor).
+    if (engine === "kokoro") {
+      const { pcm, sampleRate } = await synthesizeWithTts(
+        VOICE_PREVIEW_TEXT,
+        voiceName,
+        undefined,
+        undefined,
+        { skipIcl: true }
+      );
+      didGenerate = true;
+      if (pcm.length === 0) {
+        throw new Error("Prévia Kokoro vazia.");
+      }
+      const samples = new Int16Array(
+        pcm.buffer,
+        pcm.byteOffset,
+        Math.floor(pcm.byteLength / 2)
+      );
+      const wavBuffer = encodePcmToWav(samples, sampleRate);
+      return res.json({
+        audioData: wavBuffer.toString("base64"),
+        mimeType: "audio/wav",
+        voiceName,
+        cached: false,
+        source: "generated",
+        engine,
+      });
+    }
+
     const cacheKey = voiceName.toLowerCase();
 
     const memCached = voicePreviewCache.get(cacheKey);
@@ -1058,6 +1231,7 @@ app.post("/api/voice-preview", async (req, res) => {
         source: "memory",
         filePath: voicePreviewWavPath(cacheKey),
         textPath: voicePreviewTextPath(cacheKey),
+        engine,
       });
     }
 
@@ -1072,6 +1246,7 @@ app.post("/api/voice-preview", async (req, res) => {
         source: "disk",
         filePath: voicePreviewWavPath(cacheKey),
         textPath: voicePreviewTextPath(cacheKey),
+        engine,
       });
     }
 
@@ -1090,10 +1265,10 @@ app.post("/api/voice-preview", async (req, res) => {
       source: "generated",
       filePath: anchor.refAudioPath,
       textPath: voicePreviewTextPath(cacheKey),
+      engine,
     });
   } catch (err: any) {
     console.error("[VoicePreview]", err?.message || err);
-    // Generation may have loaded the model before failing.
     didGenerate = true;
     return res.status(500).json({
       error: err?.message || "Falha ao gerar prévia de voz.",
@@ -1102,6 +1277,75 @@ app.post("/api/voice-preview", async (req, res) => {
     if (didGenerate) {
       await unloadTtsModel();
     }
+  }
+});
+
+// Active TTS engine (qwen3 | kokoro)
+app.get("/api/tts-engine", (_req, res) => {
+  try {
+    const status = getModelsStatus();
+    res.json({
+      engine: status.engine,
+      engines: status.engines,
+      voices: status.voices,
+      ready: status.ready,
+      kokoroDevice: status.kokoroDevice,
+      kokoroAccel: status.kokoroAccel,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
+app.post("/api/tts-engine", async (req, res) => {
+  try {
+    const nextEngine = req.body?.engine;
+    const nextDevice = req.body?.kokoroDevice;
+    const hasEngine = nextEngine !== undefined && nextEngine !== null;
+    const hasDevice = nextDevice !== undefined && nextDevice !== null;
+
+    if (hasEngine && !isTtsEngineId(nextEngine)) {
+      return res.status(400).json({ error: 'engine must be "qwen3" or "kokoro"' });
+    }
+    if (hasDevice && !isKokoroDeviceId(nextDevice)) {
+      return res.status(400).json({ error: 'kokoroDevice must be "cpu" or "gpu"' });
+    }
+    if (!hasEngine && !hasDevice) {
+      return res.status(400).json({
+        error: 'Provide "engine" and/or "kokoroDevice"',
+      });
+    }
+
+    const prevEngine = activeTtsEngine();
+    const prevDevice = readKokoroDevice(AURA_DATA_DIR);
+
+    if (hasEngine) writeTtsEngine(AURA_DATA_DIR, nextEngine);
+    if (hasDevice) writeKokoroDevice(AURA_DATA_DIR, nextDevice);
+
+    const engineChanged = hasEngine && prevEngine !== nextEngine;
+    const deviceChanged = hasDevice && prevDevice !== nextDevice;
+    // Restart TTS if engine changed, or Kokoro device changed while Kokoro is active.
+    const needRestart =
+      engineChanged ||
+      (deviceChanged && (hasEngine ? nextEngine === "kokoro" : prevEngine === "kokoro"));
+
+    if (needRestart) {
+      await unloadTtsModel().catch(() => undefined);
+      stopManagedTts();
+    }
+
+    const status = getModelsStatus();
+    res.json({
+      engine: status.engine,
+      engines: status.engines,
+      voices: status.voices,
+      ready: status.ready,
+      kokoroDevice: status.kokoroDevice,
+      kokoroAccel: status.kokoroAccel,
+      restarted: needRestart,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || String(err) });
   }
 });
 
@@ -1215,8 +1459,9 @@ app.get("/api/health", async (req, res) => {
     time: new Date().toISOString(),
     models,
     tts: {
-      provider: "qwen3-tts",
-      backend: process.platform === "darwin" ? "mlx" : "torch",
+      provider: models.engine === "kokoro" ? "kokoro" : "qwen3-tts",
+      backend: models.backend,
+      engine: models.engine,
       url: TTS_URL,
       ready: ttsReady,
       modelLoaded,
@@ -1470,33 +1715,35 @@ app.post("/api/narrate-stream", async (req, res) => {
       total: totalChunks,
     });
 
-    // Ensure preview WAV+TXT exists — used as ICL voice anchor for every chunk.
-    sendEvent({
-      type: "status",
-      step: "pre_tts",
-      message: "Preparando âncora de voz (prévia) para tom consistente...",
-    });
-    let voiceAnchor: { refAudioPath: string; refText: string };
-    try {
-      voiceAnchor = await ensureVoicePreview(voice);
-      console.log(
-        `[NarrateStream] Voice anchor: ${voiceAnchor.refAudioPath}`
-      );
-    } catch (anchorErr: any) {
+    // Qwen: ensure preview WAV+TXT for ICL. Kokoro: speaker id only.
+    const engine = activeTtsEngine();
+    let voiceAnchor: { refAudioPath: string; refText: string } | null = null;
+    if (engine === "qwen3") {
       sendEvent({
-        type: "error",
-        error:
-          anchorErr?.message ||
-          "Falha ao preparar a âncora de voz. Gere a prévia da voz no seletor e tente de novo.",
+        type: "status",
+        step: "pre_tts",
+        message: "Preparando âncora de voz (prévia) para tom consistente...",
       });
-      return res.end();
+      try {
+        voiceAnchor = await ensureVoicePreview(voice);
+        console.log(`[NarrateStream] Voice anchor: ${voiceAnchor.refAudioPath}`);
+      } catch (anchorErr: any) {
+        sendEvent({
+          type: "error",
+          error:
+            anchorErr?.message ||
+            "Falha ao preparar a âncora de voz. Gere a prévia da voz no seletor e tente de novo.",
+        });
+        return res.end();
+      }
     }
 
-    // Run Text-To-Speech via local Qwen3-TTS for each chunk
+    // Run Text-To-Speech via local engine for each chunk
     const pcmChunks: Buffer[] = [];
     let sampleRate = 24000;
     let wasStoppedEarly = false;
     const taskAbort = taskId ? activeTasks.get(taskId)?.abort : undefined;
+    const engineLabel = engine === "kokoro" ? "Kokoro" : "Qwen3";
     
     for (let i = 0; i < totalChunks; i++) {
       // Check if task has been cancelled / stopped
@@ -1517,17 +1764,16 @@ app.post("/api/narrate-stream", async (req, res) => {
         step: "tts", 
         current: partNum, 
         total: totalChunks, 
-        message: `Narrando parte ${partNum} de ${totalChunks} (Qwen3 TTS)...` 
+        message: `Narrando parte ${partNum} de ${totalChunks} (${engineLabel})...` 
       });
 
       const heartbeat = setInterval(() => {
-        // Keep SSE alive and UI informed while TTS runs (no bytes until finished)
         sendEvent({
           type: "status",
           step: "tts",
           current: partNum,
           total: totalChunks,
-          message: `Narrando parte ${partNum} de ${totalChunks} — Qwen ainda gerando...`,
+          message: `Narrando parte ${partNum} de ${totalChunks} — ${engineLabel} ainda gerando...`,
         });
       }, 10_000);
 
@@ -1537,18 +1783,20 @@ app.post("/api/narrate-stream", async (req, res) => {
           voice,
           taskId,
           taskAbort?.signal,
-          {
-            refAudioPath: voiceAnchor.refAudioPath,
-            refText: voiceAnchor.refText,
-          }
+          voiceAnchor
+            ? {
+                refAudioPath: voiceAnchor.refAudioPath,
+                refText: voiceAnchor.refText,
+              }
+            : { skipIcl: true }
         );
         sampleRate = sr;
         if (i === 0) {
           console.log(
-            `[NarrateStream] Chunk 1 TTS done (voice=${voice}, icl=${!!icl}, cancelled=${cancelled}, anchor=${voiceAnchor.refAudioPath})`
+            `[NarrateStream] Chunk 1 TTS done (engine=${engine}, voice=${voice}, icl=${!!icl}, cancelled=${cancelled})`
           );
         }
-        if (!icl && !cancelled) {
+        if (engine === "qwen3" && !icl && !cancelled) {
           console.warn(
             `[NarrateStream] Chunk ${partNum}: ICL not used for voice=${voice} — ` +
               "preview anchor may be missing or Base encoder not ready."
@@ -1577,7 +1825,10 @@ app.post("/api/narrate-stream", async (req, res) => {
       if (wasStoppedEarly) {
         sendEvent({ type: "error", error: "A geração de áudio foi interrompida pelo usuário antes que qualquer parte pudesse ser narrada." });
       } else {
-        sendEvent({ type: "error", error: "A geração de áudio falhou para todas as partes do texto. Verifique se o servidor Qwen3 TTS está rodando." });
+        sendEvent({
+          type: "error",
+          error: `A geração de áudio falhou para todas as partes do texto. Verifique se o servidor ${engineLabel} TTS está rodando.`,
+        });
       }
       return res.end();
     }
@@ -1652,17 +1903,29 @@ app.post("/api/narrate", async (req, res) => {
     });
 
     const textChunks = splitTextIntoChunks(extractedText, 240);
-    const voiceAnchor = await ensureVoicePreview(voice);
+    const engine = activeTtsEngine();
+    let voiceAnchor: { refAudioPath: string; refText: string } | null = null;
+    if (engine === "qwen3") {
+      voiceAnchor = await ensureVoicePreview(voice);
+    }
     const pcmChunks: Buffer[] = [];
     let sampleRate = 24000;
     
     for (let i = 0; i < textChunks.length; i++) {
       const chunk = textChunks[i];
       try {
-        const { pcm, sampleRate: sr } = await synthesizeWithTts(chunk, voice, undefined, undefined, {
-          refAudioPath: voiceAnchor.refAudioPath,
-          refText: voiceAnchor.refText,
-        });
+        const { pcm, sampleRate: sr } = await synthesizeWithTts(
+          chunk,
+          voice,
+          undefined,
+          undefined,
+          voiceAnchor
+            ? {
+                refAudioPath: voiceAnchor.refAudioPath,
+                refText: voiceAnchor.refText,
+              }
+            : { skipIcl: true }
+        );
         sampleRate = sr;
         if (pcm.length > 0) {
           pcmChunks.push(pcm);
@@ -1673,7 +1936,9 @@ app.post("/api/narrate", async (req, res) => {
     }
 
     if (pcmChunks.length === 0) {
-      return res.status(500).json({ error: "A geração de áudio falhou para todas as partes do texto. Verifique se o servidor Qwen3 TTS está rodando." });
+      return res.status(500).json({
+        error: `A geração de áudio falhou para todas as partes do texto. Verifique se o servidor ${engine === "kokoro" ? "Kokoro" : "Qwen3"} TTS está rodando.`,
+      });
     }
 
     const combinedPcm = Buffer.concat(pcmChunks);

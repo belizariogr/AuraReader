@@ -1,0 +1,8 @@
+# Base deps — onnxruntime flavor is installed by setup-kokoro-tts.cjs
+# (--accel=cpu|cuda|rocm|dml|auto). Do not pin onnxruntime here.
+kokoro-onnx>=0.4.9
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.0.0
+numpy>=1.26.0
+soundfile>=0.12.0

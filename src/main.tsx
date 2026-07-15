@@ -14,11 +14,40 @@ type GpuInfo = {
   summary: string;
 };
 
+type EngineId = "qwen3" | "kokoro";
+
+type EngineInfo = {
+  ready: boolean;
+  modelsDir: string;
+  label: string;
+  description: string;
+  models: Array<{
+    id: string;
+    folder: string;
+    label: string;
+    present: boolean;
+    approxBytes: number;
+  }>;
+};
+
 type ModelsStatus = {
   ready: boolean;
   modelsDir: string;
-  backend?: "torch" | "mlx";
+  engine?: EngineId;
+  kokoroDevice?: "cpu" | "gpu";
+  kokoroAccel?: {
+    requested: "cpu" | "gpu";
+    effective: "gpu" | "cpu";
+    gpuReady: boolean;
+    availableProviders: string[];
+    hint: string | null;
+  };
+  backend?: "torch" | "mlx" | "onnx";
   gpu?: GpuInfo;
+  engines?: {
+    qwen3: EngineInfo;
+    kokoro: EngineInfo;
+  };
   models: Array<{
     id: string;
     folder: string;
@@ -46,7 +75,6 @@ function Root() {
       try {
         const body = await refreshStatus();
         if (cancelled) return;
-        // First install: force management screen until models exist
         if (!body.ready) setManageModels(true);
       } catch (err: any) {
         if (!cancelled) setError(err?.message || "Não foi possível verificar os modelos.");
@@ -97,6 +125,10 @@ function Root() {
         modelsDir={status.modelsDir}
         gpu={status.gpu}
         backend={status.backend}
+        engine={status.engine || "qwen3"}
+        engines={status.engines}
+        kokoroDevice={status.kokoroDevice || "gpu"}
+        kokoroAccel={status.kokoroAccel}
         onStatusChange={(models, modelsDir, extra) => {
           setStatus((s) =>
             s
@@ -108,6 +140,12 @@ function Root() {
                   ...(extra?.gpu !== undefined ? { gpu: extra.gpu ?? undefined } : {}),
                   ...(extra?.backend
                     ? { backend: extra.backend as ModelsStatus["backend"] }
+                    : {}),
+                  ...(extra?.engine ? { engine: extra.engine } : {}),
+                  ...(extra?.engines ? { engines: extra.engines } : {}),
+                  ...(extra?.kokoroDevice ? { kokoroDevice: extra.kokoroDevice } : {}),
+                  ...(extra?.kokoroAccel !== undefined
+                    ? { kokoroAccel: extra.kokoroAccel ?? undefined }
                     : {}),
                 }
               : s

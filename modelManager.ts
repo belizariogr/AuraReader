@@ -1,6 +1,6 @@
 /**
- * Local TTS model install status + Hugging Face downloads (no Python).
- * Model repos differ by platform: MLX on darwin, official Qwen on win/linux.
+ * Local TTS model install status + downloads (no Python).
+ * Supports Qwen3 (HF repos by platform) and Kokoro (direct ONNX assets).
  */
 import fs from "fs";
 import path from "path";
@@ -8,13 +8,23 @@ import { pipeline } from "stream/promises";
 import { Readable } from "stream";
 import type { ReadableStream as WebReadableStream } from "stream/web";
 import { detectGpu, type GpuDetectResult } from "./gpuDetect";
+import { probeKokoroAccel } from "./kokoroAccel";
+import {
+  readTtsEngine,
+  readKokoroDevice,
+  type TtsEngineId,
+  voicesForEngine,
+} from "./ttsEngine";
 
 export type ModelSpec = {
   id: string;
   folder: string;
   label: string;
+  /** Hugging Face repo (Qwen) or empty for direct URL assets (Kokoro). */
   repo: string;
   approxBytes: number;
+  /** Direct file downloads (Kokoro). */
+  files?: Array<{ name: string; url: string; approxBytes: number }>;
 };
 
 const MLX_MODELS: ModelSpec[] = [
@@ -51,16 +61,49 @@ const TORCH_MODELS: ModelSpec[] = [
   },
 ];
 
+const KOKORO_RELEASE =
+  "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0";
+
+const KOKORO_MODELS: ModelSpec[] = [
+  {
+    id: "kokoro",
+    folder: "kokoro",
+    label: "Kokoro 82M (ONNX + vozes)",
+    repo: "",
+    approxBytes: 325_000_000 + 28_000_000,
+    files: [
+      {
+        name: "kokoro-v1.0.onnx",
+        url: `${KOKORO_RELEASE}/kokoro-v1.0.onnx`,
+        approxBytes: 325_000_000,
+      },
+      {
+        name: "voices-v1.0.bin",
+        url: `${KOKORO_RELEASE}/voices-v1.0.bin`,
+        approxBytes: 28_000_000,
+      },
+    ],
+  },
+];
+
 export function isTorchTtsPlatform(platform = process.platform): boolean {
   return platform === "win32" || platform === "linux";
 }
 
-export function getRequiredModels(platform = process.platform): ModelSpec[] {
+export function getQwenModels(platform = process.platform): ModelSpec[] {
   return isTorchTtsPlatform(platform) ? TORCH_MODELS : MLX_MODELS;
 }
 
-/** Models required on this host OS. */
-export const REQUIRED_MODELS: ModelSpec[] = getRequiredModels();
+export function getRequiredModels(
+  engine: TtsEngineId = "qwen3",
+  platform = process.platform
+): ModelSpec[] {
+  if (engine === "kokoro") return KOKORO_MODELS;
+  return getQwenModels(platform);
+}
+
+/** @deprecated Prefer getRequiredModels(readTtsEngine(...)) */
+export const REQUIRED_MODELS: ModelSpec[] = getQwenModels();
 
 export type ProgressEvent = Record<string, unknown>;
 
@@ -97,26 +140,70 @@ export function modelFolderReady(folderPath: string): boolean {
         continue;
       }
       if (st.isDirectory()) stack.push(full);
-      // Require real weights — config/json alone means an incomplete download.
       else if (/\.(safetensors|npz)$/i.test(name)) return true;
     }
   }
   return false;
 }
 
-export function projectModelsDir(auraRoot: string, platform = process.platform): string {
+export function kokoroAssetsReady(folderPath: string): boolean {
+  if (!fs.existsSync(folderPath) || !fs.statSync(folderPath).isDirectory()) return false;
+  const onnx = path.join(folderPath, "kokoro-v1.0.onnx");
+  const voices = path.join(folderPath, "voices-v1.0.bin");
+  try {
+    return (
+      fs.existsSync(onnx) &&
+      fs.statSync(onnx).size > 1_000_000 &&
+      fs.existsSync(voices) &&
+      fs.statSync(voices).size > 1_000_000
+    );
+  } catch {
+    return false;
+  }
+}
+
+function specReady(spec: ModelSpec, folderPath: string): boolean {
+  if (spec.files?.length) return kokoroAssetsReady(folderPath);
+  return modelFolderReady(folderPath);
+}
+
+export function projectModelsDir(
+  auraRoot: string,
+  engine: TtsEngineId = "qwen3",
+  platform = process.platform
+): string {
+  if (engine === "kokoro") {
+    return path.join(auraRoot, "tts", "kokoro", "models");
+  }
   if (isTorchTtsPlatform(platform)) {
     return path.join(auraRoot, "tts", "torch", "models");
   }
   return path.join(auraRoot, "qwen3-tts-apple-silicon", "models");
 }
 
-export function resolveModelsDir(auraRoot: string, auraDataDir: string): string {
+export function resolveModelsDir(
+  auraRoot: string,
+  auraDataDir: string,
+  engine?: TtsEngineId
+): string {
+  const active = engine ?? readTtsEngine(auraDataDir);
+  if (active === "kokoro") {
+    if (process.env.KOKORO_MODEL_DIR) {
+      return path.resolve(process.env.KOKORO_MODEL_DIR);
+    }
+    const projectModels = projectModelsDir(auraRoot, "kokoro");
+    const dataModels = path.join(auraDataDir, "models", "kokoro");
+    if (kokoroAssetsReady(projectModels)) return projectModels;
+    if (kokoroAssetsReady(dataModels)) return dataModels;
+    if (path.resolve(auraDataDir) !== path.resolve(auraRoot)) return dataModels;
+    return projectModels;
+  }
+
   if (process.env.QWEN_TTS_MODELS_DIR) {
     return path.resolve(process.env.QWEN_TTS_MODELS_DIR);
   }
-  const models = getRequiredModels();
-  const projectModels = projectModelsDir(auraRoot);
+  const models = getQwenModels();
+  const projectModels = projectModelsDir(auraRoot, "qwen3");
   const dataModels = path.join(auraDataDir, "models");
   const projectReady = models.every((m) =>
     modelFolderReady(path.join(projectModels, m.folder))
@@ -130,11 +217,16 @@ export function resolveModelsDir(auraRoot: string, auraDataDir: string): string 
   return projectModels;
 }
 
-export function getModelsStatus(auraRoot: string, auraDataDir: string) {
-  const modelsDir = resolveModelsDir(auraRoot, auraDataDir);
-  const models = getRequiredModels().map((m) => {
-    const folderPath = path.join(modelsDir, m.folder);
-    const present = modelFolderReady(folderPath);
+function engineStatusBlock(
+  auraRoot: string,
+  auraDataDir: string,
+  engine: TtsEngineId
+) {
+  const modelsDir = resolveModelsDir(auraRoot, auraDataDir, engine);
+  const models = getRequiredModels(engine).map((m) => {
+    const folderPath =
+      engine === "kokoro" ? modelsDir : path.join(modelsDir, m.folder);
+    const present = specReady(m, folderPath);
     return {
       id: m.id,
       folder: m.folder,
@@ -142,18 +234,54 @@ export function getModelsStatus(auraRoot: string, auraDataDir: string) {
       present,
       approxBytes: m.approxBytes,
       path: folderPath,
-      downloading: downloadActive,
     };
   });
-  const gpu: GpuDetectResult = detectGpu(auraRoot);
   return {
     ready: models.every((m) => m.present),
     modelsDir,
     models,
+    voices: voicesForEngine(engine),
+  };
+}
+
+export function getModelsStatus(auraRoot: string, auraDataDir: string) {
+  const engine = readTtsEngine(auraDataDir);
+  const kokoroDevice = readKokoroDevice(auraDataDir);
+  const active = engineStatusBlock(auraRoot, auraDataDir, engine);
+  const qwen3 = engineStatusBlock(auraRoot, auraDataDir, "qwen3");
+  const kokoro = engineStatusBlock(auraRoot, auraDataDir, "kokoro");
+  const gpu: GpuDetectResult = detectGpu(auraRoot);
+  return {
+    ready: active.ready,
+    engine,
+    kokoroDevice,
+    modelsDir: active.modelsDir,
+    models: active.models.map((m) => ({ ...m, downloading: downloadActive })),
+    engines: {
+      qwen3: {
+        ready: qwen3.ready,
+        modelsDir: qwen3.modelsDir,
+        models: qwen3.models,
+        voices: qwen3.voices,
+        label: "Qwen3-TTS",
+        description: "Alta qualidade com clonagem de voz (ICL).",
+      },
+      kokoro: {
+        ready: kokoro.ready,
+        modelsDir: kokoro.modelsDir,
+        models: kokoro.models,
+        voices: kokoro.voices,
+        label: "Kokoro",
+        description: "Rápido e leve (ONNX) — ideal em AMD/CPU.",
+      },
+    },
     downloading: downloadActive,
-    backend: isTorchTtsPlatform() ? "torch" : "mlx",
+    backend:
+      engine === "kokoro" ? "onnx" : isTorchTtsPlatform() ? "torch" : "mlx",
     platform: process.platform,
     gpu,
+    voices: active.voices,
+    kokoroAccel: probeKokoroAccel(auraRoot, kokoroDevice),
   };
 }
 
@@ -186,35 +314,33 @@ function ensureParentDir(filePath: string) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
 }
 
-async function downloadFile(
-  repo: string,
-  relativePath: string,
+async function downloadUrlToFile(
+  url: string,
   destPath: string,
   expectedSize: number,
   signal: AbortSignal,
-  onBytes: (received: number, total: number) => void
+  onBytes: (received: number, total: number) => void,
+  headers: Record<string, string> = { "User-Agent": "AuraReader/0.0.1" }
 ): Promise<number> {
-  const url = `https://huggingface.co/${repo}/resolve/main/${relativePath.split("/").map(encodeURIComponent).join("/")}`;
   const partialPath = `${destPath}.partial`;
 
-  // Resume if partial exists
   let startAt = 0;
   if (fs.existsSync(partialPath)) {
     startAt = fs.statSync(partialPath).size;
   } else if (fs.existsSync(destPath) && expectedSize > 0) {
     const existing = fs.statSync(destPath).size;
-    if (existing === expectedSize) {
-      onBytes(expectedSize, expectedSize);
-      return expectedSize;
+    if (existing === expectedSize || (expectedSize > 1_000_000 && existing > expectedSize * 0.95)) {
+      onBytes(existing, existing);
+      return existing;
     }
   }
 
-  const headers = hfHeaders();
-  if (startAt > 0) headers.Range = `bytes=${startAt}-`;
+  const reqHeaders = { ...headers };
+  if (startAt > 0) reqHeaders.Range = `bytes=${startAt}-`;
 
-  const res = await fetch(url, { headers, signal, redirect: "follow" });
+  const res = await fetch(url, { headers: reqHeaders, signal, redirect: "follow" });
   if (!(res.ok || res.status === 206)) {
-    throw new Error(`Download falhou (${relativePath}): HTTP ${res.status}`);
+    throw new Error(`Download falhou (${path.basename(destPath)}): HTTP ${res.status}`);
   }
 
   const totalHeader = res.headers.get("content-length");
@@ -226,7 +352,7 @@ async function downloadFile(
   if (flags === "w" && fs.existsSync(partialPath)) fs.unlinkSync(partialPath);
 
   const body = res.body;
-  if (!body) throw new Error(`Resposta vazia ao baixar ${relativePath}`);
+  if (!body) throw new Error(`Resposta vazia ao baixar ${path.basename(destPath)}`);
 
   let received = flags === "a" ? startAt : 0;
   onBytes(received, total || expectedSize);
@@ -242,14 +368,30 @@ async function downloadFile(
   await pipeline(nodeReadable, writeStream);
 
   if (expectedSize > 0 && received !== expectedSize) {
-    // Some hosts omit exact size; only fail if we got Range resume inconsistency
     if (res.status === 206 && received < expectedSize) {
-      throw new Error(`Arquivo incompleto: ${relativePath} (${received}/${expectedSize})`);
+      throw new Error(
+        `Arquivo incompleto: ${path.basename(destPath)} (${received}/${expectedSize})`
+      );
     }
   }
 
   fs.renameSync(partialPath, destPath);
   return received;
+}
+
+async function downloadFile(
+  repo: string,
+  relativePath: string,
+  destPath: string,
+  expectedSize: number,
+  signal: AbortSignal,
+  onBytes: (received: number, total: number) => void
+): Promise<number> {
+  const url = `https://huggingface.co/${repo}/resolve/main/${relativePath
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/")}`;
+  return downloadUrlToFile(url, destPath, expectedSize, signal, onBytes, hfHeaders());
 }
 
 function formatEta(seconds: number | null): string | null {
@@ -266,13 +408,15 @@ function formatEta(seconds: number | null): string | null {
 export async function downloadMissingModels(options: {
   auraRoot: string;
   auraDataDir: string;
+  engine?: TtsEngineId;
   onEvent: (evt: ProgressEvent) => void;
 }): Promise<void> {
   if (downloadActive) {
     throw new Error("Download já em andamento.");
   }
 
-  const modelsDir = resolveModelsDir(options.auraRoot, options.auraDataDir);
+  const engine = options.engine ?? readTtsEngine(options.auraDataDir);
+  const modelsDir = resolveModelsDir(options.auraRoot, options.auraDataDir, engine);
   fs.mkdirSync(modelsDir, { recursive: true });
 
   const abort = new AbortController();
@@ -293,13 +437,23 @@ export async function downloadMissingModels(options: {
   };
 
   try {
-    emit({ type: "start", modelsDir, backend: isTorchTtsPlatform() ? "torch" : "mlx" }, true);
+    emit(
+      {
+        type: "start",
+        modelsDir,
+        engine,
+        backend:
+          engine === "kokoro" ? "onnx" : isTorchTtsPlatform() ? "torch" : "mlx",
+      },
+      true
+    );
 
-    for (const spec of getRequiredModels()) {
+    for (const spec of getRequiredModels(engine)) {
       if (abort.signal.aborted) throw new Error("Download cancelado.");
 
-      const localDir = path.join(modelsDir, spec.folder);
-      if (modelFolderReady(localDir)) {
+      const localDir =
+        engine === "kokoro" ? modelsDir : path.join(modelsDir, spec.folder);
+      if (specReady(spec, localDir)) {
         emit(
           {
             type: "model_skip",
@@ -307,6 +461,122 @@ export async function downloadMissingModels(options: {
             label: spec.label,
             folder: spec.folder,
             reason: "already_present",
+          },
+          true
+        );
+        continue;
+      }
+
+      fs.mkdirSync(localDir, { recursive: true });
+
+      if (spec.files?.length) {
+        const totalBytes = spec.files.reduce((sum, f) => sum + f.approxBytes, 0);
+        let modelDownloaded = 0;
+
+        emit(
+          {
+            type: "model_start",
+            model: spec.id,
+            label: spec.label,
+            repo: "kokoro-onnx",
+            folder: spec.folder,
+            totalBytes,
+            files: spec.files.length,
+          },
+          true
+        );
+
+        for (let i = 0; i < spec.files.length; i++) {
+          if (abort.signal.aborted) throw new Error("Download cancelado.");
+          const file = spec.files[i];
+          const size = file.approxBytes;
+          const dest = path.join(localDir, file.name);
+
+          emit(
+            {
+              type: "file_start",
+              model: spec.id,
+              label: spec.label,
+              file: file.name,
+              fileIndex: i + 1,
+              fileCount: spec.files.length,
+              fileBytes: size,
+              downloadedBytes: modelDownloaded,
+              totalBytes,
+              percent: totalBytes ? Math.round((1000 * modelDownloaded) / totalBytes) / 10 : 0,
+            },
+            true
+          );
+
+          await downloadUrlToFile(
+            file.url,
+            dest,
+            size,
+            abort.signal,
+            (fileReceived, fileTotal) => {
+              const overallDownloaded = modelDownloaded + fileReceived;
+              const now = Date.now();
+              const dt = (now - lastSpeedAt) / 1000;
+              if (dt >= 0.4) {
+                const instant = (overallDownloaded - lastBytes) / Math.max(dt, 0.001);
+                speedEma = speedEma ? speedEma * 0.7 + instant * 0.3 : instant;
+                lastBytes = overallDownloaded;
+                lastSpeedAt = now;
+              }
+              const remaining = Math.max(0, totalBytes - overallDownloaded);
+              const etaSeconds = speedEma > 1024 ? remaining / speedEma : null;
+              emit({
+                type: "progress",
+                model: spec.id,
+                label: spec.label,
+                file: file.name,
+                fileIndex: i + 1,
+                fileCount: spec.files!.length,
+                fileDownloadedBytes: fileReceived,
+                fileTotalBytes: fileTotal || size,
+                filePercent:
+                  fileTotal || size
+                    ? Math.round((1000 * fileReceived) / (fileTotal || size)) / 10
+                    : 0,
+                downloadedBytes: overallDownloaded,
+                totalBytes,
+                percent: totalBytes
+                  ? Math.round((1000 * overallDownloaded) / totalBytes) / 10
+                  : 0,
+                bytesPerSecond: Math.round(speedEma),
+                etaSeconds: etaSeconds != null ? Math.round(etaSeconds) : null,
+                etaLabel: formatEta(etaSeconds),
+              });
+            }
+          );
+
+          modelDownloaded += fs.statSync(dest).size;
+          emit(
+            {
+              type: "file_done",
+              model: spec.id,
+              file: file.name,
+              fileIndex: i + 1,
+              fileCount: spec.files.length,
+              downloadedBytes: modelDownloaded,
+              totalBytes,
+              percent: totalBytes
+                ? Math.round((1000 * modelDownloaded) / totalBytes) / 10
+                : 100,
+              bytesPerSecond: Math.round(speedEma),
+            },
+            true
+          );
+        }
+
+        emit(
+          {
+            type: "model_done",
+            model: spec.id,
+            label: spec.label,
+            folder: spec.folder,
+            downloadedBytes: modelDownloaded,
+            totalBytes,
           },
           true
         );
@@ -369,8 +639,7 @@ export async function downloadMissingModels(options: {
               lastSpeedAt = now;
             }
             const remaining = Math.max(0, totalBytes - overallDownloaded);
-            const etaSeconds =
-              speedEma > 1024 ? remaining / speedEma : null;
+            const etaSeconds = speedEma > 1024 ? remaining / speedEma : null;
 
             emit({
               type: "progress",
@@ -433,8 +702,8 @@ export async function downloadMissingModels(options: {
     }
 
     const status = getModelsStatus(options.auraRoot, options.auraDataDir);
-    emit({ type: "done", ready: status.ready, modelsDir: status.modelsDir }, true);
-    if (!status.ready) {
+    emit({ type: "done", ready: status.ready, modelsDir: status.modelsDir, engine }, true);
+    if (!status.ready && status.engine === engine) {
       throw new Error("Download terminou, mas os modelos ainda estão incompletos.");
     }
   } catch (err: any) {
@@ -460,26 +729,34 @@ export async function downloadMissingModels(options: {
 export function deleteModels(
   auraRoot: string,
   auraDataDir: string,
-  ids?: string[]
+  ids?: string[],
+  engine?: TtsEngineId
 ): { deleted: string[]; modelsDir: string } {
   if (downloadActive) {
     throw new Error("Cancele o download antes de excluir modelos.");
   }
-  const modelsDir = resolveModelsDir(auraRoot, auraDataDir);
-  const all = getRequiredModels();
-  const targets =
-    ids && ids.length
-      ? all.filter((m) => ids.includes(m.id))
-      : all;
+  const active = engine ?? readTtsEngine(auraDataDir);
+  const modelsDir = resolveModelsDir(auraRoot, auraDataDir, active);
+  const all = getRequiredModels(active);
+  const targets = ids && ids.length ? all.filter((m) => ids.includes(m.id)) : all;
 
   const deleted: string[] = [];
   for (const spec of targets) {
-    const folderPath = path.join(modelsDir, spec.folder);
+    const folderPath =
+      active === "kokoro" ? modelsDir : path.join(modelsDir, spec.folder);
     if (fs.existsSync(folderPath)) {
-      fs.rmSync(folderPath, { recursive: true, force: true });
-      deleted.push(spec.id);
+      if (active === "kokoro") {
+        for (const f of spec.files || []) {
+          const p = path.join(folderPath, f.name);
+          if (fs.existsSync(p)) fs.rmSync(p, { force: true });
+          if (fs.existsSync(`${p}.partial`)) fs.rmSync(`${p}.partial`, { force: true });
+        }
+        deleted.push(spec.id);
+      } else {
+        fs.rmSync(folderPath, { recursive: true, force: true });
+        deleted.push(spec.id);
+      }
     }
-    // Clean leftover partials next to folder name
     const partialRoot = `${folderPath}.partial`;
     if (fs.existsSync(partialRoot)) {
       fs.rmSync(partialRoot, { recursive: true, force: true });
