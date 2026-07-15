@@ -1,0 +1,13 @@
+# Linux (PyTorch official ROCm wheels):
+#   pip install -r requirements-base.txt
+#   pip install -r requirements-rocm.txt --index-url https://download.pytorch.org/whl/rocm6.3
+#
+# Windows (AMD ROCm SDK wheels — Python 3.12 only):
+#   See scripts/prepare-app-resources.cjs ROCM_WINDOWS_WHEELS, or:
+#   pip install --no-cache-dir \
+#     https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torch-2.9.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl
+#
+# torchaudio must come from this index too — qwen-tts otherwise pulls a CUDA
+# PyPI wheel that fails with libcudart.so.* on ROCm/CPU setups.
+torch
+torchaudio

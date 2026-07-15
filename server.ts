@@ -17,6 +17,7 @@ import {
   isModelDownloadActive,
   resolveModelsDir,
 } from "./modelManager";
+import { detectGpu } from "./gpuDetect";
 
 /** Packaged app root (Resources/aura) or project cwd. */
 const AURA_ROOT = process.env.AURA_ROOT
@@ -57,22 +58,67 @@ const TTS_LANGUAGE = process.env.QWEN_TTS_LANGUAGE || "Auto";
 let ttsChild: ChildProcess | null = null;
 let ttsStartPromise: Promise<void> | null = null;
 
+type TtsAccel = "cuda" | "rocm" | "cpu" | "mlx";
+
+function readTtsAccel(): TtsAccel {
+  const metaPath = path.join(AURA_ROOT, "tts-accel.json");
+  try {
+    if (fs.existsSync(metaPath)) {
+      const raw = JSON.parse(fs.readFileSync(metaPath, "utf8")) as { accel?: string };
+      const accel = String(raw.accel || "").toLowerCase();
+      if (accel === "cuda" || accel === "rocm" || accel === "cpu" || accel === "mlx") {
+        return accel;
+      }
+    }
+  } catch {
+    // ignore malformed meta
+  }
+  if (process.platform === "darwin") return "mlx";
+  return "cuda";
+}
+
+function rocmSpawnEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    MIOPEN_FIND_MODE: process.env.MIOPEN_FIND_MODE ?? "2",
+    TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL:
+      process.env.TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL ?? "1",
+  };
+
+  // Consumer RDNA2 (RX 6000 / Navi 21–23) often needs an override on ROCm.
+  if (!process.env.HSA_OVERRIDE_GFX_VERSION) {
+    try {
+      const gpu = detectGpu(AURA_ROOT);
+      const blob = gpu.devices.map((d) => d.name).join(" ").toLowerCase();
+      if (
+        /navi 2[123]|rx 6[789]\d{2}|rx 6800|rx 6900|rx 6700|rx 6600|gfx1030|gfx1031|gfx1032/.test(
+          blob
+        )
+      ) {
+        env.HSA_OVERRIDE_GFX_VERSION = "10.3.0";
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return env;
+}
+
 function resolveQwenLaunch(): {
   command: string;
   args: string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
 } {
-  const qwenDir = path.join(AURA_ROOT, "qwen3-tts-apple-silicon");
-  const previewDir = path.join(AURA_DATA_DIR, "cache", "voice-previews");
-  const sitePackages = path.join(qwenDir, "site-packages");
-  const pythonHome =
-    process.env.AURA_PYTHON_HOME ||
-    path.join(AURA_ROOT, "python", "Python.framework", "Versions", "3.12");
-  const bundledPython = path.join(pythonHome, "bin", "python3.12");
-  const venvPython = path.join(qwenDir, ".venv", "bin", "python");
-
+  const previewDir = path.join(AURA_ROOT, "assets", "voice-previews");
   const modelsDir = resolveModelsDir(AURA_ROOT, AURA_DATA_DIR);
+  const accel = readTtsAccel();
+  const useTorch = process.platform === "win32" || process.platform === "linux";
+  const ttsDir = useTorch
+    ? path.join(AURA_ROOT, "tts", "torch")
+    : path.join(AURA_ROOT, "qwen3-tts-apple-silicon");
+  const sitePackages = path.join(ttsDir, "site-packages");
+
   const baseEnv: NodeJS.ProcessEnv = {
     ...process.env,
     QWEN_TTS_PORT: String(TTS_PORT),
@@ -80,14 +126,69 @@ function resolveQwenLaunch(): {
     QWEN_TTS_PRELOAD: process.env.QWEN_TTS_PRELOAD ?? "0",
     VOICE_PREVIEW_DIR: previewDir,
     QWEN_TTS_MODELS_DIR: modelsDir,
+    ...(accel === "rocm" ? rocmSpawnEnv() : {}),
   };
+
+  if (useTorch) {
+    const pythonHome =
+      process.env.AURA_PYTHON_HOME || path.join(AURA_ROOT, "python");
+    const bundledCandidates = [
+      path.join(pythonHome, "python.exe"),
+      path.join(pythonHome, "bin", "python3.12"),
+      path.join(pythonHome, "bin", "python3"),
+      path.join(pythonHome, "bin", "python"),
+    ];
+    const bundledPython = bundledCandidates.find((p) => fs.existsSync(p));
+    const venvCandidates = [
+      path.join(ttsDir, ".venv", "Scripts", "python.exe"),
+      path.join(ttsDir, ".venv", "bin", "python"),
+    ];
+    const venvPython = venvCandidates.find((p) => fs.existsSync(p));
+
+    if (bundledPython && fs.existsSync(sitePackages)) {
+      return {
+        command: bundledPython,
+        args: ["tts_server.py", "--host", "127.0.0.1", "--port", String(TTS_PORT)],
+        cwd: ttsDir,
+        env: {
+          ...baseEnv,
+          PYTHONHOME: pythonHome,
+          PYTHONPATH: sitePackages,
+          PYTHONNOUSERSITE: "1",
+        },
+      };
+    }
+
+    if (venvPython) {
+      return {
+        command: venvPython,
+        args: ["tts_server.py", "--host", "127.0.0.1", "--port", String(TTS_PORT)],
+        cwd: ttsDir,
+        env: baseEnv,
+      };
+    }
+
+    throw new Error(
+      `Qwen TTS (Torch) runtime não encontrado em ${ttsDir} (site-packages ou .venv).\n` +
+        `Configure com: bun run setup:tts\n` +
+        `(AMD → setup:tts -- --accel=rocm | NVIDIA → --accel=cuda | sem GPU → --accel=cpu). ` +
+        `Detalhes: tts/torch/README.md (accel=${accel}).`
+    );
+  }
+
+  // darwin / MLX
+  const pythonHome =
+    process.env.AURA_PYTHON_HOME ||
+    path.join(AURA_ROOT, "python", "Python.framework", "Versions", "3.12");
+  const bundledPython = path.join(pythonHome, "bin", "python3.12");
+  const venvPython = path.join(ttsDir, ".venv", "bin", "python");
 
   // Packaged layout: framework python + copied site-packages (relocatable).
   if (fs.existsSync(bundledPython) && fs.existsSync(sitePackages)) {
     return {
       command: bundledPython,
       args: ["tts_server.py", "--host", "127.0.0.1", "--port", String(TTS_PORT)],
-      cwd: qwenDir,
+      cwd: ttsDir,
       env: {
         ...baseEnv,
         PYTHONHOME: pythonHome,
@@ -102,13 +203,13 @@ function resolveQwenLaunch(): {
     return {
       command: venvPython,
       args: ["tts_server.py", "--host", "127.0.0.1", "--port", String(TTS_PORT)],
-      cwd: qwenDir,
+      cwd: ttsDir,
       env: baseEnv,
     };
   }
 
   throw new Error(
-    `Qwen TTS runtime não encontrado em ${qwenDir} (site-packages ou .venv).`
+    `Qwen TTS runtime não encontrado em ${ttsDir} (site-packages ou .venv).`
   );
 }
 
@@ -544,8 +645,9 @@ async function cancelTtsJob(jobId: string): Promise<void> {
   }
 }
 
-/** Release Qwen TTS weights from memory (no-op if already unloaded). */
+/** Release Qwen TTS weights from memory (no-op if TTS is not running). */
 async function unloadTtsModel(): Promise<void> {
+  if (!(await isTtsProcessReady())) return;
   try {
     const res = await fetch(`${TTS_URL}/tts/unload`, { method: "POST" });
     if (!res.ok) {
@@ -554,7 +656,9 @@ async function unloadTtsModel(): Promise<void> {
     }
     const body = (await res.json()) as { unloaded?: boolean };
     console.log(`[TTS] Model unload:`, body);
-  } catch (err) {
+  } catch (err: any) {
+    const msg = err?.message || String(err);
+    if (/ConnectionRefused|ECONNREFUSED|Unable to connect/i.test(msg)) return;
     console.warn(`[TTS] Failed to unload model:`, err);
   }
 }
@@ -804,7 +908,7 @@ const VOICE_PREVIEW_TEXT =
 /** Bump when preview text or TTS settings change so old disk samples are ignored. */
 const VOICE_PREVIEW_CACHE_VERSION = process.env.QWEN_TTS_PREVIEW_CACHE_VERSION || "en-v2";
 /** WAV + transcript used as voice-reference (ref_audio / ref_text for ICL). */
-const VOICE_PREVIEW_DIR = path.join(AURA_DATA_DIR, "cache", "voice-previews");
+const VOICE_PREVIEW_DIR = path.join(AURA_ROOT, "assets", "voice-previews");
 /** In-memory WAV previews (base64) layered on disk cache. */
 const voicePreviewCache = new Map<string, string>();
 
@@ -884,7 +988,7 @@ async function saveVoicePreviewToDisk(
 
 /**
  * Ensure a disk WAV+TXT voice anchor exists for ICL narration.
- * Reuses cache/voice-previews; synthesizes once with skipIcl if missing.
+ * Reuses assets/voice-previews; synthesizes once with skipIcl if missing.
  */
 async function ensureVoicePreview(
   voiceName: string
@@ -1110,7 +1214,13 @@ app.get("/api/health", async (req, res) => {
     status: "ok",
     time: new Date().toISOString(),
     models,
-    tts: { provider: "qwen3-tts", url: TTS_URL, ready: ttsReady, modelLoaded },
+    tts: {
+      provider: "qwen3-tts",
+      backend: process.platform === "darwin" ? "mlx" : "torch",
+      url: TTS_URL,
+      ready: ttsReady,
+      modelLoaded,
+    },
   });
 });
 

@@ -1,11 +1,13 @@
 /**
  * Local TTS model install status + Hugging Face downloads (no Python).
+ * Model repos differ by platform: MLX on darwin, official Qwen on win/linux.
  */
 import fs from "fs";
 import path from "path";
 import { pipeline } from "stream/promises";
 import { Readable } from "stream";
 import type { ReadableStream as WebReadableStream } from "stream/web";
+import { detectGpu, type GpuDetectResult } from "./gpuDetect";
 
 export type ModelSpec = {
   id: string;
@@ -15,7 +17,7 @@ export type ModelSpec = {
   approxBytes: number;
 };
 
-export const REQUIRED_MODELS: ModelSpec[] = [
+const MLX_MODELS: ModelSpec[] = [
   {
     id: "base",
     folder: "Qwen3-TTS-12Hz-0.6B-Base-8bit",
@@ -31,6 +33,34 @@ export const REQUIRED_MODELS: ModelSpec[] = [
     approxBytes: 2_000_000_000,
   },
 ];
+
+const TORCH_MODELS: ModelSpec[] = [
+  {
+    id: "base",
+    folder: "Qwen3-TTS-12Hz-0.6B-Base",
+    label: "Base (ICL / clonagem de voz)",
+    repo: "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    approxBytes: 1_500_000_000,
+  },
+  {
+    id: "custom",
+    folder: "Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    label: "CustomVoice (prévias e speakers)",
+    repo: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    approxBytes: 1_500_000_000,
+  },
+];
+
+export function isTorchTtsPlatform(platform = process.platform): boolean {
+  return platform === "win32" || platform === "linux";
+}
+
+export function getRequiredModels(platform = process.platform): ModelSpec[] {
+  return isTorchTtsPlatform(platform) ? TORCH_MODELS : MLX_MODELS;
+}
+
+/** Models required on this host OS. */
+export const REQUIRED_MODELS: ModelSpec[] = getRequiredModels();
 
 export type ProgressEvent = Record<string, unknown>;
 
@@ -74,17 +104,25 @@ export function modelFolderReady(folderPath: string): boolean {
   return false;
 }
 
+export function projectModelsDir(auraRoot: string, platform = process.platform): string {
+  if (isTorchTtsPlatform(platform)) {
+    return path.join(auraRoot, "tts", "torch", "models");
+  }
+  return path.join(auraRoot, "qwen3-tts-apple-silicon", "models");
+}
+
 export function resolveModelsDir(auraRoot: string, auraDataDir: string): string {
   if (process.env.QWEN_TTS_MODELS_DIR) {
     return path.resolve(process.env.QWEN_TTS_MODELS_DIR);
   }
-  const projectModels = path.join(auraRoot, "qwen3-tts-apple-silicon", "models");
+  const models = getRequiredModels();
+  const projectModels = projectModelsDir(auraRoot);
   const dataModels = path.join(auraDataDir, "models");
-  const projectReady = REQUIRED_MODELS.every((m) =>
+  const projectReady = models.every((m) =>
     modelFolderReady(path.join(projectModels, m.folder))
   );
   if (projectReady) return projectModels;
-  const dataReady = REQUIRED_MODELS.every((m) =>
+  const dataReady = models.every((m) =>
     modelFolderReady(path.join(dataModels, m.folder))
   );
   if (dataReady) return dataModels;
@@ -94,7 +132,7 @@ export function resolveModelsDir(auraRoot: string, auraDataDir: string): string 
 
 export function getModelsStatus(auraRoot: string, auraDataDir: string) {
   const modelsDir = resolveModelsDir(auraRoot, auraDataDir);
-  const models = REQUIRED_MODELS.map((m) => {
+  const models = getRequiredModels().map((m) => {
     const folderPath = path.join(modelsDir, m.folder);
     const present = modelFolderReady(folderPath);
     return {
@@ -107,11 +145,15 @@ export function getModelsStatus(auraRoot: string, auraDataDir: string) {
       downloading: downloadActive,
     };
   });
+  const gpu: GpuDetectResult = detectGpu(auraRoot);
   return {
     ready: models.every((m) => m.present),
     modelsDir,
     models,
     downloading: downloadActive,
+    backend: isTorchTtsPlatform() ? "torch" : "mlx",
+    platform: process.platform,
+    gpu,
   };
 }
 
@@ -251,9 +293,9 @@ export async function downloadMissingModels(options: {
   };
 
   try {
-    emit({ type: "start", modelsDir }, true);
+    emit({ type: "start", modelsDir, backend: isTorchTtsPlatform() ? "torch" : "mlx" }, true);
 
-    for (const spec of REQUIRED_MODELS) {
+    for (const spec of getRequiredModels()) {
       if (abort.signal.aborted) throw new Error("Download cancelado.");
 
       const localDir = path.join(modelsDir, spec.folder);
@@ -424,10 +466,11 @@ export function deleteModels(
     throw new Error("Cancele o download antes de excluir modelos.");
   }
   const modelsDir = resolveModelsDir(auraRoot, auraDataDir);
+  const all = getRequiredModels();
   const targets =
     ids && ids.length
-      ? REQUIRED_MODELS.filter((m) => ids.includes(m.id))
-      : REQUIRED_MODELS;
+      ? all.filter((m) => ids.includes(m.id))
+      : all;
 
   const deleted: string[] = [];
   for (const spec of targets) {

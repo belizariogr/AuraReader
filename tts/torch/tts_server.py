@@ -1,9 +1,9 @@
 """
-HTTP TTS server wrapping Qwen3-TTS (MLX) for AuraReader.
+HTTP TTS server wrapping Qwen3-TTS (PyTorch / qwen-tts) for AuraReader on Windows/Linux.
 
-Prefers the Lite Base model (0.6B) so narration can use ICL voice cloning with a
-fixed preview WAV+TXT anchor (locks speaker identity across chunks).
-Falls back to CustomVoice if Base is not installed.
+Same API as the MLX server: /health, /tts, /tts/cancel, /tts/unload.
+Prefers Base (ICL voice clone) when a preview anchor exists; CustomVoice for
+skipIcl / speaker-id generation.
 """
 
 from __future__ import annotations
@@ -14,48 +14,32 @@ import gc
 import os
 import threading
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
+import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-from mlx_audio.tts.utils import load_model
-
-try:
-    import mlx.core as mx
-except ImportError:  # pragma: no cover
-    mx = None
+from qwen_tts import Qwen3TTSModel
 
 DEFAULT_SAMPLE_RATE = 24000
 PORT = int(os.environ.get("QWEN_TTS_PORT", os.environ.get("DIA_PORT", "8765")))
 HOST = os.environ.get("QWEN_TTS_HOST", "127.0.0.1")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(SCRIPT_DIR)
-BASE_MODEL_FOLDER = "Qwen3-TTS-12Hz-0.6B-Base-8bit"
-CUSTOM_MODEL_FOLDER = "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit"
+REPO_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+BASE_MODEL_FOLDER = "Qwen3-TTS-12Hz-0.6B-Base"
+CUSTOM_MODEL_FOLDER = "Qwen3-TTS-12Hz-0.6B-CustomVoice"
 MODELS_DIR = os.environ.get(
     "QWEN_TTS_MODELS_DIR",
     os.path.join(SCRIPT_DIR, "models"),
 )
 
-
-def resolve_default_model_folder() -> str:
-    env = os.environ.get("QWEN_TTS_MODEL")
-    if env:
-        return env
-    if os.path.isdir(os.path.join(MODELS_DIR, BASE_MODEL_FOLDER)):
-        return BASE_MODEL_FOLDER
-    return CUSTOM_MODEL_FOLDER
-
-
-DEFAULT_MODEL_FOLDER = resolve_default_model_folder()
 DEFAULT_VOICE = os.environ.get("QWEN_TTS_VOICE", "vivian")
 DEFAULT_LANGUAGE = os.environ.get("QWEN_TTS_LANGUAGE", "Auto")
-# Low temperature keeps prosody stable; ICL anchors lock speaker identity.
 DEFAULT_TEMPERATURE = float(os.environ.get("QWEN_TTS_TEMPERATURE", "0.3"))
 DEFAULT_INSTRUCT = os.environ.get(
     "QWEN_TTS_INSTRUCT",
@@ -75,7 +59,6 @@ VOICE_PREVIEW_DIR = os.environ.get(
 )
 VOICE_PREVIEW_CACHE_VERSION = os.environ.get("QWEN_TTS_PREVIEW_CACHE_VERSION", "en-v2")
 
-# Speakers shared by CustomVoice / common AuraReader ids.
 SPEAKERS = {
     "vivian",
     "serena",
@@ -86,6 +69,19 @@ SPEAKERS = {
     "sohee",
     "eric",
     "dylan",
+}
+
+# qwen-tts CustomVoice expects Title_Case / known display names.
+SPEAKER_API_NAMES = {
+    "vivian": "Vivian",
+    "serena": "Serena",
+    "ryan": "Ryan",
+    "aiden": "Aiden",
+    "uncle_fu": "Uncle_Fu",
+    "ono_anna": "Ono_Anna",
+    "sohee": "Sohee",
+    "eric": "Eric",
+    "dylan": "Dylan",
 }
 
 VOICE_ALIASES = {
@@ -109,6 +105,30 @@ VOICE_ALIASES = {
     "Fenrir": "dylan",
 }
 
+LANGUAGE_MAP = {
+    "auto": "Auto",
+    "en": "English",
+    "english": "English",
+    "zh": "Chinese",
+    "chinese": "Chinese",
+    "ja": "Japanese",
+    "japanese": "Japanese",
+    "ko": "Korean",
+    "korean": "Korean",
+    "de": "German",
+    "german": "German",
+    "fr": "French",
+    "french": "French",
+    "ru": "Russian",
+    "russian": "Russian",
+    "pt": "Portuguese",
+    "portuguese": "Portuguese",
+    "es": "Spanish",
+    "spanish": "Spanish",
+    "it": "Italian",
+    "italian": "Italian",
+}
+
 
 def resolve_voice(name: Optional[str]) -> str:
     if not name:
@@ -129,22 +149,87 @@ def resolve_voice(name: Optional[str]) -> str:
     if alias_ci and alias_ci in SPEAKERS:
         return alias_ci
 
-    for speaker in SPEAKERS:
-        if speaker == lowered:
-            return speaker
-
     return DEFAULT_VOICE if DEFAULT_VOICE in SPEAKERS else "vivian"
 
 
-model = None
+def speaker_api_name(voice: str) -> str:
+    key = resolve_voice(voice)
+    return SPEAKER_API_NAMES.get(key, key.replace("_", " ").title().replace(" ", "_"))
+
+
+def resolve_language(language: Optional[str]) -> str:
+    raw = (language or DEFAULT_LANGUAGE).strip() or DEFAULT_LANGUAGE
+    mapped = LANGUAGE_MAP.get(raw.lower())
+    if mapped:
+        return mapped
+    # Already a display name (English, Auto, …)
+    if raw[:1].isupper():
+        return raw
+    return raw.title()
+
+
+def resolve_device() -> str:
+    override = (os.environ.get("AURA_TTS_DEVICE") or "").strip().lower()
+    if override in ("cpu",):
+        return "cpu"
+    if override in ("cuda", "hip", "rocm", "gpu"):
+        if torch.cuda.is_available():
+            return "cuda"
+        print(f"[qwen-tts] AURA_TTS_DEVICE={override} requested but CUDA/HIP unavailable; using cpu")
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+def detect_accel(device: str) -> str:
+    if device == "cpu" or not torch.cuda.is_available():
+        return "cpu"
+    hip = getattr(torch.version, "hip", None)
+    if hip:
+        return "rocm"
+    return "cuda"
+
+
+def resolve_dtype(device: str):
+    if device == "cpu":
+        return torch.float32
+    # bf16 is widely supported on modern NVIDIA + ROCm RDNA3/4
+    if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+DEVICE = resolve_device()
+ACCEL = detect_accel(DEVICE)
+DTYPE = resolve_dtype(DEVICE)
+
+base_model: Any = None
+custom_model: Any = None
+active_kind: Optional[str] = None  # "base" | "custom"
 model_sample_rate = DEFAULT_SAMPLE_RATE
 model_tts_type = "unknown"
 model_icl_capable = False
 cancel_flags: dict[str, threading.Event] = {}
 cancel_lock = threading.Lock()
-# Serialize load / generate / unload so cancel+unload waits for the current generate.
 model_lock = threading.RLock()
 server_ready = False
+
+
+def model_folder_present(folder_name: str) -> bool:
+    return os.path.isdir(os.path.join(MODELS_DIR, folder_name))
+
+
+def resolve_default_model_folder() -> str:
+    env = os.environ.get("QWEN_TTS_MODEL")
+    if env:
+        return env
+    if model_folder_present(BASE_MODEL_FOLDER):
+        return BASE_MODEL_FOLDER
+    return CUSTOM_MODEL_FOLDER
+
+
+DEFAULT_MODEL_FOLDER = resolve_default_model_folder()
 
 
 def resolve_model_path(folder_name: str) -> str:
@@ -153,7 +238,7 @@ def resolve_model_path(folder_name: str) -> str:
         raise FileNotFoundError(
             f"Model not found at {full_path}. "
             f"Download Base for ICL: "
-            f"huggingface_hub.snapshot_download('mlx-community/{BASE_MODEL_FOLDER}', "
+            f"huggingface_hub.snapshot_download('Qwen/{BASE_MODEL_FOLDER}', "
             f"local_dir='models/{BASE_MODEL_FOLDER}'). "
             f"Or keep CustomVoice at models/{CUSTOM_MODEL_FOLDER}."
         )
@@ -206,156 +291,101 @@ def load_preview_anchor(voice: str) -> tuple[Optional[str], Optional[str]]:
     return wav_path, ref_text
 
 
-def detect_icl_capable(loaded_model) -> tuple[str, bool]:
-    cfg = getattr(loaded_model, "config", None)
-    tts_type = str(getattr(cfg, "tts_model_type", "base") or "base")
-    tokenizer = getattr(loaded_model, "speech_tokenizer", None)
-    has_encoder = bool(getattr(tokenizer, "has_encoder", False))
-    # ICL is the Base path: ref_audio + ref_text + encoder.
-    capable = tts_type == "base" and has_encoder
-    return tts_type, capable
+def gpu_name() -> Optional[str]:
+    if not torch.cuda.is_available():
+        return None
+    try:
+        return torch.cuda.get_device_name(0)
+    except Exception:
+        return None
 
 
-def enable_speech_tokenizer_encoder(loaded_model, model_path: str) -> bool:
-    """Reload speech tokenizer WITH encoder weights.
+def _drop_model(kind: str) -> None:
+    global base_model, custom_model, active_kind, model_tts_type, model_icl_capable
+    if kind == "base":
+        base_model = None
+    elif kind == "custom":
+        custom_model = None
+    if active_kind == kind:
+        active_kind = None
+        model_tts_type = "unknown"
+        model_icl_capable = False
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception as exc:
+            print(f"[qwen-tts] torch.cuda.empty_cache failed: {exc}")
 
-    mlx_audio's post_load_hook currently sets encoder_config=None, which disables
-    ICL even though Base model safetensors include encoder weights. Rebuild here.
-    """
-    import json
-    from pathlib import Path
 
-    import mlx.core as mx_local
-    from mlx_audio.tts.models.qwen3_tts.config import (
-        Qwen3TTSTokenizerConfig,
-        Qwen3TTSTokenizerDecoderConfig,
-        Qwen3TTSTokenizerEncoderConfig,
-        filter_dict_for_dataclass,
+def _load_qwen_model(folder_name: str) -> Any:
+    model_path = resolve_model_path(folder_name)
+    device_map = DEVICE if DEVICE == "cpu" else "cuda:0"
+    print(
+        f"[qwen-tts] Loading {folder_name} from {model_path} "
+        f"(device={device_map}, dtype={DTYPE}, accel={ACCEL}) ..."
     )
-    from mlx_audio.tts.models.qwen3_tts.speech_tokenizer import Qwen3TTSSpeechTokenizer
-
-    speech_tokenizer_path = Path(model_path) / "speech_tokenizer"
-    config_path = speech_tokenizer_path / "config.json"
-    if not config_path.is_file():
-        print(f"[qwen-tts] No speech_tokenizer config at {config_path}")
-        return False
-
-    with open(config_path, encoding="utf-8") as f:
-        tokenizer_config_dict = json.load(f)
-
-    if not tokenizer_config_dict.get("encoder_config"):
-        print("[qwen-tts] speech_tokenizer config has no encoder_config")
-        return False
-
-    decoder_config = None
-    encoder_config = None
-    if "decoder_config" in tokenizer_config_dict:
-        filtered = filter_dict_for_dataclass(
-            Qwen3TTSTokenizerDecoderConfig,
-            tokenizer_config_dict["decoder_config"],
-        )
-        decoder_config = Qwen3TTSTokenizerDecoderConfig(**filtered)
-    if "encoder_config" in tokenizer_config_dict:
-        filtered = filter_dict_for_dataclass(
-            Qwen3TTSTokenizerEncoderConfig,
-            tokenizer_config_dict["encoder_config"],
-        )
-        encoder_config = Qwen3TTSTokenizerEncoderConfig(**filtered)
-
-    tokenizer_config = Qwen3TTSTokenizerConfig(
-        encoder_config=encoder_config,
-        decoder_config=decoder_config,
+    loaded = Qwen3TTSModel.from_pretrained(
+        model_path,
+        device_map=device_map,
+        dtype=DTYPE,
+        attn_implementation="sdpa",
     )
-    for k, v in tokenizer_config_dict.items():
-        if k not in ("decoder_config", "encoder_config") and hasattr(tokenizer_config, k):
-            setattr(tokenizer_config, k, v)
-
-    speech_tokenizer = Qwen3TTSSpeechTokenizer(tokenizer_config)
-    tokenizer_weights = {}
-    for wf in speech_tokenizer_path.glob("*.safetensors"):
-        tokenizer_weights.update(mx_local.load(str(wf)))
-    if not tokenizer_weights:
-        print("[qwen-tts] No speech_tokenizer weights found")
-        return False
-
-    tokenizer_weights = Qwen3TTSSpeechTokenizer.sanitize(tokenizer_weights)
-    speech_tokenizer.load_weights(list(tokenizer_weights.items()), strict=False)
-    mx_local.eval(speech_tokenizer.parameters())
-    speech_tokenizer.eval()
-
-    if speech_tokenizer.encoder_model is not None:
-        quantizer = speech_tokenizer.encoder_model.quantizer
-        for layer in quantizer.rvq_first.vq.layers:
-            layer.codebook.update_in_place()
-        for layer in quantizer.rvq_rest.vq.layers:
-            layer.codebook.update_in_place()
-
-    if not speech_tokenizer.has_encoder:
-        print("[qwen-tts] Encoder still missing after reload")
-        return False
-
-    loaded_model.load_speech_tokenizer(speech_tokenizer)
-    print("[qwen-tts] Speech tokenizer encoder enabled for ICL voice cloning")
-    return True
+    print(f"[qwen-tts] Loaded {folder_name}")
+    return loaded
 
 
-def ensure_model_loaded() -> None:
-    """Load weights on first conversion request (caller must hold model_lock)."""
-    global model, model_sample_rate, model_tts_type, model_icl_capable, DEFAULT_MODEL_FOLDER
-    if model is not None:
+def ensure_model_loaded(kind: str) -> None:
+    """Load Base or CustomVoice. Caller must hold model_lock."""
+    global base_model, custom_model, active_kind, model_sample_rate
+    global model_tts_type, model_icl_capable, DEFAULT_MODEL_FOLDER
+
+    if kind == "base":
+        if base_model is not None:
+            active_kind = "base"
+            model_tts_type = "base"
+            model_icl_capable = True
+            DEFAULT_MODEL_FOLDER = BASE_MODEL_FOLDER
+            return
+        # Free the other model to limit VRAM use.
+        if custom_model is not None:
+            print("[qwen-tts] Unloading CustomVoice to free VRAM for Base")
+            _drop_model("custom")
+        base_model = _load_qwen_model(BASE_MODEL_FOLDER)
+        active_kind = "base"
+        model_tts_type = "base"
+        model_icl_capable = True
+        DEFAULT_MODEL_FOLDER = BASE_MODEL_FOLDER
         return
 
-    DEFAULT_MODEL_FOLDER = resolve_default_model_folder()
-    model_path = resolve_model_path(DEFAULT_MODEL_FOLDER)
-    print(f"[qwen-tts] Loading model from {model_path} ...")
-    loaded = load_model(model_path)
+    if kind == "custom":
+        if custom_model is not None:
+            active_kind = "custom"
+            model_tts_type = "custom_voice"
+            model_icl_capable = False
+            DEFAULT_MODEL_FOLDER = CUSTOM_MODEL_FOLDER
+            return
+        if base_model is not None:
+            print("[qwen-tts] Unloading Base to free VRAM for CustomVoice")
+            _drop_model("base")
+        custom_model = _load_qwen_model(CUSTOM_MODEL_FOLDER)
+        active_kind = "custom"
+        model_tts_type = "custom_voice"
+        model_icl_capable = False
+        DEFAULT_MODEL_FOLDER = CUSTOM_MODEL_FOLDER
+        return
 
-    tts_type, icl_capable = detect_icl_capable(loaded)
-    if tts_type == "base" and not icl_capable:
-        try:
-            if enable_speech_tokenizer_encoder(loaded, model_path):
-                tts_type, icl_capable = detect_icl_capable(loaded)
-        except Exception as exc:
-            print(f"[qwen-tts] Failed to enable ICL encoder: {exc}")
-
-    model = loaded
-    model_sample_rate = int(
-        getattr(loaded, "sample_rate", DEFAULT_SAMPLE_RATE) or DEFAULT_SAMPLE_RATE
-    )
-    model_tts_type, model_icl_capable = tts_type, icl_capable
-    print(
-        f"[qwen-tts] Model loaded (sample_rate={model_sample_rate}, model={DEFAULT_MODEL_FOLDER}, "
-        f"type={model_tts_type}, icl={model_icl_capable}, voice={DEFAULT_VOICE})"
-    )
-    if not model_icl_capable:
-        print(
-            "[qwen-tts] WARNING: Full ICL disabled. "
-            "Will still pass preview ref_audio as x-vector anchor when available."
-        )
+    raise ValueError(f"Unknown model kind: {kind}")
 
 
 def unload_model() -> bool:
-    """Release model weights and MLX cache. Safe to call when already unloaded."""
-    global model, model_tts_type, model_icl_capable
     with model_lock:
-        if model is None:
+        had = base_model is not None or custom_model is not None
+        if not had:
             return False
-        print("[qwen-tts] Unloading model...")
-        model = None
-        model_tts_type = "unknown"
-        model_icl_capable = False
-        gc.collect()
-        if mx is not None:
-            try:
-                mx.clear_cache()
-            except Exception as exc:
-                print(f"[qwen-tts] mx.clear_cache failed: {exc}")
-            try:
-                metal = getattr(mx, "metal", None)
-                if metal is not None and hasattr(metal, "clear_cache"):
-                    metal.clear_cache()
-            except Exception as exc:
-                print(f"[qwen-tts] mx.metal.clear_cache failed: {exc}")
+        print("[qwen-tts] Unloading model(s)...")
+        _drop_model("base")
+        _drop_model("custom")
         print("[qwen-tts] Model unloaded.")
         return True
 
@@ -370,16 +400,11 @@ def synthesize(
     ref_text: Optional[str] = None,
     skip_icl: bool = False,
 ) -> tuple[np.ndarray, int, bool]:
-    """Returns (audio, sample_rate, used_icl).
-
-    Always keeps the selected `voice`. When a preview WAV+TXT exist, also pass
-    them as ref_audio/ref_text so Base ICL (or x-vector) locks tone/energy.
-    """
-    assert model is not None
+    """Returns (audio, sample_rate, used_icl)."""
     text = " ".join(text.split())
+    language = resolve_language(language)
 
     if skip_icl:
-        # Bootstrap preview sample for this speaker id — do not clone from an old anchor.
         ref_audio_path = None
         ref_text = None
     else:
@@ -393,73 +418,55 @@ def synthesize(
     has_ref = bool(
         ref_audio_path and ref_text and os.path.isfile(ref_audio_path)
     )
-    use_icl = bool(model_icl_capable and has_ref)
-
-    # Base narration must clone the selected speaker's preview — never free-form.
-    if not skip_icl and model_tts_type == "base" and not has_ref:
-        raise ValueError(
-            f"Missing voice preview anchor for '{voice}'. "
-            f"Generate the preview first (expected under {VOICE_PREVIEW_DIR})."
-        )
-
-    print(
-        f"[qwen-tts] synthesize voice={voice} icl={use_icl} has_ref={has_ref} "
-        f"ref={ref_audio_path or '-'}"
-    )
+    use_icl = bool(has_ref and not skip_icl and model_folder_present(BASE_MODEL_FOLDER))
 
     if use_icl:
-        # Full ICL: identity comes from the preview WAV of the selected voice.
-        results = list(
-            model.generate(
-                text=text,
-                voice=voice,
-                ref_audio=ref_audio_path,
-                ref_text=ref_text,
-                lang_code=language,
-                temperature=temperature,
-                verbose=False,
-            )
+        ensure_model_loaded("base")
+        assert base_model is not None
+        print(
+            f"[qwen-tts] synthesize voice={voice} icl=True ref={ref_audio_path}"
         )
-    elif has_ref and model_tts_type == "base":
-        # Encoder missing: still pass ref_audio so speaker_encoder x-vector anchors tone.
-        results = list(
-            model.generate(
-                text=text,
-                voice=voice,
-                ref_audio=ref_audio_path,
-                ref_text=ref_text,
-                lang_code=language,
-                temperature=temperature,
-                verbose=False,
-            )
+        wavs, sr = base_model.generate_voice_clone(
+            text=text,
+            language=language,
+            ref_audio=ref_audio_path,
+            ref_text=ref_text,
+            temperature=temperature,
         )
     else:
-        gen_kwargs = dict(
-            text=text,
-            voice=voice,
-            lang_code=language,
-            temperature=temperature,
-            verbose=False,
+        if not skip_icl and not has_ref and model_folder_present(BASE_MODEL_FOLDER):
+            # Narration with Base prefers ICL anchors — mirror MLX behavior.
+            if not model_folder_present(CUSTOM_MODEL_FOLDER):
+                raise ValueError(
+                    f"Missing voice preview anchor for '{voice}'. "
+                    f"Generate the preview first (expected under {VOICE_PREVIEW_DIR})."
+                )
+        if not model_folder_present(CUSTOM_MODEL_FOLDER):
+            raise ValueError(
+                f"CustomVoice model not found at {os.path.join(MODELS_DIR, CUSTOM_MODEL_FOLDER)}"
+            )
+        ensure_model_loaded("custom")
+        assert custom_model is not None
+        speaker = speaker_api_name(voice)
+        print(
+            f"[qwen-tts] synthesize voice={voice} speaker={speaker} icl=False"
         )
-        if model_tts_type == "custom_voice":
-            gen_kwargs["instruct"] = instruct
-        results = list(model.generate(**gen_kwargs))
+        wavs, sr = custom_model.generate_custom_voice(
+            text=text,
+            language=language,
+            speaker=speaker,
+            instruct=instruct,
+            temperature=temperature,
+        )
+        use_icl = False
 
-    if not results:
-        return np.zeros(0, dtype=np.float32), model_sample_rate, use_icl
-
-    chunks = []
-    sample_rate = model_sample_rate
-    for result in results:
-        audio = np.array(result.audio, dtype=np.float32).reshape(-1)
-        if audio.size:
-            chunks.append(audio)
-        if getattr(result, "sample_rate", None):
-            sample_rate = int(result.sample_rate)
-
-    if not chunks:
+    sample_rate = int(sr or DEFAULT_SAMPLE_RATE)
+    if not wavs:
         return np.zeros(0, dtype=np.float32), sample_rate, use_icl
-    return np.concatenate(chunks), sample_rate, use_icl
+
+    first = wavs[0]
+    audio = np.asarray(first, dtype=np.float32).reshape(-1)
+    return audio, sample_rate, use_icl
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -471,19 +478,21 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global server_ready, DEFAULT_MODEL_FOLDER
+    global server_ready, DEFAULT_MODEL_FOLDER, DEVICE, ACCEL, DTYPE
+    DEVICE = resolve_device()
+    ACCEL = detect_accel(DEVICE)
+    DTYPE = resolve_dtype(DEVICE)
     DEFAULT_MODEL_FOLDER = resolve_default_model_folder()
-    # Default: stay lightweight at boot; weights load on the first /tts.
-    # Opt in with QWEN_TTS_PRELOAD=1 for earlier ICL readiness.
     preload = _env_flag("QWEN_TTS_PRELOAD", default=False)
     if preload:
         try:
             with model_lock:
-                ensure_model_loaded()
+                kind = "base" if model_folder_present(BASE_MODEL_FOLDER) else "custom"
+                ensure_model_loaded(kind)
             print(
                 f"[qwen-tts] Server ready (preloaded model={DEFAULT_MODEL_FOLDER}, "
                 f"type={model_tts_type}, icl={model_icl_capable}, "
-                f"defaultVoice={DEFAULT_VOICE}, previews={VOICE_PREVIEW_DIR})"
+                f"device={DEVICE}, accel={ACCEL}, gpu={gpu_name() or '-'})"
             )
         except Exception as exc:
             print(f"[qwen-tts] WARNING: model preload failed: {exc}")
@@ -491,6 +500,7 @@ async def lifespan(app: FastAPI):
     else:
         print(
             f"[qwen-tts] Server ready (lazy model load; model={DEFAULT_MODEL_FOLDER}, "
+            f"device={DEVICE}, accel={ACCEL}, gpu={gpu_name() or '-'}, "
             f"defaultVoice={DEFAULT_VOICE}, previews={VOICE_PREVIEW_DIR})"
         )
     server_ready = True
@@ -499,19 +509,18 @@ async def lifespan(app: FastAPI):
     unload_model()
 
 
-app = FastAPI(title="Qwen3 TTS", lifespan=lifespan)
+app = FastAPI(title="Qwen3 TTS (Torch)", lifespan=lifespan)
 
 
 class TtsRequest(BaseModel):
     text: str = Field(..., min_length=1)
     voice: Optional[str] = None
-    seed: Optional[int] = None  # accepted for Dia API compatibility; ignored
+    seed: Optional[int] = None
     language: Optional[str] = None
     instruct: Optional[str] = None
     temperature: Optional[float] = None
     refAudioPath: Optional[str] = None
     refText: Optional[str] = None
-    # When true, force speaker-id generation (bootstrap preview) even if anchor exists.
     skipIcl: Optional[bool] = False
     jobId: Optional[str] = None
 
@@ -523,18 +532,21 @@ class CancelRequest(BaseModel):
 @app.get("/health")
 def health():
     return {
-        # Server process is up (app may start before weights are loaded).
         "ready": server_ready,
-        "modelLoaded": model is not None,
+        "modelLoaded": base_model is not None or custom_model is not None,
         "provider": "qwen3-tts",
+        "backend": "torch",
         "model": DEFAULT_MODEL_FOLDER,
         "ttsModelType": model_tts_type,
-        "icl": model_icl_capable,
+        "icl": model_icl_capable or model_folder_present(BASE_MODEL_FOLDER),
         "sampleRate": model_sample_rate,
         "defaultVoice": DEFAULT_VOICE,
         "defaultTemperature": DEFAULT_TEMPERATURE,
         "previewDir": VOICE_PREVIEW_DIR,
         "speakers": sorted(SPEAKERS),
+        "device": DEVICE,
+        "accel": ACCEL,
+        "gpu": gpu_name(),
     }
 
 
@@ -574,7 +586,6 @@ def tts(req: TtsRequest):
         if job_id:
             with cancel_lock:
                 cancel_flags.pop(job_id, None)
-        # Do not unload on cancel — keeps ICL ready for the next chunk/job.
         return {
             "sampleRate": model_sample_rate,
             "audioData": "",
@@ -588,18 +599,7 @@ def tts(req: TtsRequest):
     sample_rate = model_sample_rate
     audio = np.zeros(0, dtype=np.float32)
 
-    # Hold lock for load + generate so /tts/unload waits until this request finishes.
     with model_lock:
-        try:
-            ensure_model_loaded()
-        except Exception as exc:
-            if job_id:
-                with cancel_lock:
-                    cancel_flags.pop(job_id, None)
-            raise HTTPException(
-                status_code=503, detail=f"Failed to load TTS model: {exc}"
-            ) from exc
-
         if is_cancelled(job_id):
             if job_id:
                 with cancel_lock:
@@ -631,7 +631,6 @@ def tts(req: TtsRequest):
                     cancel_flags.pop(job_id, None)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            # Keep model loaded; only unload on explicit /tts/unload.
             if job_id:
                 with cancel_lock:
                     cancel_flags.pop(job_id, None)
@@ -654,7 +653,6 @@ def tts(req: TtsRequest):
             }
 
         audio_b64 = float_to_pcm16_b64(audio) if audio.size else ""
-
         return {
             "sampleRate": sample_rate,
             "audioData": audio_b64,
@@ -682,7 +680,9 @@ def unload():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Qwen3-TTS HTTP server for AuraReader")
+    parser = argparse.ArgumentParser(
+        description="Qwen3-TTS (PyTorch) HTTP server for AuraReader"
+    )
     parser.add_argument("--host", default=HOST)
     parser.add_argument("--port", type=int, default=PORT)
     args = parser.parse_args()

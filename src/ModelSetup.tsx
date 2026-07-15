@@ -1,9 +1,10 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { motion } from "motion/react";
 import {
   AlertCircle,
   CheckCircle2,
   CircleStop,
+  Cpu,
   Download,
   HardDrive,
   Loader2,
@@ -17,6 +18,15 @@ type ModelInfo = {
   label: string;
   present: boolean;
   approxBytes: number;
+};
+
+type GpuInfo = {
+  supported: boolean;
+  devices: Array<{ name: string; vendor: string }>;
+  primary: "nvidia" | "amd" | "intel" | "unknown" | null;
+  recommendedAccel: "cuda" | "rocm" | "cpu" | null;
+  packagedAccel: "cuda" | "rocm" | "cpu" | "mlx" | null;
+  summary: string;
 };
 
 type ProgressState = {
@@ -53,6 +63,34 @@ function formatSpeed(bps: number): string {
   return `${formatBytes(bps)}/s`;
 }
 
+function vendorBadge(primary: GpuInfo["primary"]): {
+  label: string;
+  className: string;
+} {
+  if (primary === "nvidia") {
+    return {
+      label: "NVIDIA",
+      className: "bg-emerald-500/15 text-emerald-300 border-emerald-400/25",
+    };
+  }
+  if (primary === "amd") {
+    return {
+      label: "AMD",
+      className: "bg-rose-500/15 text-rose-300 border-rose-400/25",
+    };
+  }
+  if (primary === "intel") {
+    return {
+      label: "Intel",
+      className: "bg-sky-500/15 text-sky-300 border-sky-400/25",
+    };
+  }
+  return {
+    label: "GPU não identificada",
+    className: "bg-slate-500/15 text-slate-300 border-white/10",
+  };
+}
+
 const emptyProgress = (): ProgressState => ({
   fileDownloadedBytes: 0,
   fileTotalBytes: 0,
@@ -68,21 +106,34 @@ const emptyProgress = (): ProgressState => ({
 export default function ModelSetup({
   models,
   modelsDir,
+  gpu: gpuProp,
+  backend,
   onComplete,
   onStatusChange,
 }: {
   models: ModelInfo[];
   modelsDir: string;
+  gpu?: GpuInfo | null;
+  backend?: "torch" | "mlx";
   onComplete: () => void;
-  onStatusChange?: (models: ModelInfo[], modelsDir: string) => void;
+  onStatusChange?: (
+    models: ModelInfo[],
+    modelsDir: string,
+    extra?: { gpu?: GpuInfo | null; backend?: string }
+  ) => void;
 }) {
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [localModels, setLocalModels] = useState(models);
   const [localDir, setLocalDir] = useState(modelsDir);
+  const [gpu, setGpu] = useState<GpuInfo | null | undefined>(gpuProp);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [progress, setProgress] = useState<ProgressState>(emptyProgress);
   const [overall, setOverall] = useState({ current: 0, total: models.length });
+
+  useEffect(() => {
+    setGpu(gpuProp);
+  }, [gpuProp]);
 
   const missing = useMemo(() => localModels.filter((m) => !m.present), [localModels]);
   const present = useMemo(() => localModels.filter((m) => m.present), [localModels]);
@@ -91,14 +142,28 @@ export default function ModelSetup({
     [missing]
   );
 
+  const showGpu = Boolean(gpu?.supported);
+  const isTorch = backend === "torch" || showGpu;
+  const badge = vendorBadge(gpu?.primary ?? null);
+  const accelMismatch =
+    showGpu &&
+    gpu?.packagedAccel &&
+    gpu?.recommendedAccel &&
+    gpu.packagedAccel !== "mlx" &&
+    gpu.packagedAccel !== gpu.recommendedAccel;
+
   async function refreshStatus() {
     const res = await fetch("/api/models/status");
     const body = await res.json();
     if (body.models) {
       setLocalModels(body.models);
-      onStatusChange?.(body.models, body.modelsDir || localDir);
+      onStatusChange?.(body.models, body.modelsDir || localDir, {
+        gpu: body.gpu ?? null,
+        backend: body.backend,
+      });
     }
     if (body.modelsDir) setLocalDir(body.modelsDir);
+    if (body.gpu) setGpu(body.gpu);
     return body;
   }
 
@@ -128,9 +193,13 @@ export default function ModelSetup({
       if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
       if (body.status?.models) {
         setLocalModels(body.status.models);
-        onStatusChange?.(body.status.models, body.status.modelsDir || localDir);
+        onStatusChange?.(body.status.models, body.status.modelsDir || localDir, {
+          gpu: body.status.gpu ?? gpu ?? null,
+          backend: body.status.backend,
+        });
       }
       if (body.status?.modelsDir) setLocalDir(body.status.modelsDir);
+      if (body.status?.gpu) setGpu(body.status.gpu);
       setProgress(emptyProgress());
     } catch (err: any) {
       setError(err?.message || String(err));
@@ -314,11 +383,59 @@ export default function ModelSetup({
               <h2 className="text-xl font-bold text-white mb-1">Modelos TTS necessários</h2>
               <p className="text-sm text-slate-300 leading-relaxed">
                 Os pesos do Qwen3-TTS não vêm no aplicativo. Na primeira vez é preciso baixá-los
-                (~{formatBytes(approxTotal || 4_000_000_000)}) para o seu Mac. Depois ficam salvos
+                (~{formatBytes(approxTotal || 4_000_000_000)})
+                {isTorch ? " para este computador" : " para o seu Mac"}. Depois ficam salvos
                 localmente e não precisam ser baixados de novo.
               </p>
             </div>
           </div>
+
+          {showGpu && (
+            <div className="mb-6 rounded-2xl border border-white/10 bg-slate-900/50 p-4 space-y-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="inline-flex items-center gap-1.5 text-xs text-slate-400">
+                  <Cpu className="w-3.5 h-3.5" />
+                  Placa de vídeo
+                </span>
+                <span
+                  className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold ${badge.className}`}
+                >
+                  {badge.label}
+                </span>
+                {gpu?.recommendedAccel && (
+                  <span className="inline-flex items-center rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[11px] text-slate-300 font-mono">
+                    sugerido: {gpu.recommendedAccel.toUpperCase()}
+                  </span>
+                )}
+                {gpu?.packagedAccel && gpu.packagedAccel !== "mlx" && (
+                  <span className="inline-flex items-center rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[11px] text-slate-400 font-mono">
+                    este app: {gpu.packagedAccel.toUpperCase()}
+                  </span>
+                )}
+              </div>
+              {gpu?.devices?.length ? (
+                <ul className="space-y-1">
+                  {gpu.devices.map((d) => (
+                    <li key={d.name} className="text-xs text-slate-300 font-mono truncate">
+                      {d.name}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-xs text-slate-400">Nenhuma GPU detectada.</p>
+              )}
+              {gpu?.summary && (
+                <p className="text-xs text-slate-400 leading-relaxed">{gpu.summary}</p>
+              )}
+              {accelMismatch && (
+                <p className="text-xs text-amber-200/90 leading-relaxed">
+                  A GPU sugere o build {gpu!.recommendedAccel!.toUpperCase()}, mas este pacote é{" "}
+                  {gpu!.packagedAccel!.toUpperCase()}. A narração ainda funciona (com fallback para
+                  CPU se a aceleração não bater), mas o desempenho pode ficar abaixo do ideal.
+                </p>
+              )}
+            </div>
+          )}
 
           <ul className="space-y-3 mb-6">
             {localModels.map((m) => (
@@ -477,7 +594,10 @@ export default function ModelSetup({
           </div>
 
           <p className="text-center text-[11px] text-slate-500 mt-4">
-            Requer internet na primeira instalação. Apple Silicon recomendado.
+            Requer internet na primeira instalação.
+            {isTorch
+              ? " Windows/Linux: use o instalador CUDA (NVIDIA) ou ROCm (AMD) correspondente à sua GPU."
+              : " Apple Silicon recomendado."}
           </p>
         </motion.div>
       </main>

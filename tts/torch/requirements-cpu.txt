@@ -1,0 +1,8 @@
+# Install with:
+#   pip install -r requirements-base.txt
+#   pip install -r requirements-cpu.txt --index-url https://download.pytorch.org/whl/cpu
+#
+# torchaudio must come from this index too — qwen-tts otherwise pulls a CUDA
+# PyPI wheel that fails without NVIDIA CUDA runtime libs.
+torch
+torchaudio

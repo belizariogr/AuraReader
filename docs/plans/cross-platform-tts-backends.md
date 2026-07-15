@@ -4,22 +4,22 @@ overview: Adicionar backend PyTorch (qwen-tts) para Windows/Linux (NVIDIA CUDA, 
 todos:
   - id: torch-backend
     content: Criar tts/torch/tts_server.py + requirements (CUDA/ROCm/CPU) com API HTTP idêntica ao MLX
-    status: pending
+    status: completed
   - id: device-resolve
     content: Detectar device em runtime (cuda → hip/rocm → cpu) e documentar env AMD
-    status: pending
+    status: completed
   - id: platform-resolve
     content: Resolver backend/python por process.platform em server.ts e electron/main.cjs
-    status: pending
+    status: completed
   - id: model-matrix
     content: "modelManager: repos/folders MLX vs Qwen oficiais por plataforma"
-    status: pending
+    status: completed
   - id: prepare-per-os
     content: prepare-app-resources --platform + --accel=cuda|rocm|cpu empacota só runtime daquele OS/acelerador
-    status: pending
+    status: completed
   - id: electron-targets
     content: Scripts dist:mac/win/linux (+ variantes accel) + configs icon/targets electron-builder
-    status: pending
+    status: completed
   - id: smoke-mac
     content: Validar build Mac; documentar build Win/Linux (CUDA e ROCm) na plataforma alvo
     status: pending

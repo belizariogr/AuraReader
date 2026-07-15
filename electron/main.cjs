@@ -22,38 +22,54 @@ function log(...args) {
   console.log("[electron]", ...args);
 }
 
-function hasBundledAura(dir) {
+function hasTorchRuntime(dir) {
+  const torchDir = path.join(dir, "tts", "torch");
+  if (!fs.existsSync(path.join(torchDir, "tts_server.py"))) return false;
   return (
-    fs.existsSync(path.join(dir, "dist", "server.cjs")) &&
-    fs.existsSync(path.join(dir, "dist", "index.html")) &&
-    fs.existsSync(path.join(dir, "qwen3-tts-apple-silicon", "tts_server.py")) &&
-    (fs.existsSync(path.join(dir, "qwen3-tts-apple-silicon", "site-packages")) ||
-      fs.existsSync(
-        path.join(dir, "qwen3-tts-apple-silicon", ".venv", "bin", "python")
-      ))
+    fs.existsSync(path.join(torchDir, "site-packages")) ||
+    fs.existsSync(path.join(torchDir, ".venv", "bin", "python")) ||
+    fs.existsSync(path.join(torchDir, ".venv", "Scripts", "python.exe"))
   );
 }
 
+function hasMlxRuntime(dir) {
+  const mlxDir = path.join(dir, "qwen3-tts-apple-silicon");
+  if (!fs.existsSync(path.join(mlxDir, "tts_server.py"))) return false;
+  return (
+    fs.existsSync(path.join(mlxDir, "site-packages")) ||
+    fs.existsSync(path.join(mlxDir, ".venv", "bin", "python"))
+  );
+}
+
+function hasBundledAura(dir) {
+  const hasDist =
+    fs.existsSync(path.join(dir, "dist", "server.cjs")) &&
+    fs.existsSync(path.join(dir, "dist", "index.html"));
+  if (!hasDist) return false;
+  if (process.platform === "darwin") return hasMlxRuntime(dir);
+  return hasTorchRuntime(dir);
+}
+
+/** Dev checkout: enough to run the UI/server; TTS venv may be set up later. */
 function hasProjectRoot(dir) {
   if (!dir || dir.includes(".asar")) return false;
-  return fs.existsSync(
-    path.join(dir, "qwen3-tts-apple-silicon", ".venv", "bin", "python")
-  );
+  if (!fs.existsSync(path.join(dir, "package.json"))) return false;
+  if (!fs.existsSync(path.join(dir, "electron", "main.cjs"))) return false;
+  if (process.platform === "darwin") {
+    return fs.existsSync(
+      path.join(dir, "qwen3-tts-apple-silicon", "tts_server.py")
+    );
+  }
+  return fs.existsSync(path.join(dir, "tts", "torch", "tts_server.py"));
+}
+
+function hasTtsRuntimeReady(dir) {
+  if (process.platform === "darwin") return hasMlxRuntime(dir);
+  return hasTorchRuntime(dir);
 }
 
 function seedDataFromBundle(auraRoot, dataDir) {
-  const seed = path.join(auraRoot, "cache", "voice-previews");
-  const dest = path.join(dataDir, "cache", "voice-previews");
-  if (fs.existsSync(seed)) {
-    fs.mkdirSync(dest, { recursive: true });
-    for (const name of fs.readdirSync(seed)) {
-      const from = path.join(seed, name);
-      const to = path.join(dest, name);
-      if (!fs.existsSync(to)) {
-        fs.copyFileSync(from, to);
-      }
-    }
-  }
+  // Voice anchors live in auraRoot/assets/voice-previews (bundled); no copy needed.
 
   const envSeed = path.join(auraRoot, ".env");
   const envDest = path.join(dataDir, ".env");
@@ -70,26 +86,40 @@ function resolveAuraRoot() {
   if (app.isPackaged) {
     const bundled = path.join(process.resourcesPath, "aura");
     if (hasBundledAura(bundled)) return bundled;
+    const hint =
+      process.platform === "darwin"
+        ? "bun run dist:mac"
+        : process.platform === "win32"
+          ? "bun run dist:win"
+          : "bun run dist:linux";
     throw new Error(
-      `Runtime embutido não encontrado em:\n${bundled}\n\nGere o app com: bun run dist:mac`
+      `Runtime embutido não encontrado em:\n${bundled}\n\nGere o app com: ${hint}`
     );
   }
 
   const fromMain = path.resolve(__dirname, "..");
   if (hasBundledAura(fromMain) || hasProjectRoot(fromMain)) return fromMain;
 
-  throw new Error("Pasta do projeto AuraReader não encontrada.");
+  throw new Error(
+    `Pasta do projeto AuraReader não encontrada em:\n${fromMain}\n\n` +
+      `Esperado: package.json + electron/main.cjs + ` +
+      (process.platform === "darwin"
+        ? "qwen3-tts-apple-silicon/tts_server.py"
+        : "tts/torch/tts_server.py")
+  );
 }
 
 function guiPath() {
   const extras = [
     "/opt/homebrew/bin",
     "/usr/local/bin",
+    "/usr/bin",
     path.join(os.homedir(), ".bun", "bin"),
     path.join(os.homedir(), ".local", "bin"),
+    path.join(os.homedir(), ".local", "share", "mise", "shims"),
   ];
   const current = process.env.PATH || "/usr/bin:/bin:/usr/sbin:/sbin";
-  return [...extras, current].filter(Boolean).join(":");
+  return [...extras, current].filter(Boolean).join(path.delimiter);
 }
 
 function spawnInherit(command, args, { cwd, env, name }) {
@@ -155,7 +185,7 @@ function waitForUrl(url, timeoutMs, label) {
 function resolveServerRunner(auraRoot) {
   const serverJs = path.join(auraRoot, "dist", "server.cjs");
 
-  // Prefer Electron-as-Node so the .app does not depend on system bun/node.
+  // Prefer Electron-as-Node so the packaged app does not depend on system bun/node.
   if (app.isPackaged || process.env.AURA_USE_ELECTRON_NODE === "1") {
     return {
       command: process.execPath,
@@ -170,8 +200,10 @@ function resolveServerRunner(auraRoot) {
     path.join(os.homedir(), ".bun", "bin", "bun"),
     "/usr/local/bin/bun",
     path.join(auraRoot, "node_modules", ".bin", "bun"),
+    "/usr/bin/bun",
     "/opt/homebrew/bin/node",
     "/usr/local/bin/node",
+    "/usr/bin/node",
   ];
   for (const command of candidates) {
     if (fs.existsSync(command)) {
@@ -186,6 +218,18 @@ function resolveServerRunner(auraRoot) {
     }).trim();
     if (bun && fs.existsSync(bun)) {
       return { command: bun, args: [serverJs], envExtra: { PATH: pathEnv } };
+    }
+  } catch {
+    // fall through
+  }
+
+  try {
+    const node = execSync("which node", {
+      encoding: "utf8",
+      env: { ...process.env, PATH: pathEnv },
+    }).trim();
+    if (node && fs.existsSync(node)) {
+      return { command: node, args: [serverJs], envExtra: { PATH: pathEnv } };
     }
   } catch {
     // fall through
@@ -261,18 +305,27 @@ function createWindow() {
 }
 
 function buildMenu() {
+  const isMac = process.platform === "darwin";
   const template = [
+    ...(isMac
+      ? [
+          {
+            label: app.name,
+            submenu: [
+              { role: "about" },
+              { type: "separator" },
+              { role: "hide" },
+              { role: "hideOthers" },
+              { role: "unhide" },
+              { type: "separator" },
+              { role: "quit" },
+            ],
+          },
+        ]
+      : []),
     {
-      label: app.name,
-      submenu: [
-        { role: "about" },
-        { type: "separator" },
-        { role: "hide" },
-        { role: "hideOthers" },
-        { role: "unhide" },
-        { type: "separator" },
-        { role: "quit" },
-      ],
+      label: "File",
+      submenu: [isMac ? { role: "close" } : { role: "quit" }],
     },
     {
       label: "Edit",
@@ -301,28 +354,58 @@ function buildMenu() {
     },
     {
       label: "Window",
-      submenu: [{ role: "minimize" }, { role: "zoom" }, { role: "close" }],
+      submenu: [{ role: "minimize" }, { role: "zoom" }, ...(isMac ? [{ role: "close" }] : [])],
     },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
 async function startBackend(auraRoot) {
-  if (!hasBundledAura(auraRoot) && !hasProjectRoot(auraRoot)) {
+  const isDevProject = hasProjectRoot(auraRoot);
+  const isBundled = hasBundledAura(auraRoot);
+  if (!isBundled && !isDevProject) {
     throw new Error(`Runtime incompleto em:\n${auraRoot}`);
   }
 
+  if (isDevProject && !hasTtsRuntimeReady(auraRoot)) {
+    const hint =
+      process.platform === "darwin"
+        ? "cd qwen3-tts-apple-silicon && python3.12 -m venv .venv && pip install -r requirements.txt"
+        : "veja tts/torch/README.md (python3.12 + requirements-*)";
+    log(
+      `TTS runtime ainda não configurado — o app sobe, mas a narração falha até criar o venv (${hint}).`
+    );
+  }
+
+  // Dev: prefer built dist/server.cjs next to the project (electron:dev runs build first).
+  if (isDevProject && !fs.existsSync(path.join(auraRoot, "dist", "server.cjs"))) {
+    throw new Error(
+      `dist/server.cjs não encontrado em:\n${auraRoot}\n\nRode: bun run build`
+    );
+  }
+
   const dataDir = app.getPath("userData");
-  fs.mkdirSync(path.join(dataDir, "cache", "voice-previews"), { recursive: true });
   seedDataFromBundle(auraRoot, dataDir);
 
-  const pythonHome = path.join(
+  const mlxPythonHome = path.join(
     auraRoot,
     "python",
     "Python.framework",
     "Versions",
     "3.12"
   );
+  const torchPythonHome = path.join(auraRoot, "python");
+  let pythonHome = "";
+  if (process.platform === "darwin" && fs.existsSync(mlxPythonHome)) {
+    pythonHome = mlxPythonHome;
+  } else if (
+    fs.existsSync(path.join(torchPythonHome, "python.exe")) ||
+    fs.existsSync(path.join(torchPythonHome, "bin", "python3.12")) ||
+    fs.existsSync(path.join(torchPythonHome, "bin", "python"))
+  ) {
+    pythonHome = torchPythonHome;
+  }
+
   const modelsDir = path.join(dataDir, "models");
   fs.mkdirSync(modelsDir, { recursive: true });
 
@@ -337,13 +420,13 @@ async function startBackend(auraRoot) {
       NODE_ENV: "production",
       AURA_ROOT: auraRoot,
       AURA_DATA_DIR: dataDir,
-      AURA_PYTHON_HOME: fs.existsSync(pythonHome) ? pythonHome : "",
+      AURA_PYTHON_HOME: pythonHome,
       QWEN_TTS_MODELS_DIR: modelsDir,
       TTS_URL,
       TTS_PORT: String(TTS_PORT),
       PORT: String(APP_PORT),
       QWEN_TTS_PRELOAD: process.env.QWEN_TTS_PRELOAD ?? "0",
-      VOICE_PREVIEW_DIR: path.join(dataDir, "cache", "voice-previews"),
+      VOICE_PREVIEW_DIR: path.join(auraRoot, "assets", "voice-previews"),
     },
   });
 

@@ -5,9 +5,20 @@ import ModelSetup from "./ModelSetup.tsx";
 import "./index.css";
 import { Loader2, Sparkles } from "lucide-react";
 
+type GpuInfo = {
+  supported: boolean;
+  devices: Array<{ name: string; vendor: string }>;
+  primary: "nvidia" | "amd" | "intel" | "unknown" | null;
+  recommendedAccel: "cuda" | "rocm" | "cpu" | null;
+  packagedAccel: "cuda" | "rocm" | "cpu" | "mlx" | null;
+  summary: string;
+};
+
 type ModelsStatus = {
   ready: boolean;
   modelsDir: string;
+  backend?: "torch" | "mlx";
+  gpu?: GpuInfo;
   models: Array<{
     id: string;
     folder: string;
@@ -84,7 +95,9 @@ function Root() {
       <ModelSetup
         models={status.models}
         modelsDir={status.modelsDir}
-        onStatusChange={(models, modelsDir) => {
+        gpu={status.gpu}
+        backend={status.backend}
+        onStatusChange={(models, modelsDir, extra) => {
           setStatus((s) =>
             s
               ? {
@@ -92,6 +105,10 @@ function Root() {
                   models,
                   modelsDir,
                   ready: models.every((m) => m.present),
+                  ...(extra?.gpu !== undefined ? { gpu: extra.gpu ?? undefined } : {}),
+                  ...(extra?.backend
+                    ? { backend: extra.backend as ModelsStatus["backend"] }
+                    : {}),
                 }
               : s
           );

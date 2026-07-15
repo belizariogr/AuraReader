@@ -13,5 +13,10 @@ qwen3-tts-apple-silicon/models/
 qwen3-tts-apple-silicon/outputs/
 qwen3-tts-apple-silicon/__pycache__/
 qwen3-tts-apple-silicon/**/__pycache__/
+tts/torch/.venv/
+tts/torch/models/
+tts/torch/__pycache__/
+tts/torch/**/__pycache__/
+tts-accel.json
 *.pyc
 .venv/

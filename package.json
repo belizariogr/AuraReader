@@ -8,12 +8,31 @@
     "dev": "bun run scripts/start.ts",
     "start": "bun run scripts/start.ts",
     "start:tts": "cd qwen3-tts-apple-silicon && .venv/bin/python tts_server.py",
+    "setup:tts": "node scripts/setup-torch-tts.cjs",
+    "setup:tts:rocm": "node scripts/setup-torch-tts.cjs --accel=rocm",
+    "setup:tts:cuda": "node scripts/setup-torch-tts.cjs --accel=cuda",
+    "setup:tts:cpu": "node scripts/setup-torch-tts.cjs --accel=cpu",
+    "start:tts:torch": "cd tts/torch && (.venv/bin/python tts_server.py 2>/dev/null || .venv/Scripts/python.exe tts_server.py)",
     "start:app": "bun run server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "build:app": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --external:vite --sourcemap --outfile=dist/server.cjs",
     "electron": "bun run build && node scripts/ensure-electron.cjs && electron .",
     "electron:dev": "bun run build && node scripts/ensure-electron.cjs && NODE_ENV=production electron .",
-    "dist:mac": "bun run build:app && node scripts/ensure-electron.cjs && node scripts/prepare-app-resources.cjs && electron-builder --mac --arm64",
+    "prepare:mac": "node scripts/prepare-app-resources.cjs --platform=darwin",
+    "prepare:win": "node scripts/prepare-app-resources.cjs --platform=win32 --accel=cuda",
+    "prepare:win:rocm": "node scripts/prepare-app-resources.cjs --platform=win32 --accel=rocm",
+    "prepare:win:cpu": "node scripts/prepare-app-resources.cjs --platform=win32 --accel=cpu",
+    "prepare:linux": "node scripts/prepare-app-resources.cjs --platform=linux --accel=cuda",
+    "prepare:linux:rocm": "node scripts/prepare-app-resources.cjs --platform=linux --accel=rocm",
+    "prepare:linux:cpu": "node scripts/prepare-app-resources.cjs --platform=linux --accel=cpu",
+    "dist": "node scripts/dist.cjs",
+    "dist:mac": "bun run build:app && node scripts/ensure-electron.cjs && bun run prepare:mac && electron-builder --mac --arm64",
+    "dist:win": "bun run build:app && node scripts/ensure-electron.cjs && bun run prepare:win && electron-builder --win --x64 -c.artifactName=AuraReader-cuda-${version}-${arch}.${ext}",
+    "dist:win:rocm": "bun run build:app && node scripts/ensure-electron.cjs && bun run prepare:win:rocm && electron-builder --win --x64 -c.artifactName=AuraReader-rocm-${version}-${arch}.${ext}",
+    "dist:win:cpu": "bun run build:app && node scripts/ensure-electron.cjs && bun run prepare:win:cpu && electron-builder --win --x64 -c.artifactName=AuraReader-cpu-${version}-${arch}.${ext}",
+    "dist:linux": "bun run build:app && node scripts/ensure-electron.cjs && bun run prepare:linux && electron-builder --linux --x64 -c.artifactName=AuraReader-cuda-${version}-${arch}.${ext}",
+    "dist:linux:rocm": "bun run build:app && node scripts/ensure-electron.cjs && bun run prepare:linux:rocm && electron-builder --linux --x64 -c.artifactName=AuraReader-rocm-${version}-${arch}.${ext}",
+    "dist:linux:cpu": "bun run build:app && node scripts/ensure-electron.cjs && bun run prepare:linux:cpu && electron-builder --linux --x64 -c.artifactName=AuraReader-cpu-${version}-${arch}.${ext}",
     "clean": "rm -rf dist server.js release build/app-resources",
     "lint": "tsc --noEmit"
   },
@@ -73,6 +92,57 @@
         "dmg"
       ],
       "identity": null
+    },
+    "win": {
+      "icon": "icon.png",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "linux": {
+      "icon": "icon.png",
+      "category": "AudioVideo",
+      "executableName": "AuraReader",
+      "desktop": {
+        "Name": "AuraReader",
+        "Comment": "PDF/EPUB narrator with local Qwen3-TTS",
+        "Categories": "AudioVideo;Office;"
+      },
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
     },
     "extraMetadata": {
       "main": "electron/main.cjs"

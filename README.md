@@ -26,7 +26,7 @@ python -c "from huggingface_hub import snapshot_download; snapshot_download('mlx
 python -c "from huggingface_hub import snapshot_download; snapshot_download('mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit', local_dir='models/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit')"
 ```
 
-Com o Base instalado, cada voz usa o WAV em `cache/voice-previews/` (gerado ao tocar a prévia na UI ou na primeira narração) como `ref_audio` + transcript como `ref_text` em **todos** os blocos.
+Com o Base instalado, cada voz usa o WAV em `assets/voice-previews/` como `ref_audio` + transcript como `ref_text` em **todos** os blocos.
 
 ## Rodar
 
