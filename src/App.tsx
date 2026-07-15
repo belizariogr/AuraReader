@@ -322,9 +322,12 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       if (!res.ok) throw new Error(info.error || "Falha ao ler o documento.");
 
       if (type === "pdf") {
+        const pageCount = typeof info.pageCount === "number" ? info.pageCount : null;
         updateDoc(docId, {
           docInfoMessage: info.message || "",
-          pdfPageCount: typeof info.pageCount === "number" ? info.pageCount : null,
+          pdfPageCount: pageCount,
+          startPage: 1,
+          endPage: pageCount != null ? String(pageCount) : "",
           docInfoLoading: false,
         });
       } else {
@@ -332,8 +335,8 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
         updateDoc(docId, {
           docInfoMessage: info.message || "",
           epubChapters: chapters,
-          startPage: chapters.length > 0 ? 1 : 1,
-          endPage: chapters.length > 0 ? "1" : "",
+          startPage: 1,
+          endPage: chapters.length > 0 ? String(chapters.length) : "",
           docInfoLoading: false,
         });
       }
