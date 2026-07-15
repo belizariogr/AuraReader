@@ -9,7 +9,6 @@ import {
   Sparkles, 
   Trash2, 
   BookOpen, 
-  ChevronRight, 
   RotateCcw, 
   RotateCw, 
   Music, 
@@ -20,7 +19,8 @@ import {
   FileAudio,
   Loader2,
   Book,
-  Square
+  Square,
+  Plus
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
@@ -31,6 +31,49 @@ interface Voice {
   gender: "Feminino" | "Masculino";
   description: string;
   icon: string;
+}
+
+interface EpubChapter {
+  index: number;
+  id: string;
+  title: string;
+}
+
+interface DocItem {
+  id: string;
+  file: File;
+  fileBase64: string;
+  fileType: "pdf" | "epub";
+  startPage: number;
+  endPage: string;
+  pdfPageCount: number | null;
+  epubChapters: EpubChapter[];
+  docInfoMessage: string;
+  docInfoLoading: boolean;
+  editableText: string;
+  extractedText: string;
+  pagesNarrated: string;
+  audioBase64: string | null;
+  audioUrl: string | null;
+}
+
+function createDocId() {
+  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function isPdfOrEpub(file: File): boolean {
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  return (
+    file.type === "application/pdf" ||
+    extension === "pdf" ||
+    extension === "epub" ||
+    file.type === "application/epub+zip"
+  );
+}
+
+function detectFileType(file: File): "pdf" | "epub" {
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  return extension === "epub" || file.type === "application/epub+zip" ? "epub" : "pdf";
 }
 
 const FALLBACK_QWEN_VOICES: Voice[] = [
@@ -82,23 +125,26 @@ function persistVoice(engine: string, voiceId: string) {
 }
 
 export default function App({ onManageModels }: { onManageModels?: () => void }) {
-  // File Upload State
-  const [uploadedFile, setUploadedFile] = useState<File | null>(null);
-  const [fileBase64, setFileBase64] = useState<string>("");
-  const [fileType, setFileType] = useState<"pdf" | "epub">("pdf");
+  // Multi-document state
+  const [documents, setDocuments] = useState<DocItem[]>([]);
+  const [activeDocId, setActiveDocId] = useState<string | null>(null);
+  const [reviewDocId, setReviewDocId] = useState<string | null>(null);
+  const [resultDocId, setResultDocId] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState<boolean>(false);
 
-  // Configuration State
-  const [startPage, setStartPage] = useState<number>(1);
-  const [endPage, setEndPage] = useState<string>("");
+  // Shared configuration
   const [voices, setVoices] = useState<Voice[]>(FALLBACK_QWEN_VOICES);
   const [ttsEngine, setTtsEngine] = useState<"qwen3" | "kokoro">("qwen3");
   const [kokoroDevice, setKokoroDevice] = useState<"cpu" | "gpu">("gpu");
   const [selectedVoice, setSelectedVoice] = useState<string>("Vivian");
-  const [pdfPageCount, setPdfPageCount] = useState<number | null>(null);
-  const [epubChapters, setEpubChapters] = useState<{ index: number; id: string; title: string }[]>([]);
-  const [docInfoLoading, setDocInfoLoading] = useState(false);
-  const [docInfoMessage, setDocInfoMessage] = useState<string>("");
+
+  const completedDocs = documents.filter((d) => d.audioUrl);
+  const activeDoc = documents.find((d) => d.id === activeDocId) ?? documents[0] ?? null;
+  const reviewDoc = documents.find((d) => d.id === reviewDocId) ?? documents[0] ?? null;
+  const resultDoc =
+    documents.find((d) => d.id === resultDocId) ?? completedDocs[0] ?? null;
+  const anyDocInfoLoading = documents.some((d) => d.docInfoLoading);
+  const allDocsReady = documents.length > 0 && documents.every((d) => d.fileBase64 && !d.docInfoLoading);
 
   useEffect(() => {
     let cancelled = false;
@@ -137,18 +183,50 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   const [loading, setLoading] = useState<boolean>(false);
   const [loadingMode, setLoadingMode] = useState<"extract" | "narrate">("extract");
   const [showTextReview, setShowTextReview] = useState<boolean>(false);
-  const [editableText, setEditableText] = useState<string>("");
   const [progressStep, setProgressStep] = useState<string>("init"); // 'init', 'extraction', 'pre_tts', 'chunks', 'tts', 'encoding', 'done'
   const [currentChunk, setCurrentChunk] = useState<number>(0);
   const [totalChunks, setTotalChunks] = useState<number>(0);
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const [isStopping, setIsStopping] = useState<boolean>(false);
+  const [processingFileIndex, setProcessingFileIndex] = useState<number>(0);
+  const [processingFileTotal, setProcessingFileTotal] = useState<number>(0);
+  const [processingFileName, setProcessingFileName] = useState<string>("");
+  const [processingPreviewText, setProcessingPreviewText] = useState<string>("");
+  const [lastSavedFileName, setLastSavedFileName] = useState<string>("");
+  const [savedFilesCount, setSavedFilesCount] = useState<number>(0);
   
   const [error, setError] = useState<string | null>(null);
-  const [audioBase64, setAudioBase64] = useState<string | null>(null);
-  const [extractedText, setExtractedText] = useState<string>("");
-  const [audioUrl, setAudioUrl] = useState<string | null>(null);
-  const [pagesNarrated, setPagesNarrated] = useState<string>("");
+  const hasResults = completedDocs.length > 0;
+
+  const buildDownloadFileName = (doc: DocItem, pagesNarrated?: string) => {
+    const safeName = doc.file.name.replace(/\.[^/.]+$/, "") || "narracao";
+    const range = (pagesNarrated ?? doc.pagesNarrated ?? "").replace(/\s+/g, "");
+    return range ? `narracao_${safeName}_${range}.mp3` : `narracao_${safeName}.mp3`;
+  };
+
+  const saveAudioToDownloads = async (
+    audioData: string,
+    fileName: string
+  ): Promise<{ fileName: string; path: string } | null> => {
+    try {
+      const res = await fetch("/api/save-to-downloads", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ audioData, fileName }),
+      });
+      const payload = await res.json();
+      if (!res.ok) {
+        throw new Error(payload.error || "Falha ao salvar em Downloads.");
+      }
+      return {
+        fileName: payload.fileName as string,
+        path: payload.path as string,
+      };
+    } catch (err) {
+      console.error("Erro ao salvar áudio em Downloads:", err);
+      return null;
+    }
+  };
 
   // Custom Audio Player State
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
@@ -158,6 +236,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const isStoppingRef = useRef(false);
+  const stopBatchRef = useRef(false);
 
   // Voice preview samples
   const [previewLoadingVoice, setPreviewLoadingVoice] = useState<string | null>(null);
@@ -182,21 +261,26 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
         previewAudioRef.current.pause();
         previewAudioRef.current = null;
       }
-      for (const url of Object.values(previewCacheRef.current)) {
+      for (const url of Object.values(previewCacheRef.current) as string[]) {
         URL.revokeObjectURL(url);
       }
       previewCacheRef.current = {};
     };
   }, []);
 
-  // Clean up Object URL when component unmounts or audio changes
+  // Clean up Object URLs on unmount
   useEffect(() => {
     return () => {
-      if (audioUrl) {
-        URL.revokeObjectURL(audioUrl);
+      for (const doc of documents) {
+        if (doc.audioUrl) URL.revokeObjectURL(doc.audioUrl);
       }
     };
-  }, [audioUrl]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only on unmount
+  }, []);
+
+  const updateDoc = (id: string, patch: Partial<DocItem>) => {
+    setDocuments((docs) => docs.map((d) => (d.id === id ? { ...d, ...patch } : d)));
+  };
 
   // Drag-and-drop handlers
   const handleDrag = (e: React.DragEvent) => {
@@ -214,167 +298,237 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     e.stopPropagation();
     setDragActive(false);
 
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      const file = e.dataTransfer.files[0];
-      const extension = file.name.split('.').pop()?.toLowerCase();
-      if (file.type === "application/pdf" || extension === "pdf" || extension === "epub" || file.type === "application/epub+zip") {
-        processFile(file);
-      } else {
-        setError("Por favor, adicione apenas arquivos PDF ou EPUB válidos.");
-      }
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      processFiles(Array.from(e.dataTransfer.files));
     }
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      processFile(e.target.files[0]);
+    if (e.target.files && e.target.files.length > 0) {
+      processFiles(Array.from(e.target.files));
+      e.target.value = "";
     }
   };
 
-  const processFile = (file: File) => {
-    setError(null);
-    const extension = file.name.split('.').pop()?.toLowerCase();
-    const type = (extension === "epub" || file.type === "application/epub+zip") ? "epub" : "pdf";
-    setFileType(type);
-    setUploadedFile(file);
-    setStartPage(1);
-    setEndPage("");
-    setPdfPageCount(null);
-    setEpubChapters([]);
-    setDocInfoMessage("");
+  const loadDocumentInfo = async (docId: string, base64: string, type: "pdf" | "epub") => {
+    updateDoc(docId, { docInfoLoading: true });
+    try {
+      const res = await fetch("/api/document-info", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileData: base64, fileType: type }),
+      });
+      const info = await res.json();
+      if (!res.ok) throw new Error(info.error || "Falha ao ler o documento.");
 
-    const reader = new FileReader();
-    reader.onload = async () => {
-      const result = reader.result as string;
-      const base64 = result.split(",")[1];
-      setFileBase64(base64);
-
-      setDocInfoLoading(true);
-      try {
-        const res = await fetch("/api/document-info", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ fileData: base64, fileType: type }),
+      if (type === "pdf") {
+        updateDoc(docId, {
+          docInfoMessage: info.message || "",
+          pdfPageCount: typeof info.pageCount === "number" ? info.pageCount : null,
+          docInfoLoading: false,
         });
-        const info = await res.json();
-        if (!res.ok) throw new Error(info.error || "Falha ao ler o documento.");
-
-        setDocInfoMessage(info.message || "");
-        if (type === "pdf") {
-          setPdfPageCount(typeof info.pageCount === "number" ? info.pageCount : null);
-        } else {
-          const chapters = Array.isArray(info.chapters) ? info.chapters : [];
-          setEpubChapters(chapters);
-          if (chapters.length > 0) {
-            setStartPage(1);
-            setEndPage("1");
-          }
-        }
-      } catch (err: any) {
-        console.error(err);
-        setError(err.message || "Não foi possível inspecionar o documento.");
-      } finally {
-        setDocInfoLoading(false);
+      } else {
+        const chapters = Array.isArray(info.chapters) ? info.chapters : [];
+        updateDoc(docId, {
+          docInfoMessage: info.message || "",
+          epubChapters: chapters,
+          startPage: chapters.length > 0 ? 1 : 1,
+          endPage: chapters.length > 0 ? "1" : "",
+          docInfoLoading: false,
+        });
       }
-    };
-    reader.onerror = () => {
-      setError(`Erro ao ler o arquivo ${type.toUpperCase()}.`);
-    };
-    reader.readAsDataURL(file);
+    } catch (err: any) {
+      console.error(err);
+      updateDoc(docId, { docInfoLoading: false });
+      setError(err.message || "Não foi possível inspecionar o documento.");
+    }
   };
 
-  const handleRemoveFile = () => {
-    setUploadedFile(null);
-    setFileBase64("");
-    setStartPage(1);
-    setEndPage("");
-    setShowTextReview(false);
-    setEditableText("");
-    setPdfPageCount(null);
-    setEpubChapters([]);
-    setDocInfoMessage("");
+  const processFiles = (files: File[]) => {
+    setError(null);
+    const valid = files.filter(isPdfOrEpub);
+    if (valid.length === 0) {
+      setError("Por favor, adicione apenas arquivos PDF ou EPUB válidos.");
+      return;
+    }
+    if (valid.length < files.length) {
+      setError("Alguns arquivos foram ignorados. Apenas PDF e EPUB são aceitos.");
+    }
+
+    const newDocs: DocItem[] = valid.map((file) => ({
+      id: createDocId(),
+      file,
+      fileBase64: "",
+      fileType: detectFileType(file),
+      startPage: 1,
+      endPage: "",
+      pdfPageCount: null,
+      epubChapters: [],
+      docInfoMessage: "",
+      docInfoLoading: true,
+      editableText: "",
+      extractedText: "",
+      pagesNarrated: "",
+      audioBase64: null,
+      audioUrl: null,
+    }));
+
+    setDocuments((prev) => [...prev, ...newDocs]);
+    if (!activeDocId && newDocs.length > 0) {
+      setActiveDocId(newDocs[0].id);
+    }
+
+    for (const doc of newDocs) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        const base64 = result.split(",")[1];
+        updateDoc(doc.id, { fileBase64: base64 });
+        void loadDocumentInfo(doc.id, base64, doc.fileType);
+      };
+      reader.onerror = () => {
+        updateDoc(doc.id, { docInfoLoading: false });
+        setError(`Erro ao ler o arquivo ${doc.fileType.toUpperCase()}: ${doc.file.name}`);
+      };
+      reader.readAsDataURL(doc.file);
+    }
   };
 
-  const validatePageRange = (): { start: number; end: number } | null => {
-    const start = Math.max(1, startPage || 1);
-    if (fileType === "pdf" && pdfPageCount != null && start > pdfPageCount) {
-      setError(`Este PDF tem ${pdfPageCount} página(s). A página inicial ${start} está fora do intervalo.`);
+  const handleRemoveFile = (docId: string) => {
+    setDocuments((prev) => {
+      const target = prev.find((d) => d.id === docId);
+      if (target?.audioUrl) URL.revokeObjectURL(target.audioUrl);
+      const next = prev.filter((d) => d.id !== docId);
+      setActiveDocId((current) => {
+        if (current !== docId) return current;
+        return next[0]?.id ?? null;
+      });
+      setReviewDocId((current) => {
+        if (current !== docId) return current;
+        return next[0]?.id ?? null;
+      });
+      setResultDocId((current) => {
+        if (current !== docId) return current;
+        return next.find((d) => d.audioUrl)?.id ?? null;
+      });
+      if (next.length === 0) {
+        setShowTextReview(false);
+      }
+      return next;
+    });
+  };
+
+  const validatePageRange = (doc: DocItem): { start: number; end: number } | null => {
+    const start = Math.max(1, doc.startPage || 1);
+    if (doc.fileType === "pdf" && doc.pdfPageCount != null && start > doc.pdfPageCount) {
+      setError(`${doc.file.name}: este PDF tem ${doc.pdfPageCount} página(s). A página inicial ${start} está fora do intervalo.`);
       return null;
     }
-    if (fileType === "epub" && epubChapters.length > 0 && start > epubChapters.length) {
-      setError(`Este EPUB tem ${epubChapters.length} seção(ões). O índice ${start} está fora do intervalo.`);
+    if (doc.fileType === "epub" && doc.epubChapters.length > 0 && start > doc.epubChapters.length) {
+      setError(`${doc.file.name}: este EPUB tem ${doc.epubChapters.length} seção(ões). O índice ${start} está fora do intervalo.`);
       return null;
     }
 
-    const end = endPage.trim()
-      ? parseInt(endPage, 10)
+    const end = doc.endPage.trim()
+      ? parseInt(doc.endPage, 10)
       : start;
 
     if (!Number.isFinite(end) || end < 1) {
-      setError("A página/seção final é inválida.");
+      setError(`${doc.file.name}: a página/seção final é inválida.`);
       return null;
     }
     if (end < start) {
-      setError(`A página/seção final (${end}) não pode ser menor que a inicial (${start}).`);
+      setError(`${doc.file.name}: a página/seção final (${end}) não pode ser menor que a inicial (${start}).`);
       return null;
     }
-    if (fileType === "pdf" && pdfPageCount != null && end > pdfPageCount) {
-      setError(`Este PDF tem ${pdfPageCount} página(s). A página final ${end} está fora do intervalo.`);
+    if (doc.fileType === "pdf" && doc.pdfPageCount != null && end > doc.pdfPageCount) {
+      setError(`${doc.file.name}: este PDF tem ${doc.pdfPageCount} página(s). A página final ${end} está fora do intervalo.`);
       return null;
     }
-    if (fileType === "epub" && epubChapters.length > 0 && end > epubChapters.length) {
-      setError(`Este EPUB tem ${epubChapters.length} seção(ões). O índice ${end} está fora do intervalo.`);
+    if (doc.fileType === "epub" && doc.epubChapters.length > 0 && end > doc.epubChapters.length) {
+      setError(`${doc.file.name}: este EPUB tem ${doc.epubChapters.length} seção(ões). O índice ${end} está fora do intervalo.`);
       return null;
     }
     return { start, end };
   };
 
-  // Step 1: extract text only, then open editable review
+  // Step 1: extract text from all documents, then open editable review
   const handleExtractForReview = async () => {
-    if (!fileBase64) return;
-    const range = validatePageRange();
-    if (!range) return;
+    if (documents.length === 0 || !allDocsReady) return;
+
+    const ranges: { id: string; start: number; end: number }[] = [];
+    for (const doc of documents) {
+      const range = validatePageRange(doc);
+      if (!range) return;
+      ranges.push({ id: doc.id, ...range });
+    }
 
     setLoading(true);
     setLoadingMode("extract");
     setError(null);
-    setAudioBase64(null);
-    setExtractedText("");
-    setEditableText("");
     setShowTextReview(false);
     setProgressStep("extraction");
+    setProcessingFileTotal(documents.length);
+    setProcessingPreviewText("");
 
-    if (audioUrl) {
-      URL.revokeObjectURL(audioUrl);
-      setAudioUrl(null);
-    }
+    // Clear previous audio results
+    setDocuments((docs) =>
+      docs.map((d) => {
+        if (d.audioUrl) URL.revokeObjectURL(d.audioUrl);
+        return {
+          ...d,
+          editableText: "",
+          extractedText: "",
+          pagesNarrated: "",
+          audioBase64: null,
+          audioUrl: null,
+        };
+      })
+    );
 
     try {
-      const response = await fetch("/api/extract", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileData: fileBase64,
-          fileType,
-          startPage: range.start,
-          endPage: range.end,
-        }),
-      });
+      for (let i = 0; i < documents.length; i++) {
+        const doc = documents[i];
+        const range = ranges[i];
+        setProcessingFileIndex(i + 1);
+        setProcessingFileName(doc.file.name);
+        setProgressStep("extraction");
+        setCurrentChunk(0);
+        setTotalChunks(0);
 
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.error || "Falha ao extrair o texto.");
+        const response = await fetch("/api/extract", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            fileData: doc.fileBase64,
+            fileType: doc.fileType,
+            startPage: range.start,
+            endPage: range.end,
+          }),
+        });
+
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(`${doc.file.name}: ${payload.error || "Falha ao extrair o texto."}`);
+        }
+
+        updateDoc(doc.id, {
+          extractedText: payload.extractedText,
+          editableText: payload.extractedText,
+          pagesNarrated: payload.pagesNarrated || "",
+        });
       }
 
-      setExtractedText(payload.extractedText);
-      setEditableText(payload.extractedText);
-      setPagesNarrated(payload.pagesNarrated || "");
+      setReviewDocId(documents[0]?.id ?? null);
       setShowTextReview(true);
     } catch (err: any) {
       console.error(err);
       setError(err.message || "Não foi possível extrair o texto do documento.");
     } finally {
       setLoading(false);
+      setProcessingFileIndex(0);
+      setProcessingFileTotal(0);
+      setProcessingFileName("");
     }
   };
 
@@ -448,20 +602,14 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     }
   };
 
-  // Step 2: narrate the (possibly edited) text
-  const handleConfirmNarration = async () => {
-    const text = editableText.trim();
+  // Step 2: narrate all (possibly edited) texts sequentially
+  const narrateDocument = async (doc: DocItem): Promise<void> => {
+    const text = doc.editableText.trim();
     if (!text) {
-      setError("Edite ou confirme um texto antes de narrar.");
-      return;
+      throw new Error(`${doc.file.name}: edite ou confirme um texto antes de narrar.`);
     }
 
-    setShowTextReview(false);
-    setLoading(true);
-    setLoadingMode("narrate");
-    setError(null);
-    setAudioBase64(null);
-    setExtractedText(text);
+    setProcessingPreviewText(text);
     setProgressStep("pre_tts");
     setCurrentChunk(0);
     setTotalChunks(0);
@@ -471,108 +619,178 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     const taskId = Math.random().toString(36).substring(7);
     setCurrentTaskId(taskId);
 
-    if (audioUrl) {
-      URL.revokeObjectURL(audioUrl);
-      setAudioUrl(null);
+    if (doc.audioUrl) {
+      URL.revokeObjectURL(doc.audioUrl);
+      updateDoc(doc.id, { audioUrl: null, audioBase64: null });
     }
 
-    try {
-      const response = await fetch("/api/narrate-stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text,
-          voiceName: selectedVoice,
-          taskId,
-          pagesNarrated,
-        }),
-      });
+    const response = await fetch("/api/narrate-stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        voiceName: selectedVoice,
+        taskId,
+        pagesNarrated: doc.pagesNarrated,
+      }),
+    });
 
-      if (!response.ok) {
-        throw new Error("Erro de conexão ou falha no servidor ao iniciar a narração.");
-      }
+    if (!response.ok) {
+      throw new Error(`${doc.file.name}: erro de conexão ou falha no servidor ao iniciar a narração.`);
+    }
 
-      if (!response.body) {
-        throw new Error("O servidor não retornou um fluxo de dados válido.");
-      }
+    if (!response.body) {
+      throw new Error(`${doc.file.name}: o servidor não retornou um fluxo de dados válido.`);
+    }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-      let buffer = "";
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    let gotDone = false;
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
 
-        for (const line of lines) {
-          const trimmedLine = line.trim();
-          if (!trimmedLine || !trimmedLine.startsWith("data: ")) continue;
+      for (const line of lines) {
+        const trimmedLine = line.trim();
+        if (!trimmedLine || !trimmedLine.startsWith("data: ")) continue;
 
-          const dataStr = trimmedLine.slice(6).trim();
-          if (!dataStr) continue;
+        const dataStr = trimmedLine.slice(6).trim();
+        if (!dataStr) continue;
 
-          try {
-            const payload = JSON.parse(dataStr);
-            
-            if (payload.type === "status") {
-              if (isStoppingRef.current && payload.step === "tts") {
-                continue;
-              }
-              if (payload.step) setProgressStep(payload.step);
-              if (payload.current !== undefined) setCurrentChunk(payload.current);
-              if (payload.total !== undefined) setTotalChunks(payload.total);
-              if (typeof payload.extractedText === "string" && payload.extractedText.length > 0) {
-                setExtractedText(payload.extractedText);
-              }
-            } else if (payload.type === "done") {
-              setProgressStep("done");
-              setAudioBase64(payload.audioData);
-              setExtractedText(payload.extractedText);
-              setPagesNarrated(payload.pagesNarrated);
+        try {
+          const payload = JSON.parse(dataStr);
 
-              const binary = atob(payload.audioData);
-              const bytes = new Uint8Array(binary.length);
-              for (let i = 0; i < binary.length; i++) {
-                bytes[i] = binary.charCodeAt(i);
-              }
-              const blob = new Blob([bytes], { type: "audio/mp3" });
-              const url = URL.createObjectURL(blob);
-              setAudioUrl(url);
-
-              setIsPlaying(false);
-              setCurrentTime(0);
-            } else if (payload.type === "error") {
-              throw new Error(payload.error || "Ocorreu um erro durante o processamento.");
+          if (payload.type === "status") {
+            if (isStoppingRef.current && payload.step === "tts") {
+              continue;
             }
-          } catch (jsonErr: any) {
-            if (jsonErr.message && !jsonErr.message.startsWith("Unexpected token")) {
-              throw jsonErr;
+            if (payload.step) setProgressStep(payload.step);
+            if (payload.current !== undefined) setCurrentChunk(payload.current);
+            if (payload.total !== undefined) setTotalChunks(payload.total);
+            if (typeof payload.extractedText === "string" && payload.extractedText.length > 0) {
+              setProcessingPreviewText(payload.extractedText);
+              updateDoc(doc.id, { extractedText: payload.extractedText });
             }
-            console.error("Erro ao analisar dados do fluxo:", jsonErr);
+          } else if (payload.type === "done") {
+            setProgressStep("done");
+            gotDone = true;
+
+            const binary = atob(payload.audioData);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+              bytes[i] = binary.charCodeAt(i);
+            }
+            const blob = new Blob([bytes], { type: "audio/mp3" });
+            const url = URL.createObjectURL(blob);
+            const pagesNarrated = payload.pagesNarrated || doc.pagesNarrated;
+
+            updateDoc(doc.id, {
+              audioBase64: payload.audioData,
+              extractedText: payload.extractedText,
+              pagesNarrated,
+              audioUrl: url,
+            });
+
+            // Persist immediately to Downloads as each file completes
+            const saved = await saveAudioToDownloads(
+              payload.audioData,
+              buildDownloadFileName(doc, pagesNarrated)
+            );
+            if (saved) {
+              setLastSavedFileName(saved.fileName);
+              setSavedFilesCount((n) => n + 1);
+            }
+          } else if (payload.type === "error") {
+            throw new Error(`${doc.file.name}: ${payload.error || "Ocorreu um erro durante o processamento."}`);
           }
+        } catch (jsonErr: any) {
+          if (jsonErr.message && !jsonErr.message.startsWith("Unexpected token")) {
+            throw jsonErr;
+          }
+          console.error("Erro ao analisar dados do fluxo:", jsonErr);
         }
       }
+    }
 
+    if (!gotDone) {
+      throw new Error(`${doc.file.name}: a narração terminou sem áudio gerado.`);
+    }
+  };
+
+  const handleConfirmNarration = async () => {
+    const docsSnapshot = documents.map((d) => ({ ...d }));
+    const empty = docsSnapshot.find((d) => !d.editableText.trim());
+    if (empty) {
+      setError(`${empty.file.name}: edite ou confirme um texto antes de narrar.`);
+      setReviewDocId(empty.id);
+      return;
+    }
+
+    setShowTextReview(false);
+    setLoading(true);
+    setLoadingMode("narrate");
+    setError(null);
+    setProcessingFileTotal(docsSnapshot.length);
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setLastSavedFileName("");
+    setSavedFilesCount(0);
+    stopBatchRef.current = false;
+
+    let lastCompletedId: string | null = null;
+
+    try {
+      for (let i = 0; i < docsSnapshot.length; i++) {
+        const doc = docsSnapshot[i];
+        setProcessingFileIndex(i + 1);
+        setProcessingFileName(doc.file.name);
+        await narrateDocument(doc);
+        lastCompletedId = doc.id;
+
+        if (stopBatchRef.current) break;
+
+        // After each file, reset stop flag for the next one
+        setIsStopping(false);
+        isStoppingRef.current = false;
+        setCurrentTaskId(null);
+      }
+
+      setResultDocId(lastCompletedId ?? docsSnapshot[0]?.id ?? null);
+      setIsPlaying(false);
+      setCurrentTime(0);
     } catch (err: any) {
       console.error(err);
       setError(err.message || "Não foi possível completar a narração. Verifique sua conexão e tente novamente.");
-      setShowTextReview(true);
+      // If some files already finished, show results; otherwise return to review
+      if (lastCompletedId) {
+        setResultDocId(lastCompletedId);
+      } else {
+        setShowTextReview(true);
+      }
     } finally {
       setLoading(false);
       setIsStopping(false);
       isStoppingRef.current = false;
+      stopBatchRef.current = false;
       setCurrentTaskId(null);
+      setProcessingFileIndex(0);
+      setProcessingFileTotal(0);
+      setProcessingFileName("");
+      setProcessingPreviewText("");
     }
   };
 
-  // Stop current narration stream and compile whatever is completed
+  // Stop current narration stream and compile whatever is completed (ends the batch)
   const handleStopNarration = async () => {
     if (!currentTaskId || isStopping) return;
     isStoppingRef.current = true;
+    stopBatchRef.current = true;
     setIsStopping(true);
     // Advance UI immediately — server aborts the in-flight TTS fetch next
     setProgressStep("encoding");
@@ -663,28 +881,46 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   };
 
   // Force physical browser download of the MP3
-  const downloadMp3 = () => {
-    if (!audioUrl || !uploadedFile) return;
+  const downloadMp3 = (doc: DocItem | null = resultDoc) => {
+    if (!doc?.audioUrl) return;
     const a = document.createElement("a");
-    a.href = audioUrl;
-    const safeName = uploadedFile.name.replace(/\.[^/.]+$/, "");
-    a.download = `narracao_${safeName}_${pagesNarrated.replace(/\s+/g, "")}.mp3`;
+    a.href = doc.audioUrl;
+    const safeName = doc.file.name.replace(/\.[^/.]+$/, "");
+    a.download = `narracao_${safeName}_${(doc.pagesNarrated || "").replace(/\s+/g, "")}.mp3`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
   };
 
   const resetAll = () => {
-    setAudioBase64(null);
-    setExtractedText("");
-    setEditableText("");
     setShowTextReview(false);
-    if (audioUrl) {
-      URL.revokeObjectURL(audioUrl);
-      setAudioUrl(null);
+    setResultDocId(null);
+    setDocuments((docs) =>
+      docs.map((d) => {
+        if (d.audioUrl) URL.revokeObjectURL(d.audioUrl);
+        return {
+          ...d,
+          editableText: "",
+          extractedText: "",
+          pagesNarrated: "",
+          audioBase64: null,
+          audioUrl: null,
+        };
+      })
+    );
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+  };
+
+  const selectResultDoc = (docId: string) => {
+    if (audioRef.current) {
+      audioRef.current.pause();
     }
     setIsPlaying(false);
     setCurrentTime(0);
+    setDuration(0);
+    setResultDocId(docId);
   };
 
   const [stageBarPercent, setStageBarPercent] = useState(0);
@@ -853,10 +1089,11 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       </div>
 
       {/* Hidden audio tag linked with React state */}
-      {audioUrl && (
+      {resultDoc?.audioUrl && (
         <audio
+          key={resultDoc.id}
           ref={audioRef}
-          src={audioUrl}
+          src={resultDoc.audioUrl}
           onTimeUpdate={handleTimeUpdate}
           onLoadedMetadata={handleLoadedMetadata}
           onEnded={handleAudioEnded}
@@ -921,9 +1158,9 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
               initial={{ opacity: 0, scale: 0.98 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.98 }}
-              className={`${loadingMode === "narrate" && extractedText ? "max-w-5xl" : "max-w-2xl"} mx-auto bg-white/5 backdrop-blur-2xl border border-white/15 rounded-3xl shadow-2xl p-8 sm:p-12 text-center`}
+              className={`${loadingMode === "narrate" && processingPreviewText ? "max-w-5xl" : "max-w-2xl"} mx-auto bg-white/5 backdrop-blur-2xl border border-white/15 rounded-3xl shadow-2xl p-8 sm:p-12 text-center`}
             >
-              <div className={`grid ${loadingMode === "narrate" && extractedText ? "lg:grid-cols-2 gap-8 items-start text-left" : ""}`}>
+              <div className={`grid ${loadingMode === "narrate" && processingPreviewText ? "lg:grid-cols-2 gap-8 items-start text-left" : ""}`}>
                 <div>
                   <div className="relative w-24 h-24 mx-auto mb-8 flex items-center justify-center">
                     <div className="absolute inset-0 border-4 border-blue-500/10 rounded-full animate-pulse" />
@@ -933,13 +1170,40 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
 
                   <h3 className="text-xl font-bold text-white mb-2 text-center">
                     {loadingMode === "extract"
-                      ? (fileType === "pdf" ? "Extraindo texto do PDF" : "Extraindo texto do EPUB")
-                      : (fileType === "pdf" ? "Narrando seu texto" : "Narrando seu texto")}
+                      ? (processingFileTotal > 1 ? "Extraindo textos" : "Extraindo texto")
+                      : (processingFileTotal > 1 ? "Narrando seus textos" : "Narrando seu texto")}
                   </h3>
+
+                  {processingFileName && (
+                    <div className="max-w-md mx-auto mb-4 rounded-2xl border border-blue-500/25 bg-blue-500/10 px-4 py-3 text-center">
+                      {processingFileTotal > 1 && (
+                        <p className="text-[11px] font-semibold uppercase tracking-wider text-blue-300/90 mb-1">
+                          Arquivo {processingFileIndex} de {processingFileTotal}
+                        </p>
+                      )}
+                      <p className="text-sm font-semibold text-white truncate" title={processingFileName}>
+                        {processingFileName}
+                      </p>
+                    </div>
+                  )}
+
+                  {loadingMode === "narrate" && savedFilesCount > 0 && lastSavedFileName && (
+                    <div className="max-w-md mx-auto mb-4 rounded-2xl border border-emerald-500/25 bg-emerald-500/10 px-4 py-2.5 text-center">
+                      <p className="text-[11px] font-semibold text-emerald-300 flex items-center justify-center gap-1.5">
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                        Salvo em Downloads
+                        {savedFilesCount > 1 ? ` (${savedFilesCount})` : ""}
+                      </p>
+                      <p className="text-xs text-emerald-100/90 truncate mt-0.5" title={lastSavedFileName}>
+                        {lastSavedFileName}
+                      </p>
+                    </div>
+                  )}
+
                   <p className="text-slate-300 text-sm max-w-md mx-auto mb-8 text-center">
                     {loadingMode === "extract"
-                      ? "Em seguida você poderá revisar e editar o texto antes da narração."
-                      : "Acompanhe o progresso da síntese de voz."}
+                      ? "Em seguida você poderá revisar e editar o texto de cada arquivo antes da narração."
+                      : "Cada áudio concluído é salvo automaticamente na pasta Downloads."}
                   </p>
 
                   {/* Progress bar: 0–100% within the current stage only */}
@@ -966,17 +1230,22 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                   </div>
 
                   {/* Steps stay on the left only when there is no right column */}
-                  {!(loadingMode === "narrate" && extractedText) && (
+                  {!(loadingMode === "narrate" && processingPreviewText) && (
                     <div className="bg-slate-900/40 border border-white/10 rounded-2xl p-5 max-w-md mx-auto text-left space-y-4 mb-8">
                       <div className="flex items-center justify-between">
                         <span className="text-xs font-mono text-slate-400">Etapas do Processo</span>
+                        {processingFileTotal > 1 && (
+                          <span className="text-xs font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20 px-2 py-0.5 rounded-full">
+                            {processingFileIndex}/{processingFileTotal}
+                          </span>
+                        )}
                       </div>
                       <hr className="border-white/5" />
                       {loadingMode === "extract" ? (
                         <div className="flex items-center gap-3 text-sm">
                           <Loader2 className="w-4 h-4 text-blue-400 animate-spin shrink-0" />
                           <span className="text-white font-medium animate-pulse">
-                            {fileType === "pdf" ? "Recortando páginas e extraindo texto" : "Extraindo capítulos selecionados"}
+                            Extraindo texto do arquivo atual
                           </span>
                         </div>
                       ) : null}
@@ -1005,28 +1274,38 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                       </button>
                       <p className="text-[11px] text-slate-400 mt-2 text-center">
                         Interrompe a narração e monta o áudio MP3 com o conteúdo processado até este momento.
+                        {processingFileTotal > 1
+                          ? " Os arquivos seguintes não serão narrados."
+                          : ""}
                       </p>
                     </div>
                   )}
 
-                  {!(loadingMode === "narrate" && extractedText) && (
+                  {!(loadingMode === "narrate" && processingPreviewText) && (
                     <p className="text-xs italic text-slate-400 mt-6 text-center">
                       "A leitura nos dá um lugar para ir quando temos que ficar onde estamos."
                     </p>
                   )}
                 </div>
 
-                {loadingMode === "narrate" && extractedText && (
+                {loadingMode === "narrate" && processingPreviewText && (
                   <div className="bg-slate-900/40 border border-white/10 rounded-2xl p-5 text-left space-y-4">
-                    <div className="flex items-center justify-between">
+                    <div className="flex items-center justify-between gap-2">
                       <span className="text-xs font-mono text-slate-400">Etapas do Processo</span>
-                      {(progressStep === "tts" || (progressStep === "encoding" && totalChunks > 0)) && totalChunks > 0 && (
-                        <span className="text-xs font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20 px-2 py-0.5 rounded-full animate-pulse">
-                          {progressStep === "encoding"
-                            ? `${currentChunk} de ${totalChunks} partes`
-                            : `Parte ${currentChunk} de ${totalChunks}`}
-                        </span>
-                      )}
+                      <div className="flex items-center gap-2 shrink-0">
+                        {processingFileTotal > 1 && (
+                          <span className="text-xs font-semibold bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 px-2 py-0.5 rounded-full">
+                            Arquivo {processingFileIndex}/{processingFileTotal}
+                          </span>
+                        )}
+                        {(progressStep === "tts" || (progressStep === "encoding" && totalChunks > 0)) && totalChunks > 0 && (
+                          <span className="text-xs font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20 px-2 py-0.5 rounded-full animate-pulse">
+                            {progressStep === "encoding"
+                              ? `${currentChunk} de ${totalChunks} partes`
+                              : `Parte ${currentChunk} de ${totalChunks}`}
+                          </span>
+                        )}
+                      </div>
                     </div>
                     <hr className="border-white/5" />
 
@@ -1096,19 +1375,24 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                 <div>
                   <h3 className="text-xl font-bold text-white flex items-center gap-2">
                     <BookOpen className="w-5 h-5 text-blue-400" />
-                    Revisar texto antes de narrar
+                    {documents.length > 1
+                      ? "Revisar textos antes de narrar"
+                      : "Revisar texto antes de narrar"}
                   </h3>
                   <p className="text-sm text-slate-400 mt-1">
-                    Edite o conteúdo como quiser. A narração usará exatamente este texto.
-                    {pagesNarrated ? (
-                      <span className="block mt-1 text-xs text-slate-500">Intervalo: {pagesNarrated}</span>
+                    {documents.length > 1
+                      ? "Valide o texto de cada arquivo. A narração usará exatamente o conteúdo revisado."
+                      : "Edite o conteúdo como quiser. A narração usará exatamente este texto."}
+                    {reviewDoc?.pagesNarrated ? (
+                      <span className="block mt-1 text-xs text-slate-500">
+                        Intervalo: {reviewDoc.pagesNarrated}
+                      </span>
                     ) : null}
                   </p>
                 </div>
                 <button
                   onClick={() => {
                     setShowTextReview(false);
-                    setEditableText("");
                   }}
                   className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-400 hover:text-white transition-colors cursor-pointer"
                 >
@@ -1117,9 +1401,41 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                 </button>
               </div>
 
+              {documents.length > 1 && (
+                <div className="flex gap-2 overflow-x-auto pb-3 mb-4 scrollbar-thin scrollbar-thumb-white/10">
+                  {documents.map((doc, index) => {
+                    const isActive = (reviewDocId ?? documents[0]?.id) === doc.id;
+                    const hasText = Boolean(doc.editableText.trim());
+                    return (
+                      <button
+                        key={doc.id}
+                        type="button"
+                        onClick={() => setReviewDocId(doc.id)}
+                        className={`shrink-0 max-w-[220px] rounded-xl border px-3 py-2 text-left transition-all cursor-pointer ${
+                          isActive
+                            ? "border-blue-500/60 bg-blue-500/15 text-white"
+                            : "border-white/10 bg-white/5 text-slate-300 hover:border-white/20 hover:bg-white/10"
+                        }`}
+                        title={doc.file.name}
+                      >
+                        <span className="block text-[10px] font-semibold uppercase tracking-wider text-slate-400 mb-0.5">
+                          Arquivo {index + 1}
+                          {!hasText ? " · vazio" : ""}
+                        </span>
+                        <span className="block text-xs font-semibold truncate">{doc.file.name}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
               <textarea
-                value={editableText}
-                onChange={(e) => setEditableText(e.target.value)}
+                value={reviewDoc?.editableText ?? ""}
+                onChange={(e) => {
+                  const id = reviewDocId ?? documents[0]?.id;
+                  if (!id) return;
+                  updateDoc(id, { editableText: e.target.value });
+                }}
                 rows={18}
                 className="w-full min-h-[320px] bg-slate-950/60 border border-white/10 focus:border-blue-500/60 rounded-2xl p-5 text-sm text-slate-200 leading-relaxed font-serif whitespace-pre-wrap outline-none resize-y scrollbar-thin scrollbar-thumb-white/10"
                 placeholder="Texto extraído..."
@@ -1129,7 +1445,6 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                 <button
                   onClick={() => {
                     setShowTextReview(false);
-                    setEditableText("");
                   }}
                   className="sm:flex-1 bg-white/5 hover:bg-white/10 border border-white/15 text-slate-200 py-3.5 rounded-2xl text-sm font-semibold transition-all cursor-pointer"
                 >
@@ -1137,15 +1452,19 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                 </button>
                 <button
                   onClick={handleConfirmNarration}
-                  disabled={!editableText.trim()}
+                  disabled={documents.some((d) => !d.editableText.trim())}
                   className="sm:flex-[2] bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white py-3.5 rounded-2xl font-bold text-sm shadow-lg shadow-blue-900/35 flex items-center justify-center gap-2.5 transition-all cursor-pointer"
                 >
                   <Sparkles className="w-5 h-5" />
-                  <span>Narrar este texto</span>
+                  <span>
+                    {documents.length > 1
+                      ? `Narrar todos (${documents.length} arquivos)`
+                      : "Narrar este texto"}
+                  </span>
                 </button>
               </div>
             </motion.div>
-          ) : !audioBase64 ? (
+          ) : !hasResults ? (
             /* Upload & Configuration Panel */
             <motion.div
               key="setup"
@@ -1158,15 +1477,11 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
               <div className="lg:col-span-5 space-y-6">
                 <div className="bg-white/5 backdrop-blur-2xl border border-white/15 rounded-3xl p-6 shadow-xl">
                   <h2 className="text-base font-bold text-white mb-4 flex items-center gap-2">
-                    {fileType === "epub" ? (
-                      <Book className="w-4.5 h-4.5 text-blue-400" />
-                    ) : (
-                      <FileText className="w-4.5 h-4.5 text-blue-400" />
-                    )}
-                    <span>1. Documento PDF ou EPUB</span>
+                    <FileText className="w-4.5 h-4.5 text-blue-400" />
+                    <span>1. Documentos PDF ou EPUB</span>
                   </h2>
 
-                  {!uploadedFile ? (
+                  {documents.length === 0 ? (
                     // Drag and Drop Zone
                     <div
                       onDragEnter={handleDrag}
@@ -1184,96 +1499,157 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                         id="file-upload"
                         className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
                         accept="application/pdf,application/epub+zip,.epub,.pdf"
+                        multiple
                         onChange={handleFileChange}
                       />
                       <div className="bg-blue-500/10 text-blue-400 w-12 h-12 rounded-2xl flex items-center justify-center mx-auto mb-4">
                         <FileText className="w-6 h-6" />
                       </div>
                       <p className="text-sm font-semibold text-slate-200 mb-1">
-                        Arraste seu PDF ou EPUB aqui
+                        Arraste PDFs ou EPUBs aqui
                       </p>
                       <p className="text-xs text-slate-400 mb-4">
-                        ou clique para selecionar do dispositivo
+                        um ou vários arquivos — clique para selecionar
                       </p>
                       <span className="inline-block bg-white/10 hover:bg-white/25 border border-white/15 rounded-lg px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition-colors">
-                        Escolher Arquivo
+                        Escolher Arquivos
                       </span>
                     </div>
                   ) : (
-                    // File Information
-                    <div className="border border-white/15 bg-white/5 rounded-2xl p-4 flex items-center justify-between gap-4">
-                      <div className="flex items-center gap-3 overflow-hidden">
-                        <div className="bg-gradient-to-br from-red-500/20 to-red-600/20 border border-red-500/30 text-red-400 p-2.5 rounded-xl shrink-0">
-                          {fileType === "epub" ? (
-                            <Book className="w-5 h-5 text-indigo-400" />
-                          ) : (
-                            <FileText className="w-5 h-5" />
-                          )}
-                        </div>
-                        <div className="overflow-hidden">
-                          <h4 className="text-sm font-semibold text-white truncate" title={uploadedFile.name}>
-                            {uploadedFile.name}
-                          </h4>
-                          <p className="text-xs text-slate-400">
-                            {(uploadedFile.size / (1024 * 1024)).toFixed(2)} MB • {fileType.toUpperCase()} Document
-                          </p>
-                        </div>
+                    <div className="space-y-3">
+                      <div className="space-y-2">
+                        {documents.map((doc, index) => {
+                          const isActive = activeDocId === doc.id;
+                          return (
+                            <div
+                              key={doc.id}
+                              role="button"
+                              tabIndex={0}
+                              onClick={() => setActiveDocId(doc.id)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" || e.key === " ") {
+                                  e.preventDefault();
+                                  setActiveDocId(doc.id);
+                                }
+                              }}
+                              className={`border rounded-2xl p-3 flex items-center justify-between gap-3 cursor-pointer transition-all ${
+                                isActive
+                                  ? "border-blue-500/50 bg-blue-500/10"
+                                  : "border-white/15 bg-white/5 hover:border-white/25"
+                              }`}
+                            >
+                              <div className="flex items-center gap-3 overflow-hidden min-w-0">
+                                <div className="bg-gradient-to-br from-red-500/20 to-red-600/20 border border-red-500/30 text-red-400 p-2 rounded-xl shrink-0">
+                                  {doc.fileType === "epub" ? (
+                                    <Book className="w-4 h-4 text-indigo-400" />
+                                  ) : (
+                                    <FileText className="w-4 h-4" />
+                                  )}
+                                </div>
+                                <div className="overflow-hidden min-w-0">
+                                  <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                                    Arquivo {index + 1}
+                                  </p>
+                                  <h4 className="text-sm font-semibold text-white truncate" title={doc.file.name}>
+                                    {doc.file.name}
+                                  </h4>
+                                  <p className="text-xs text-slate-400">
+                                    {(doc.file.size / (1024 * 1024)).toFixed(2)} MB • {doc.fileType.toUpperCase()}
+                                    {doc.docInfoLoading ? " • lendo…" : ""}
+                                  </p>
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleRemoveFile(doc.id);
+                                }}
+                                className="bg-white/5 hover:bg-rose-500/20 text-slate-300 hover:text-rose-400 border border-white/10 rounded-xl p-2 transition-all shadow-sm shrink-0 cursor-pointer"
+                                title="Remover arquivo"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          );
+                        })}
                       </div>
-                      <button
-                        onClick={handleRemoveFile}
-                        className="bg-white/5 hover:bg-rose-500/20 text-slate-300 hover:text-rose-400 border border-white/10 rounded-xl p-2 transition-all shadow-sm shrink-0"
-                        title="Remover arquivo"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
+
+                      <label className="relative flex items-center justify-center gap-2 rounded-xl border border-dashed border-white/15 hover:border-blue-500/40 hover:bg-white/5 px-3 py-2.5 text-xs font-semibold text-slate-300 hover:text-white transition-all cursor-pointer">
+                        <Plus className="w-3.5 h-3.5" />
+                        Adicionar mais arquivos
+                        <input
+                          type="file"
+                          className="absolute inset-0 opacity-0 cursor-pointer"
+                          accept="application/pdf,application/epub+zip,.epub,.pdf"
+                          multiple
+                          onChange={handleFileChange}
+                        />
+                      </label>
                     </div>
                   )}
                 </div>
 
                 {/* Page Controls Panel (Only shows if file loaded) */}
-                {uploadedFile && (
+                {activeDoc && (
                   <motion.div
+                    key={activeDoc.id}
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: "auto" }}
                     className="bg-white/5 backdrop-blur-2xl border border-white/15 rounded-3xl p-6 shadow-xl space-y-4"
                   >
                     <h2 className="text-base font-bold text-white mb-2 flex items-center gap-2">
                       <Clock className="w-4.5 h-4.5 text-blue-400" />
-                      <span>2. {fileType === "pdf" ? "Páginas do PDF" : "Capítulos do EPUB"}</span>
+                      <span>
+                        2.{" "}
+                        {activeDoc.fileType === "pdf" ? "Páginas do PDF" : "Capítulos do EPUB"}
+                      </span>
                     </h2>
+                    {documents.length > 1 && (
+                      <p className="text-xs text-slate-400 -mt-2 truncate" title={activeDoc.file.name}>
+                        Configurando: <span className="text-slate-200 font-medium">{activeDoc.file.name}</span>
+                      </p>
+                    )}
 
-                    {docInfoLoading ? (
+                    {activeDoc.docInfoLoading ? (
                       <div className="flex items-center gap-2 text-sm text-slate-400">
                         <Loader2 className="w-4 h-4 animate-spin text-blue-400" />
                         Lendo estrutura do documento...
                       </div>
                     ) : (
                       <>
-                        {docInfoMessage && (
+                        {activeDoc.docInfoMessage && (
                           <p className="text-[11px] text-amber-200/90 bg-amber-500/10 border border-amber-500/20 rounded-xl px-3 py-2 leading-relaxed">
-                            {docInfoMessage}
-                            {fileType === "pdf" && pdfPageCount != null
-                              ? ` Use números de 1 a ${pdfPageCount}.`
+                            {activeDoc.docInfoMessage}
+                            {activeDoc.fileType === "pdf" && activeDoc.pdfPageCount != null
+                              ? ` Use números de 1 a ${activeDoc.pdfPageCount}.`
                               : ""}
                           </p>
                         )}
 
-                        {fileType === "epub" && epubChapters.length > 0 ? (
+                        {activeDoc.fileType === "epub" && activeDoc.epubChapters.length > 0 ? (
                           <div className="space-y-4">
                             <div className="grid grid-cols-1 gap-4">
                               <div className="space-y-1.5">
                                 <label className="text-xs font-bold text-slate-300">Capítulo / seção inicial</label>
                                 <select
-                                  value={startPage}
+                                  value={activeDoc.startPage}
                                   onChange={(e) => {
                                     const next = parseInt(e.target.value, 10) || 1;
-                                    setStartPage(next);
-                                    const currentEnd = endPage ? parseInt(endPage, 10) : next;
-                                    if (!endPage || currentEnd < next) setEndPage(String(next));
+                                    const currentEnd = activeDoc.endPage
+                                      ? parseInt(activeDoc.endPage, 10)
+                                      : next;
+                                    updateDoc(activeDoc.id, {
+                                      startPage: next,
+                                      endPage:
+                                        !activeDoc.endPage || currentEnd < next
+                                          ? String(next)
+                                          : activeDoc.endPage,
+                                    });
                                   }}
                                   className="w-full bg-slate-900/50 border border-white/15 text-white focus:border-blue-500 rounded-xl px-4 py-3 text-sm font-semibold outline-none"
                                 >
-                                  {epubChapters.map((ch) => (
+                                  {activeDoc.epubChapters.map((ch) => (
                                     <option key={ch.id || ch.index} value={ch.index}>
                                       {ch.index}. {ch.title}
                                     </option>
@@ -1283,12 +1659,14 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                               <div className="space-y-1.5">
                                 <label className="text-xs font-bold text-slate-300">Capítulo / seção final</label>
                                 <select
-                                  value={endPage || String(startPage)}
-                                  onChange={(e) => setEndPage(e.target.value)}
+                                  value={activeDoc.endPage || String(activeDoc.startPage)}
+                                  onChange={(e) =>
+                                    updateDoc(activeDoc.id, { endPage: e.target.value })
+                                  }
                                   className="w-full bg-slate-900/50 border border-white/15 text-white focus:border-blue-500 rounded-xl px-4 py-3 text-sm font-semibold outline-none"
                                 >
-                                  {epubChapters
-                                    .filter((ch) => ch.index >= startPage)
+                                  {activeDoc.epubChapters
+                                    .filter((ch) => ch.index >= activeDoc.startPage)
                                     .map((ch) => (
                                       <option key={`end-${ch.id || ch.index}`} value={ch.index}>
                                         {ch.index}. {ch.title}
@@ -1309,9 +1687,13 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                                 <input
                                   type="number"
                                   min={1}
-                                  max={pdfPageCount ?? undefined}
-                                  value={startPage}
-                                  onChange={(e) => setStartPage(Math.max(1, parseInt(e.target.value) || 1))}
+                                  max={activeDoc.pdfPageCount ?? undefined}
+                                  value={activeDoc.startPage}
+                                  onChange={(e) =>
+                                    updateDoc(activeDoc.id, {
+                                      startPage: Math.max(1, parseInt(e.target.value) || 1),
+                                    })
+                                  }
                                   className="w-full bg-slate-900/50 border border-white/15 text-white focus:border-blue-500 focus:bg-slate-900 rounded-xl px-4 py-3 text-sm font-semibold outline-none transition-all"
                                 />
                               </div>
@@ -1321,11 +1703,13 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                                 </label>
                                 <input
                                   type="number"
-                                  placeholder={String(startPage)}
-                                  min={startPage}
-                                  max={pdfPageCount ?? undefined}
-                                  value={endPage}
-                                  onChange={(e) => setEndPage(e.target.value)}
+                                  placeholder={String(activeDoc.startPage)}
+                                  min={activeDoc.startPage}
+                                  max={activeDoc.pdfPageCount ?? undefined}
+                                  value={activeDoc.endPage}
+                                  onChange={(e) =>
+                                    updateDoc(activeDoc.id, { endPage: e.target.value })
+                                  }
                                   className="w-full bg-slate-900/50 border border-white/15 text-white focus:border-blue-500 focus:bg-slate-900 rounded-xl px-4 py-3 text-sm font-semibold outline-none transition-all placeholder:text-slate-500"
                                 />
                               </div>
@@ -1346,7 +1730,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                 <div className="bg-white/5 backdrop-blur-2xl border border-white/15 rounded-3xl p-6 shadow-xl">
                   <h2 className="text-base font-bold text-white mb-1 flex items-center gap-2">
                     <Music className="w-4.5 h-4.5 text-blue-400" />
-                    <span>{uploadedFile ? "3. Voz do Narrador" : "2. Voz do Narrador"}</span>
+                    <span>{documents.length > 0 ? "3. Voz do Narrador" : "2. Voz do Narrador"}</span>
                   </h2>
                   <p className="text-xs text-slate-400 mb-4">
                     {ttsEngine === "kokoro"
@@ -1441,7 +1825,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                     })}
                   </div>
 
-                  {uploadedFile ? (
+                  {documents.length > 0 ? (
                     <motion.div
                       initial={{ opacity: 0, y: 10 }}
                       animate={{ opacity: 1, y: 0 }}
@@ -1449,17 +1833,21 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                     >
                       <button
                         onClick={handleExtractForReview}
-                        disabled={docInfoLoading || !fileBase64}
+                        disabled={!allDocsReady || anyDocInfoLoading}
                         className="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white py-4 rounded-2xl font-bold text-sm shadow-lg shadow-blue-900/35 flex items-center justify-center gap-2.5 transition-all hover:scale-[1.01] active:scale-[0.99] cursor-pointer"
                       >
                         <Sparkles className="w-5 h-5" />
-                        <span>Extrair Texto para Revisar</span>
+                        <span>
+                          {documents.length > 1
+                            ? `Extrair Textos para Revisar (${documents.length})`
+                            : "Extrair Texto para Revisar"}
+                        </span>
                       </button>
                     </motion.div>
                   ) : (
                     <div className="mt-6 p-4 bg-white/5 border border-white/10 rounded-2xl text-center">
                       <p className="text-xs text-slate-400">
-                        Adicione um documento PDF ou EPUB na coluna ao lado para iniciar a narração.
+                        Adicione um ou mais documentos PDF/EPUB na coluna ao lado para iniciar a narração.
                       </p>
                     </div>
                   )}
@@ -1486,17 +1874,49 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                     <span>Narrar Outro Trecho</span>
                   </button>
 
+                  {completedDocs.length > 1 && (
+                    <div className="flex gap-2 overflow-x-auto pb-3 mb-4 scrollbar-thin scrollbar-thumb-white/10">
+                      {completedDocs.map((doc, index) => {
+                        const isActive = resultDoc?.id === doc.id;
+                        return (
+                          <button
+                            key={doc.id}
+                            type="button"
+                            onClick={() => selectResultDoc(doc.id)}
+                            className={`shrink-0 max-w-[200px] rounded-xl border px-3 py-2 text-left transition-all cursor-pointer ${
+                              isActive
+                                ? "border-emerald-500/50 bg-emerald-500/10 text-white"
+                                : "border-white/10 bg-white/5 text-slate-300 hover:border-white/20"
+                            }`}
+                            title={doc.file.name}
+                          >
+                            <span className="block text-[10px] font-semibold uppercase tracking-wider text-slate-400 mb-0.5">
+                              Áudio {index + 1}
+                            </span>
+                            <span className="block text-xs font-semibold truncate">{doc.file.name}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+
                   <div className="text-center mb-6">
                     <div className="inline-flex bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 px-3 py-1.5 rounded-full text-xs font-bold gap-1.5 items-center mb-4">
                       <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>ÁUDIO MP3 PRONTO</span>
+                      <span>
+                        {completedDocs.length > 1
+                          ? `${completedDocs.length} ÁUDIOS MP3 PRONTOS`
+                          : "ÁUDIO MP3 PRONTO"}
+                      </span>
                     </div>
 
-                    <h2 className="text-lg font-bold text-white truncate px-4" title={uploadedFile?.name}>
-                      {uploadedFile?.name}
+                    <h2 className="text-lg font-bold text-white truncate px-4" title={resultDoc?.file.name}>
+                      {resultDoc?.file.name}
                     </h2>
                     <p className="text-xs text-slate-400 mt-1">
-                      {fileType === "pdf" ? "Páginas: " : "Seções: "}<strong className="text-slate-200">{pagesNarrated}</strong> • Voz: <strong className="text-blue-400">{selectedVoice}</strong>
+                      {resultDoc?.fileType === "pdf" ? "Páginas: " : "Seções: "}
+                      <strong className="text-slate-200">{resultDoc?.pagesNarrated}</strong>
+                      {" • "}Voz: <strong className="text-blue-400">{selectedVoice}</strong>
                     </p>
                   </div>
 
@@ -1575,8 +1995,9 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
 
                   {/* Physical Download MP3 Action */}
                   <button
-                    onClick={downloadMp3}
-                    className="w-full bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white py-4 rounded-2xl font-bold text-sm shadow-lg shadow-emerald-950/20 flex items-center justify-center gap-2.5 transition-all hover:scale-[1.01] active:scale-[0.99] mb-4 cursor-pointer"
+                    onClick={() => downloadMp3(resultDoc)}
+                    disabled={!resultDoc?.audioUrl}
+                    className="w-full bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-40 disabled:cursor-not-allowed text-white py-4 rounded-2xl font-bold text-sm shadow-lg shadow-emerald-950/20 flex items-center justify-center gap-2.5 transition-all hover:scale-[1.01] active:scale-[0.99] mb-4 cursor-pointer"
                   >
                     <Download className="w-5 h-5" />
                     <span>Baixar Áudio (.mp3)</span>
@@ -1601,7 +2022,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
 
                   <div className="flex-1 overflow-y-auto bg-slate-950/40 border border-white/5 rounded-2xl p-5 scrollbar-thin scrollbar-thumb-white/10">
                     <p className="text-slate-300 text-sm leading-relaxed whitespace-pre-wrap select-text font-serif">
-                      {extractedText}
+                      {resultDoc?.extractedText}
                     </p>
                   </div>
                 </div>

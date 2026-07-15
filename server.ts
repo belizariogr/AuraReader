@@ -1533,6 +1533,86 @@ app.get("/api/health", async (req, res) => {
 // Active generation tasks map for cancellation/stop support
 const activeTasks = new Map<string, { stopped: boolean; abort: AbortController }>();
 
+function resolveDownloadsDir(): string {
+  const home = os.homedir();
+  const candidates =
+    process.platform === "win32"
+      ? [
+          process.env.USERPROFILE ? path.join(process.env.USERPROFILE, "Downloads") : "",
+          path.join(home, "Downloads"),
+          path.join(home, "Transferências"),
+        ]
+      : [
+          path.join(home, "Downloads"),
+          path.join(home, "Transferências"), // common PT-BR folder name on macOS/Linux
+        ];
+
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) return candidate;
+  }
+  // Prefer creating the English "Downloads" name if nothing exists yet
+  const fallback = path.join(home, "Downloads");
+  fs.mkdirSync(fallback, { recursive: true });
+  return fallback;
+}
+
+function sanitizeDownloadBaseName(name: string): string {
+  const cleaned = String(name || "narracao")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^\.+/, "")
+    .slice(0, 180);
+  return cleaned || "narracao";
+}
+
+function uniqueDownloadPath(dir: string, baseName: string): string {
+  const safeBase = sanitizeDownloadBaseName(baseName.replace(/\.mp3$/i, ""));
+  let candidate = path.join(dir, `${safeBase}.mp3`);
+  if (!fs.existsSync(candidate)) return candidate;
+
+  for (let i = 1; i < 1000; i++) {
+    candidate = path.join(dir, `${safeBase} (${i}).mp3`);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+  return path.join(dir, `${safeBase}-${Date.now()}.mp3`);
+}
+
+// Save a completed MP3 into the user's Downloads folder as soon as narration finishes
+app.post("/api/save-to-downloads", async (req, res) => {
+  try {
+    const { audioData, fileName } = req.body as {
+      audioData?: string;
+      fileName?: string;
+    };
+
+    if (!audioData || typeof audioData !== "string") {
+      return res.status(400).json({ error: "audioData (base64) é obrigatório." });
+    }
+
+    const downloadsDir = resolveDownloadsDir();
+    const destPath = uniqueDownloadPath(downloadsDir, fileName || "narracao.mp3");
+    const buffer = Buffer.from(audioData, "base64");
+    if (buffer.length === 0) {
+      return res.status(400).json({ error: "Áudio vazio — nada para salvar." });
+    }
+
+    await fs.promises.writeFile(destPath, buffer);
+    console.log(`[SaveDownloads] Saved ${buffer.length} bytes → ${destPath}`);
+    return res.json({
+      success: true,
+      path: destPath,
+      fileName: path.basename(destPath),
+      directory: downloadsDir,
+    });
+  } catch (err: any) {
+    console.error("[SaveDownloads] Failed:", err);
+    return res.status(500).json({
+      error: err?.message || "Não foi possível salvar o áudio em Downloads.",
+    });
+  }
+});
+
 // API to stop an active narration stream and wrap up the processed audio so far
 app.post("/api/narrate-stop", async (req, res) => {
   const { taskId } = req.body;
