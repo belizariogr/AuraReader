@@ -82,7 +82,12 @@
     "extraResources": [
       {
         "from": "build/app-resources",
-        "to": "aura"
+        "to": "aura",
+        "filter": ["**/*", "!node_modules", "!node_modules/**"]
+      },
+      {
+        "from": "build/app-resources/node_modules",
+        "to": "aura/node_modules"
       },
       {
         "from": "assets/icon.png",

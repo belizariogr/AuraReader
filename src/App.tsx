@@ -2241,19 +2241,6 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                     </div>
                   )}
 
-                  {loadingMode === "narrate" && savedFilesCount > 0 && lastSavedFileName && (
-                    <div className="max-w-md mx-auto mb-4 rounded-2xl border border-emerald-500/25 bg-emerald-500/10 px-4 py-2.5 text-center">
-                      <p className="text-[11px] font-semibold text-emerald-300 flex items-center justify-center gap-1.5">
-                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                        Salvo em Downloads
-                        {savedFilesCount > 1 ? ` (${savedFilesCount})` : ""}
-                      </p>
-                      <p className="text-xs text-emerald-100/90 truncate mt-0.5" title={lastSavedFileName}>
-                        {lastSavedFileName}
-                      </p>
-                    </div>
-                  )}
-
                   <p className="text-slate-300 text-sm max-w-md mx-auto mb-8 text-center">
                     {loadingMode === "extract"
                       ? "Em seguida você poderá revisar e editar o texto de cada arquivo antes da narração."
@@ -2343,78 +2330,92 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                 </div>
 
                 {loadingMode === "narrate" && processingPreviewText && (
-                  <div className="bg-slate-900/40 border border-white/10 rounded-2xl p-5 text-left space-y-4">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-mono text-slate-400">Etapas do Processo</span>
-                      <div className="flex items-center gap-2 shrink-0">
-                        {processingFileTotal > 1 && (
-                          <span className="text-xs font-semibold bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 px-2 py-0.5 rounded-full">
-                            Arquivo {processingFileIndex}/{processingFileTotal}
-                          </span>
+                  <div className="space-y-4">
+                    <div className="bg-slate-900/40 border border-white/10 rounded-2xl p-5 text-left space-y-4">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-mono text-slate-400">Etapas do Processo</span>
+                        <div className="flex items-center gap-2 shrink-0">
+                          {processingFileTotal > 1 && (
+                            <span className="text-xs font-semibold bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 px-2 py-0.5 rounded-full">
+                              Arquivo {processingFileIndex}/{processingFileTotal}
+                            </span>
+                          )}
+                          {(progressStep === "tts" || (progressStep === "encoding" && totalChunks > 0)) && totalChunks > 0 && (
+                            <span className="text-xs font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20 px-2 py-0.5 rounded-full animate-pulse">
+                              {progressStep === "encoding"
+                                ? `${currentChunk} de ${totalChunks} partes`
+                                : `Parte ${currentChunk} de ${totalChunks}`}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <hr className="border-white/5" />
+
+                      {/* Step 1 skipped — text already reviewed */}
+                      <div className="flex items-center gap-3 text-sm">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <span className="text-slate-400">Texto revisado e confirmado</span>
+                      </div>
+
+                      {/* Step 2: Content preparation */}
+                      <div className="flex items-center gap-3 text-sm">
+                        {["pre_tts", "chunks"].includes(progressStep) ? (
+                          <Loader2 className="w-4 h-4 text-blue-400 animate-spin shrink-0" />
+                        ) : ["tts", "encoding", "done"].includes(progressStep) ? (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                        ) : (
+                          <div className="w-4 h-4 rounded-full border border-white/20 shrink-0" />
                         )}
-                        {(progressStep === "tts" || (progressStep === "encoding" && totalChunks > 0)) && totalChunks > 0 && (
-                          <span className="text-xs font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20 px-2 py-0.5 rounded-full animate-pulse">
-                            {progressStep === "encoding"
-                              ? `${currentChunk} de ${totalChunks} partes`
-                              : `Parte ${currentChunk} de ${totalChunks}`}
-                          </span>
+                        <span className={["pre_tts", "chunks"].includes(progressStep) ? "text-white font-medium animate-pulse" : "text-slate-400"}>
+                          Estruturando e dividindo conteúdo
+                        </span>
+                      </div>
+
+                      {/* Step 3: Synthesis */}
+                      <div className="flex items-center gap-3 text-sm">
+                        {["pre_tts", "chunks"].includes(progressStep) ? (
+                          <div className="w-4 h-4 rounded-full border border-white/20 shrink-0" />
+                        ) : progressStep === "tts" ? (
+                          <Loader2 className="w-4 h-4 text-blue-400 animate-spin shrink-0" />
+                        ) : (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                         )}
+                        <span className={progressStep === "tts" ? "text-white font-medium animate-pulse" : ["pre_tts", "chunks"].includes(progressStep) ? "text-slate-500" : "text-slate-400"}>
+                          Narrando com Inteligência Artificial (
+                            {ttsEngine === "kokoro" ? "Kokoro" : "Qwen3 TTS"}
+                          )
+                        </span>
+                      </div>
+
+                      {/* Step 4: Encoding */}
+                      <div className="flex items-center gap-3 text-sm">
+                        {["pre_tts", "chunks", "tts"].includes(progressStep) ? (
+                          <div className="w-4 h-4 rounded-full border border-white/20 shrink-0" />
+                        ) : progressStep === "encoding" ? (
+                          <Loader2 className="w-4 h-4 text-blue-400 animate-spin shrink-0" />
+                        ) : (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                        )}
+                        <span className={progressStep === "encoding" ? "text-white font-medium animate-pulse" : ["pre_tts", "chunks", "tts"].includes(progressStep) ? "text-slate-500" : "text-slate-400"}>
+                          Codificando áudio ({outputFormat === "m4b" ? "M4B" : "MP3"})
+                          {progressStep === "encoding" && encodePercent != null
+                            ? ` — ${Math.round(encodePercent)}%`
+                            : ""}
+                        </span>
                       </div>
                     </div>
-                    <hr className="border-white/5" />
-
-                    {/* Step 1 skipped — text already reviewed */}
-                    <div className="flex items-center gap-3 text-sm">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                      <span className="text-slate-400">Texto revisado e confirmado</span>
-                    </div>
-
-                    {/* Step 2: Content preparation */}
-                    <div className="flex items-center gap-3 text-sm">
-                      {["pre_tts", "chunks"].includes(progressStep) ? (
-                        <Loader2 className="w-4 h-4 text-blue-400 animate-spin shrink-0" />
-                      ) : ["tts", "encoding", "done"].includes(progressStep) ? (
-                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                      ) : (
-                        <div className="w-4 h-4 rounded-full border border-white/20 shrink-0" />
-                      )}
-                      <span className={["pre_tts", "chunks"].includes(progressStep) ? "text-white font-medium animate-pulse" : "text-slate-400"}>
-                        Estruturando e dividindo conteúdo
-                      </span>
-                    </div>
-
-                    {/* Step 3: Synthesis */}
-                    <div className="flex items-center gap-3 text-sm">
-                      {["pre_tts", "chunks"].includes(progressStep) ? (
-                        <div className="w-4 h-4 rounded-full border border-white/20 shrink-0" />
-                      ) : progressStep === "tts" ? (
-                        <Loader2 className="w-4 h-4 text-blue-400 animate-spin shrink-0" />
-                      ) : (
-                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                      )}
-                      <span className={progressStep === "tts" ? "text-white font-medium animate-pulse" : ["pre_tts", "chunks"].includes(progressStep) ? "text-slate-500" : "text-slate-400"}>
-                        Narrando com Inteligência Artificial (
-                          {ttsEngine === "kokoro" ? "Kokoro" : "Qwen3 TTS"}
-                        )
-                      </span>
-                    </div>
-
-                    {/* Step 4: Encoding */}
-                    <div className="flex items-center gap-3 text-sm">
-                      {["pre_tts", "chunks", "tts"].includes(progressStep) ? (
-                        <div className="w-4 h-4 rounded-full border border-white/20 shrink-0" />
-                      ) : progressStep === "encoding" ? (
-                        <Loader2 className="w-4 h-4 text-blue-400 animate-spin shrink-0" />
-                      ) : (
-                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                      )}
-                      <span className={progressStep === "encoding" ? "text-white font-medium animate-pulse" : ["pre_tts", "chunks", "tts"].includes(progressStep) ? "text-slate-500" : "text-slate-400"}>
-                        Codificando áudio ({outputFormat === "m4b" ? "M4B" : "MP3"})
-                        {progressStep === "encoding" && encodePercent != null
-                          ? ` — ${Math.round(encodePercent)}%`
-                          : ""}
-                      </span>
-                    </div>
+                    {savedFilesCount > 0 && lastSavedFileName && (
+                      <div className="rounded-2xl border border-emerald-500/25 bg-emerald-500/10 px-4 py-2.5 text-center">
+                        <p className="text-[11px] font-semibold text-emerald-300 flex items-center justify-center gap-1.5">
+                          <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                          Salvo em Downloads
+                          {savedFilesCount > 1 ? ` (${savedFilesCount})` : ""}
+                        </p>
+                        <p className="text-xs text-emerald-100/90 truncate mt-0.5" title={lastSavedFileName}>
+                          {lastSavedFileName}
+                        </p>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

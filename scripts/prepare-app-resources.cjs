@@ -114,10 +114,7 @@ function seedCommon() {
   const externalPkgs = ["@napi-rs/canvas", "pdfjs-dist"];
   for (const pkg of externalPkgs) {
     const src = path.join(root, "node_modules", pkg);
-    if (!fs.existsSync(src)) {
-      console.warn(`[prepare-app-resources] Missing ${pkg} — cover extract may fail in packaged app`);
-      continue;
-    }
+    mustExist(src, `node_modules/${pkg}`);
     const dst = path.join(nmOut, pkg);
     fs.mkdirSync(path.dirname(dst), { recursive: true });
     fs.cpSync(src, dst, { recursive: true });
