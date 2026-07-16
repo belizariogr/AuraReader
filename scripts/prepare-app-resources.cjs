@@ -2,6 +2,7 @@
  * Assemble a self-contained runtime tree for Electron packaging:
  *   build/app-resources/
  *     dist/
+ *     bin/ffmpeg (+ ffprobe)    (static binaries for M4B / convert)
  *     python/…                  (framework on darwin; portable 3.12 on win/linux)
  *     qwen3-tts-apple-silicon/  (darwin only)
  *     tts/torch/                (win32/linux only)
@@ -17,6 +18,7 @@ const fs = require("fs");
 const path = require("path");
 const https = require("https");
 const http = require("http");
+const zlib = require("zlib");
 const { execFileSync, spawnSync } = require("child_process");
 
 const root = path.resolve(__dirname, "..");
@@ -29,6 +31,10 @@ const cacheDir = path.join(root, "build", "cache");
 /** Pinned portable CPython 3.12 (python-build-standalone). */
 const PBS_TAG = "20260303";
 const PBS_VERSION = "3.12.13";
+
+/** Static ffmpeg/ffprobe from eugeneware/ffmpeg-static (includes both tools). */
+const FFMPEG_STATIC_TAG = "b6.1.1";
+const FFMPEG_STATIC_BASE = `https://github.com/eugeneware/ffmpeg-static/releases/download/${FFMPEG_STATIC_TAG}`;
 
 /** AMD ROCm Windows wheels (Python 3.12 / ROCm 7.2). Update when AMD bumps releases. */
 const ROCM_WINDOWS_WHEELS = [
@@ -230,11 +236,11 @@ function pbsAssetName(platform) {
   throw new Error(`No portable Python asset for ${platform}`);
 }
 
-function downloadFile(url, dest) {
+function downloadFile(url, dest, { minBytes = 1_000_000 } = {}) {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
-  if (fs.existsSync(dest) && fs.statSync(dest).size > 1_000_000) {
+  if (fs.existsSync(dest) && fs.statSync(dest).size > minBytes) {
     console.log("[prepare-app-resources] Using cached", dest);
-    return;
+    return Promise.resolve();
   }
   console.log("[prepare-app-resources] Downloading", url);
   const tmp = `${dest}.partial`;
@@ -277,6 +283,54 @@ function downloadFile(url, dest) {
     };
     get(url);
   });
+}
+
+function ffmpegStaticTriplet(platform) {
+  const arch = process.arch;
+  if (platform === "darwin") {
+    if (arch === "arm64") return "darwin-arm64";
+    if (arch === "x64") return "darwin-x64";
+  } else if (platform === "win32") {
+    return "win32-x64";
+  } else if (platform === "linux") {
+    if (arch === "arm64") return "linux-arm64";
+    if (arch === "x64") return "linux-x64";
+  }
+  throw new Error(
+    `[prepare-app-resources] No static ffmpeg for platform=${platform} arch=${arch}`
+  );
+}
+
+async function bundleFfmpeg(platform) {
+  const triplet = ffmpegStaticTriplet(platform);
+  const binDir = path.join(out, "bin");
+  fs.mkdirSync(binDir, { recursive: true });
+
+  for (const tool of ["ffmpeg", "ffprobe"]) {
+    const asset = `${tool}-${triplet}.gz`;
+    const url = `${FFMPEG_STATIC_BASE}/${asset}`;
+    const gzPath = path.join(cacheDir, "ffmpeg-static", asset);
+    await downloadFile(url, gzPath, { minBytes: 500_000 });
+
+    const destName = platform === "win32" ? `${tool}.exe` : tool;
+    const dest = path.join(binDir, destName);
+    const gunzipped = zlib.gunzipSync(fs.readFileSync(gzPath));
+    fs.writeFileSync(dest, gunzipped, { mode: 0o755 });
+    if (platform !== "win32") {
+      fs.chmodSync(dest, 0o755);
+    }
+    // Drop macOS quarantine if present (downloaded binaries)
+    if (platform === "darwin") {
+      try {
+        execFileSync("xattr", ["-dr", "com.apple.quarantine", dest], {
+          stdio: "ignore",
+        });
+      } catch {
+        // xattr may fail if attribute absent
+      }
+    }
+    console.log(`[prepare-app-resources] Bundled bin/${destName}`);
+  }
 }
 
 function extractTarGz(archive, destDir) {
@@ -582,6 +636,7 @@ async function main() {
 
   seedCommon();
   writeAccelMeta(platform, accel);
+  await bundleFfmpeg(platform);
 
   if (platform === "darwin") {
     prepareDarwin();

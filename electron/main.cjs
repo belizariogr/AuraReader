@@ -109,8 +109,10 @@ function resolveAuraRoot() {
   );
 }
 
-function guiPath() {
+function guiPath(auraRoot) {
   const extras = [
+    auraRoot ? path.join(auraRoot, "bin") : null,
+    auraRoot ? path.join(auraRoot, "build", "app-resources", "bin") : null,
     "/opt/homebrew/bin",
     "/usr/local/bin",
     "/usr/bin",
@@ -194,7 +196,7 @@ function resolveServerRunner(auraRoot) {
     };
   }
 
-  const pathEnv = guiPath();
+  const pathEnv = guiPath(auraRoot);
   const candidates = [
     "/opt/homebrew/bin/bun",
     path.join(os.homedir(), ".bun", "bin", "bun"),
@@ -415,7 +417,7 @@ async function startBackend(auraRoot) {
     name: "aura-app",
     env: {
       ...process.env,
-      PATH: guiPath(),
+      PATH: guiPath(auraRoot),
       ...(runner.envExtra || {}),
       NODE_ENV: "production",
       AURA_ROOT: auraRoot,

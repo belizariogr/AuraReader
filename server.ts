@@ -5,7 +5,6 @@ import os from "os";
 import { once } from "events";
 import { spawn, type ChildProcess } from "child_process";
 import multer from "multer";
-import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import { Mp3Encoder } from "./lamejsBridge";
 import { PDFDocument } from "pdf-lib";
@@ -470,16 +469,6 @@ const convertUpload = multer({
 });
 fs.mkdirSync(path.join(os.tmpdir(), "aura-uploads"), { recursive: true });
 
-// Initialize the Gemini SDK (PDF text extraction only; TTS is handled by Qwen3 locally)
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    }
-  }
-});
-
 /** Decode HTML named + numeric entities that often leak from PDF/EPUB extraction. */
 function decodeHtmlEntities(raw: string): string {
   if (!raw) return "";
@@ -571,7 +560,7 @@ function sanitizeExtractedText(raw: string): string {
     .replace(/\*\*(.+?)\*\*/g, "$1")
     .replace(/(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)/g, "$1")
     .replace(/`([^`]+)`/g, "$1")
-    // Common Gemini / PDF artifacts
+    // Common PDF extraction artifacts (page labels, etc.)
     .replace(/^\s*\[?\s*Page\s+\d+\s*\]?\s*:?\s*/gim, "")
     .replace(/^\s*P[aá]gina\s+\d+\s*:?\s*/gim, "")
     .replace(/\uFFFD/g, "") // replacement char
@@ -591,7 +580,12 @@ function sanitizeExtractedText(raw: string): string {
   text = text
     .split("\n")
     .map((line) => line.trim())
-    .filter((line) => line.length > 0)
+    .flatMap((line) => (line === "*" ? ["...", ""] : [line]))
+    .filter((line, i, lines) => {
+      if (line.length > 0) return true;
+      // Keep the blank line inserted after a lone "*" → "..."
+      return i > 0 && lines[i - 1] === "...";
+    })
     .join("\n");
 
   return text.trim();
@@ -842,82 +836,97 @@ function parsePageRange(startPage: unknown, endPage: unknown): { start: number; 
   return { start, end };
 }
 
-/** Physically slice PDF to the requested 1-indexed page range so Gemini cannot leave the bounds. */
-async function slicePdfToPageRange(
-  base64Data: string,
+/** Join pdf.js text items into plain text, preserving line breaks. */
+function textContentToPlainText(textContent: {
+  items: Array<{ str?: string; transform?: number[]; hasEOL?: boolean } | unknown>;
+}): string {
+  const lines: string[] = [];
+  let currentLine = "";
+  let lastY: number | null = null;
+
+  for (const raw of textContent.items) {
+    const item = raw as { str?: string; transform?: number[]; hasEOL?: boolean };
+    if (typeof item?.str !== "string") continue;
+
+    const y = Array.isArray(item.transform) ? item.transform[5] : null;
+    if (lastY !== null && y !== null && Math.abs(y - lastY) > 2.5) {
+      if (currentLine.trim()) lines.push(currentLine.trimEnd());
+      currentLine = "";
+    }
+
+    if (
+      currentLine &&
+      item.str &&
+      !currentLine.endsWith(" ") &&
+      !item.str.startsWith(" ")
+    ) {
+      currentLine += " ";
+    }
+    currentLine += item.str;
+
+    if (item.hasEOL) {
+      if (currentLine.trim()) lines.push(currentLine.trimEnd());
+      currentLine = "";
+      lastY = null;
+      continue;
+    }
+    lastY = y;
+  }
+
+  if (currentLine.trim()) lines.push(currentLine.trimEnd());
+  return lines.join("\n").trim();
+}
+
+/** Local PDF text extraction via pdf.js (no network / API key). */
+async function extractTextFromPdfLocal(
+  pdfBase64: string,
   start: number,
   end: number
-): Promise<{ base64: string; actualStart: number; actualEnd: number; totalPages: number }> {
-  const src = await PDFDocument.load(Buffer.from(base64Data, "base64"), {
-    ignoreEncryption: true,
+): Promise<{ text: string; actualStart: number; actualEnd: number; totalPages: number }> {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const data = new Uint8Array(Buffer.from(pdfBase64, "base64"));
+  const loadingTask = pdfjs.getDocument({
+    data,
+    useSystemFonts: true,
   });
-  const totalPages = src.getPageCount();
+  const doc = await loadingTask.promise;
+  const totalPages = doc.numPages;
+
   if (totalPages < 1) {
     throw new Error("O PDF não possui páginas legíveis.");
   }
 
-  const startIdx = start - 1;
-  if (startIdx >= totalPages) {
+  if (start > totalPages) {
     throw new Error(
       `O PDF possui apenas ${totalPages} página(s), mas a página inicial solicitada foi ${start}.`
     );
   }
 
-  const endIdx = Math.min(end - 1, totalPages - 1);
+  const actualStart = start;
+  const actualEnd = Math.min(end, totalPages);
   if (end > totalPages) {
     console.warn(
-      `[PDF Slice] Requested end page ${end} exceeds document (${totalPages}); clamping to ${totalPages}.`
+      `[PDF Extract] Requested end page ${end} exceeds document (${totalPages}); clamping to ${totalPages}.`
     );
   }
-  if (endIdx < startIdx) {
+  if (actualEnd < actualStart) {
     throw new Error("Intervalo de páginas inválido após o ajuste ao tamanho do PDF.");
   }
 
-  const out = await PDFDocument.create();
-  const indices: number[] = [];
-  for (let i = startIdx; i <= endIdx; i++) indices.push(i);
-  const copied = await out.copyPages(src, indices);
-  copied.forEach((page) => out.addPage(page));
+  const pageTexts: string[] = [];
+  for (let pageNum = actualStart; pageNum <= actualEnd; pageNum++) {
+    const page = await doc.getPage(pageNum);
+    const content = await page.getTextContent();
+    const pageText = textContentToPlainText(content);
+    if (pageText) pageTexts.push(pageText);
+  }
 
-  const bytes = await out.save();
   return {
-    base64: Buffer.from(bytes).toString("base64"),
-    actualStart: startIdx + 1,
-    actualEnd: endIdx + 1,
+    text: pageTexts.join("\n\n").trim(),
+    actualStart,
+    actualEnd,
     totalPages,
   };
-}
-
-async function extractTextFromPdfWithGemini(
-  pdfBase64: string,
-  actualStart: number,
-  actualEnd: number
-): Promise<string> {
-  const pageCount = actualEnd - actualStart + 1;
-  const extractionPrompt = `This PDF contains EXACTLY ${pageCount} page(s). These pages correspond to original document pages ${actualStart} through ${actualEnd} (inclusive).
-
-Extract and return ONLY the plain textual content of ALL pages in this PDF, in reading order.
-
-Important rules:
-- Return ONLY the exact textual content. No introductions, explanations, page numbers, headers like "Page N", or metadata.
-- Cover every page in this file from first to last — do not skip pages and do not invent content beyond them.
-- If there is no readable text, return exactly 'NO_CONTENT'.
-- Keep paragraphs well structured.`;
-
-  const extractionResponse = await ai.models.generateContent({
-    model: "gemini-3.5-flash",
-    contents: [
-      {
-        inlineData: {
-          data: pdfBase64,
-          mimeType: "application/pdf",
-        },
-      },
-      extractionPrompt,
-    ],
-  });
-
-  return extractionResponse.text ? extractionResponse.text.trim() : "";
 }
 
 async function extractDocumentText(options: {
@@ -929,30 +938,25 @@ async function extractDocumentText(options: {
   const { fileData, fileType, start, end } = options;
 
   if (fileType === "pdf") {
-    const sliced = await slicePdfToPageRange(fileData, start, end);
-    let extractedText = await extractTextFromPdfWithGemini(
-      sliced.base64,
-      sliced.actualStart,
-      sliced.actualEnd
-    );
-    extractedText = sanitizeExtractedText(extractedText);
+    const extracted = await extractTextFromPdfLocal(fileData, start, end);
+    let extractedText = sanitizeExtractedText(extracted.text);
 
-    if (!extractedText || extractedText === "NO_CONTENT") {
+    if (!extractedText) {
       throw new Error(
         "Não foi possível extrair texto das páginas selecionadas ou o PDF não possui conteúdo legível nesse intervalo."
       );
     }
 
     const pagesNarrated =
-      sliced.actualStart === sliced.actualEnd
-        ? `Página ${sliced.actualStart}`
-        : `Páginas ${sliced.actualStart} - ${sliced.actualEnd}`;
+      extracted.actualStart === extracted.actualEnd
+        ? `Página ${extracted.actualStart}`
+        : `Páginas ${extracted.actualStart} - ${extracted.actualEnd}`;
 
     return {
       extractedText,
       pagesNarrated,
-      actualStart: sliced.actualStart,
-      actualEnd: sliced.actualEnd,
+      actualStart: extracted.actualStart,
+      actualEnd: extracted.actualEnd,
     };
   }
 

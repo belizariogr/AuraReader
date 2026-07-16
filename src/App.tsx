@@ -57,8 +57,10 @@ interface DocItem {
   fileType: "pdf" | "epub";
   startPage: number;
   endPage: string;
-  /** PDF cover page (1-based). Empty string = no cover. */
+  /** PDF cover page (1-based). Ignored when exportCover is false. */
   coverPage: string;
+  /** When false, skip cover JPEG / M4B artwork. */
+  exportCover: boolean;
   pdfPageCount: number | null;
   epubChapters: EpubChapter[];
   docInfoMessage: string;
@@ -70,7 +72,11 @@ interface DocItem {
   audioUrl: string | null;
   audioFormat: OutputFormat;
   coverPreviewUrl: string | null;
+  startPreviewUrl: string | null;
+  endPreviewUrl: string | null;
 }
+
+type PagePreviewKey = "start" | "end" | "cover";
 
 function createDocId() {
   return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -149,8 +155,19 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   const [reviewDocId, setReviewDocId] = useState<string | null>(null);
   const [resultDocId, setResultDocId] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState<boolean>(false);
-  const [coverPreviewLoading, setCoverPreviewLoading] = useState(false);
+  const [previewLoadingKeys, setPreviewLoadingKeys] = useState<
+    Partial<Record<PagePreviewKey, boolean>>
+  >({});
   const [coverPreviewMessage, setCoverPreviewMessage] = useState<string | null>(null);
+  const previewDepsRef = useRef<{
+    id: string;
+    fileBase64: string;
+    fileType: "pdf" | "epub";
+    startPage: number;
+    endPage: string;
+    coverPage: string;
+    exportCover: boolean;
+  } | null>(null);
 
   // Shared configuration
   const [voices, setVoices] = useState<Voice[]>(FALLBACK_QWEN_VOICES);
@@ -308,68 +325,205 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     setDocuments((docs) => docs.map((d) => (d.id === id ? { ...d, ...patch } : d)));
   };
 
-  // Cover preview for active document
-  const refreshCoverPreview = useCallback(async (doc: DocItem) => {
-    if (!doc.fileBase64) return;
-    const wantsCover =
-      doc.fileType === "epub" ||
-      (doc.fileType === "pdf" && doc.coverPage.trim() !== "");
-    if (!wantsCover) {
-      if (doc.coverPreviewUrl) {
-        URL.revokeObjectURL(doc.coverPreviewUrl);
-        updateDoc(doc.id, { coverPreviewUrl: null });
-      }
-      setCoverPreviewMessage("Sem capa (página vazia)");
-      return;
-    }
+  // Page / cover previews for active document (refresh only the slots that changed)
+  const fetchPageJpegUrl = async (
+    fileBase64: string,
+    fileType: "pdf" | "epub",
+    coverPage?: string | number
+  ): Promise<string | null> => {
+    const res = await fetch("/api/cover-preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fileData: fileBase64,
+        fileType,
+        coverPage,
+      }),
+    });
+    const payload = await res.json();
+    if (!res.ok || !payload.found || !payload.imageData) return null;
+    const binary = atob(payload.imageData as string);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
+  };
 
-    setCoverPreviewLoading(true);
-    setCoverPreviewMessage(null);
-    try {
-      const res = await fetch("/api/cover-preview", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fileData: doc.fileBase64,
-          fileType: doc.fileType,
-          coverPage: doc.fileType === "pdf" ? doc.coverPage : undefined,
-        }),
+  const revokePreviewUrl = (url: string | null) => {
+    if (url) URL.revokeObjectURL(url);
+  };
+
+  const resolvePdfEndPage = (doc: DocItem) => {
+    const startPage = Math.max(1, doc.startPage || 1);
+    const endNum = doc.endPage.trim() ? parseInt(doc.endPage, 10) : startPage;
+    const endPage =
+      Number.isFinite(endNum) && endNum >= startPage ? endNum : startPage;
+    return { startPage, endPage };
+  };
+
+  const refreshPagePreviews = useCallback(
+    async (doc: DocItem, keys: PagePreviewKey[]) => {
+      if (!doc.fileBase64 || keys.length === 0) return;
+
+      const uniqueKeys = [...new Set(keys)];
+      setPreviewLoadingKeys((prev) => {
+        const next = { ...prev };
+        for (const k of uniqueKeys) next[k] = true;
+        return next;
       });
-      const payload = await res.json();
-      if (doc.coverPreviewUrl) URL.revokeObjectURL(doc.coverPreviewUrl);
-      if (!res.ok || !payload.found) {
-        updateDoc(doc.id, { coverPreviewUrl: null });
-        setCoverPreviewMessage(payload.error || payload.message || "Capa não encontrada");
-        return;
+      if (uniqueKeys.includes("cover")) setCoverPreviewMessage(null);
+
+      const patch: Partial<DocItem> = {};
+
+      try {
+        if (doc.fileType === "epub") {
+          if (uniqueKeys.includes("start")) {
+            revokePreviewUrl(doc.startPreviewUrl);
+            patch.startPreviewUrl = null;
+          }
+          if (uniqueKeys.includes("end")) {
+            if (doc.endPreviewUrl && doc.endPreviewUrl !== doc.startPreviewUrl) {
+              revokePreviewUrl(doc.endPreviewUrl);
+            }
+            patch.endPreviewUrl = null;
+          }
+          if (uniqueKeys.includes("cover")) {
+            revokePreviewUrl(doc.coverPreviewUrl);
+            if (!doc.exportCover) {
+              patch.coverPreviewUrl = null;
+              setCoverPreviewMessage(null);
+            } else {
+              const coverUrl = await fetchPageJpegUrl(doc.fileBase64, "epub");
+              patch.coverPreviewUrl = coverUrl;
+              setCoverPreviewMessage(coverUrl ? null : "Capa não encontrada");
+            }
+          }
+          updateDoc(doc.id, patch);
+          return;
+        }
+
+        const { startPage, endPage } = resolvePdfEndPage(doc);
+
+        if (uniqueKeys.includes("start")) {
+          revokePreviewUrl(doc.startPreviewUrl);
+          patch.startPreviewUrl = await fetchPageJpegUrl(
+            doc.fileBase64,
+            "pdf",
+            startPage
+          );
+        }
+
+        if (uniqueKeys.includes("end")) {
+          if (doc.endPreviewUrl && doc.endPreviewUrl !== doc.startPreviewUrl) {
+            revokePreviewUrl(doc.endPreviewUrl);
+          }
+          if (endPage === startPage) {
+            patch.endPreviewUrl = null;
+          } else {
+            patch.endPreviewUrl = await fetchPageJpegUrl(
+              doc.fileBase64,
+              "pdf",
+              endPage
+            );
+          }
+        }
+
+        if (uniqueKeys.includes("cover")) {
+          revokePreviewUrl(doc.coverPreviewUrl);
+          const coverEmpty = doc.coverPage.trim() === "";
+          const wantCover = doc.exportCover && !coverEmpty;
+          if (!wantCover) {
+            patch.coverPreviewUrl = null;
+            setCoverPreviewMessage(null);
+          } else {
+            const coverPage = Math.max(1, parseInt(doc.coverPage, 10) || 1);
+            const coverUrl = await fetchPageJpegUrl(
+              doc.fileBase64,
+              "pdf",
+              coverPage
+            );
+            patch.coverPreviewUrl = coverUrl;
+            setCoverPreviewMessage(coverUrl ? null : "Capa não encontrada");
+          }
+        }
+
+        updateDoc(doc.id, patch);
+      } catch (err: any) {
+        const failPatch: Partial<DocItem> = {};
+        for (const k of uniqueKeys) {
+          if (k === "start") failPatch.startPreviewUrl = null;
+          if (k === "end") failPatch.endPreviewUrl = null;
+          if (k === "cover") failPatch.coverPreviewUrl = null;
+        }
+        updateDoc(doc.id, failPatch);
+        if (uniqueKeys.includes("cover")) {
+          setCoverPreviewMessage(err?.message || "Falha no preview das páginas");
+        }
+      } finally {
+        setPreviewLoadingKeys((prev) => {
+          const next = { ...prev };
+          for (const k of uniqueKeys) next[k] = false;
+          return next;
+        });
       }
-      const binary = atob(payload.imageData as string);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const url = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
-      updateDoc(doc.id, { coverPreviewUrl: url });
-      setCoverPreviewMessage(null);
-    } catch (err: any) {
-      updateDoc(doc.id, { coverPreviewUrl: null });
-      setCoverPreviewMessage(err?.message || "Falha no preview da capa");
-    } finally {
-      setCoverPreviewLoading(false);
-    }
-  }, []);
+    },
+    []
+  );
 
   useEffect(() => {
     if (!activeDoc?.fileBase64 || activeDoc.docInfoLoading) return;
+
+    const next = {
+      id: activeDoc.id,
+      fileBase64: activeDoc.fileBase64,
+      fileType: activeDoc.fileType,
+      startPage: activeDoc.startPage,
+      endPage: activeDoc.endPage,
+      coverPage: activeDoc.coverPage,
+      exportCover: activeDoc.exportCover,
+    };
+    const prev = previewDepsRef.current;
+
+    let keys: PagePreviewKey[];
+    if (
+      !prev ||
+      prev.id !== next.id ||
+      prev.fileBase64 !== next.fileBase64 ||
+      prev.fileType !== next.fileType
+    ) {
+      keys =
+        next.fileType === "epub"
+          ? (["cover"] as PagePreviewKey[])
+          : (["start", "end", "cover"] as PagePreviewKey[]);
+    } else {
+      keys = [];
+      if (prev.startPage !== next.startPage) keys.push("start");
+      if (prev.endPage !== next.endPage) keys.push("end");
+      if (
+        prev.coverPage !== next.coverPage ||
+        prev.exportCover !== next.exportCover
+      ) {
+        keys.push("cover");
+      }
+    }
+
+    previewDepsRef.current = next;
+    if (keys.length === 0) return;
+
     const t = window.setTimeout(() => {
-      void refreshCoverPreview(activeDoc);
+      void refreshPagePreviews(activeDoc, keys);
     }, 400);
     return () => window.clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh on cover page / file changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh only changed preview slots
   }, [
     activeDoc?.id,
     activeDoc?.fileBase64,
     activeDoc?.coverPage,
+    activeDoc?.exportCover,
+    activeDoc?.startPage,
+    activeDoc?.endPage,
     activeDoc?.fileType,
     activeDoc?.docInfoLoading,
-    refreshCoverPreview,
+    refreshPagePreviews,
   ]);
 
   // Drag-and-drop handlers
@@ -456,6 +610,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       startPage: 1,
       endPage: "",
       coverPage: "1",
+      exportCover: true,
       pdfPageCount: null,
       epubChapters: [],
       docInfoMessage: "",
@@ -467,6 +622,8 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       audioUrl: null,
       audioFormat: outputFormat,
       coverPreviewUrl: null,
+      startPreviewUrl: null,
+      endPreviewUrl: null,
     }));
 
     setDocuments((prev) => [...prev, ...newDocs]);
@@ -495,6 +652,8 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       const target = prev.find((d) => d.id === docId);
       if (target?.audioUrl) URL.revokeObjectURL(target.audioUrl);
       if (target?.coverPreviewUrl) URL.revokeObjectURL(target.coverPreviewUrl);
+      if (target?.startPreviewUrl) URL.revokeObjectURL(target.startPreviewUrl);
+      if (target?.endPreviewUrl) URL.revokeObjectURL(target.endPreviewUrl);
       const next = prev.filter((d) => d.id !== docId);
       setActiveDocId((current) => {
         if (current !== docId) return current;
@@ -735,13 +894,14 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
         outputFormat,
         coverPage:
           doc.fileType === "pdf"
-            ? doc.coverPage.trim() === ""
-              ? null
-              : doc.coverPage
+            ? doc.exportCover && doc.coverPage.trim() !== ""
+              ? doc.coverPage
+              : null
             : undefined,
         includeCover:
-          doc.fileType === "epub" ||
-          (doc.fileType === "pdf" && doc.coverPage.trim() !== ""),
+          doc.exportCover &&
+          (doc.fileType === "epub" ||
+            (doc.fileType === "pdf" && doc.coverPage.trim() !== "")),
         sourceFileName: doc.file.name,
       }),
     });
@@ -833,7 +993,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
               audioId: typeof payload.audioId === "string" ? payload.audioId : undefined,
               audioData: typeof payload.audioData === "string" ? payload.audioData : undefined,
               fileName: buildDownloadFileName(doc, fmt),
-              saveCover: true,
+              saveCover: doc.exportCover,
             });
             if (saved) {
               const label = saved.coverFileName
@@ -1087,7 +1247,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       return;
     }
 
-    // Encoding uses real encoder/ffmpeg percent when available
+    // Encoding uses real encoder percent when available
     if (progressStep === "encoding") {
       return;
     }
@@ -1777,6 +1937,109 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                   )}
                 </div>
 
+                {/* 2. Voice */}
+                <div className="bg-white/5 backdrop-blur-2xl border border-white/15 rounded-3xl p-6 shadow-xl">
+                  <h2 className="text-base font-bold text-white mb-1 flex items-center gap-2">
+                    <Music className="w-4.5 h-4.5 text-blue-400" />
+                    <span>2. Voz do Narrador</span>
+                  </h2>
+                  <p className="text-xs text-slate-400 mb-4">
+                    {ttsEngine === "kokoro"
+                      ? `Kokoro (${kokoroDevice === "gpu" ? "GPU" : "CPU"}). Escolha a voz neural para a narração.`
+                      : "Motor Qwen3. A prévia em cache mantém o mesmo tom em toda a narração."}
+                  </p>
+
+                  {previewError && (
+                    <div className="mb-4 flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                      <AlertCircle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                      <span>{previewError}</span>
+                    </div>
+                  )}
+
+                  <div className="space-y-4">
+                    {(["Feminino", "Masculino"] as const).map((gender) => {
+                      const genderVoices = voices.filter((v) => v.gender === gender);
+                      return (
+                        <div key={gender}>
+                          <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500 mb-2 px-0.5">
+                            {gender}
+                          </p>
+                          <div
+                            className="grid grid-cols-1 sm:grid-cols-2 gap-1.5"
+                            role="radiogroup"
+                            aria-label={`Vozes ${gender.toLowerCase()}s`}
+                          >
+                            {genderVoices.map((voice) => {
+                              const isSelected = selectedVoice === voice.id;
+                              const isLoadingPreview = previewLoadingVoice === voice.id;
+                              const isPlayingPreview = previewPlayingVoice === voice.id;
+                              return (
+                                <div
+                                  key={voice.id}
+                                  role="radio"
+                                  aria-checked={isSelected}
+                                  tabIndex={0}
+                                  title={voice.description}
+                                  onClick={() => setSelectedVoice(voice.id)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter" || e.key === " ") {
+                                      e.preventDefault();
+                                      setSelectedVoice(voice.id);
+                                    }
+                                  }}
+                                  className={`group relative flex items-center gap-2.5 rounded-xl border px-2.5 py-2 cursor-pointer transition-all ${
+                                    isSelected
+                                      ? "border-blue-500/60 bg-blue-500/10 shadow-[inset_0_0_0_1px_rgba(59,130,246,0.15)]"
+                                      : "border-white/10 bg-white/[0.02] hover:border-white/20 hover:bg-white/[0.04]"
+                                  }`}
+                                >
+                                  <span className="text-base leading-none shrink-0 w-6 text-center" aria-hidden>
+                                    {voice.icon}
+                                  </span>
+                                  <div className="flex-1 min-w-0">
+                                    <span className={`block text-[13px] font-semibold truncate ${isSelected ? "text-white" : "text-slate-200"}`}>
+                                      {voice.name}
+                                    </span>
+                                    <span className="block text-[10px] text-slate-500 truncate leading-tight mt-0.5">
+                                      {voice.description}
+                                    </span>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    title={isPlayingPreview ? "Parar prévia" : `Ouvir ${voice.name}`}
+                                    aria-label={isPlayingPreview ? "Parar prévia" : `Ouvir exemplo de ${voice.name}`}
+                                    disabled={isLoadingPreview || (!!previewLoadingVoice && !isLoadingPreview)}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void playVoicePreview(voice.id);
+                                    }}
+                                    className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 border transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer ${
+                                      isPlayingPreview
+                                        ? "bg-blue-500/20 border-blue-400/40 text-blue-300"
+                                        : "bg-transparent border-transparent text-slate-500 opacity-70 group-hover:opacity-100 group-hover:bg-white/5 group-hover:border-white/10 hover:text-white"
+                                    }`}
+                                  >
+                                    {isLoadingPreview ? (
+                                      <Loader2 className="w-3 h-3 animate-spin" />
+                                    ) : isPlayingPreview ? (
+                                      <Square className="w-2.5 h-2.5 fill-current" />
+                                    ) : (
+                                      <Play className="w-3 h-3 fill-current" />
+                                    )}
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              {/* Right Column: Pages & Extract */}
+              <div className="lg:col-span-7 space-y-6">
                 {/* Page Controls Panel (Only shows if file loaded) */}
                 {activeDoc && (
                   <motion.div
@@ -1788,7 +2051,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                     <h2 className="text-base font-bold text-white mb-2 flex items-center gap-2">
                       <Clock className="w-4.5 h-4.5 text-blue-400" />
                       <span>
-                        2.{" "}
+                        3.{" "}
                         {activeDoc.fileType === "pdf" ? "Páginas do PDF" : "Capítulos do EPUB"}
                       </span>
                     </h2>
@@ -1909,15 +2172,33 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
 
                         {/* Cover page + preview */}
                         <div className="pt-2 border-t border-white/10 space-y-3">
-                          <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                            <ImageIcon className="w-4 h-4 text-blue-400" />
-                            Capa do livro
-                          </h3>
-                          {activeDoc.fileType === "pdf" ? (
+                          <div className="flex items-center justify-between gap-3">
+                            <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                              <ImageIcon className="w-4 h-4 text-blue-400" />
+                              Capa do livro
+                            </h3>
+                            <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer select-none">
+                              <input
+                                type="checkbox"
+                                checked={activeDoc.exportCover}
+                                onChange={(e) =>
+                                  updateDoc(activeDoc.id, {
+                                    exportCover: e.target.checked,
+                                  })
+                                }
+                                className="rounded border-white/20 bg-slate-900 text-blue-500 focus:ring-blue-500/40"
+                              />
+                              Exportar capa
+                            </label>
+                          </div>
+                          {!activeDoc.exportCover ? (
+                            <p className="text-[11px] text-slate-400">
+                              Sem JPEG da capa e sem artwork no M4B.
+                            </p>
+                          ) : activeDoc.fileType === "pdf" ? (
                             <div className="space-y-1.5">
                               <label className="text-xs font-bold text-slate-300">
-                                Página da capa{" "}
-                                <span className="text-slate-400 font-normal">(vazio = sem capa)</span>
+                                Página da capa
                               </label>
                               <input
                                 type="number"
@@ -1936,20 +2217,62 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                               A capa é detectada automaticamente no EPUB (metadata OPF).
                             </p>
                           )}
-                          <div className="rounded-2xl border border-white/10 bg-black/20 p-3 flex items-center justify-center min-h-[140px]">
-                            {coverPreviewLoading ? (
-                              <Loader2 className="w-6 h-6 text-blue-400 animate-spin" />
-                            ) : activeDoc.coverPreviewUrl ? (
-                              <img
-                                src={activeDoc.coverPreviewUrl}
-                                alt="Preview da capa"
-                                className="max-h-40 max-w-full object-contain rounded-lg"
-                              />
-                            ) : (
-                              <p className="text-xs text-slate-500 text-center px-2">
-                                {coverPreviewMessage || "Preview da capa"}
-                              </p>
-                            )}
+                          <div className="grid grid-cols-3 gap-2">
+                            {(
+                              [
+                                {
+                                  key: "start" as const,
+                                  label:
+                                    activeDoc.fileType === "pdf"
+                                      ? `Inicial (${activeDoc.startPage})`
+                                      : `Início (§${activeDoc.startPage})`,
+                                  url: activeDoc.startPreviewUrl,
+                                },
+                                {
+                                  key: "end" as const,
+                                  label:
+                                    activeDoc.fileType === "pdf"
+                                      ? `Final (${activeDoc.endPage.trim() || activeDoc.startPage})`
+                                      : `Fim (§${activeDoc.endPage.trim() || activeDoc.startPage})`,
+                                  url: activeDoc.endPreviewUrl || activeDoc.startPreviewUrl,
+                                },
+                                {
+                                  key: "cover" as const,
+                                  label: "Capa",
+                                  url: activeDoc.exportCover
+                                    ? activeDoc.coverPreviewUrl
+                                    : null,
+                                },
+                              ] as const
+                            ).map((item) => (
+                              <div
+                                key={item.key}
+                                className="rounded-xl border border-white/10 bg-black/20 p-2 flex flex-col items-center gap-1.5 min-h-[120px]"
+                              >
+                                <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                                  {item.label}
+                                </span>
+                                {previewLoadingKeys[item.key] ? (
+                                  <Loader2 className="w-5 h-5 text-blue-400 animate-spin my-auto" />
+                                ) : item.url ? (
+                                  <img
+                                    src={item.url}
+                                    alt={item.label}
+                                    className="max-h-28 w-full object-contain rounded-md"
+                                  />
+                                ) : (
+                                  <p className="text-[10px] text-slate-500 text-center px-1 my-auto leading-snug">
+                                    {item.key === "cover"
+                                      ? !activeDoc.exportCover
+                                        ? "Não exportar"
+                                        : coverPreviewMessage || "Sem capa"
+                                      : activeDoc.fileType === "epub"
+                                        ? "—"
+                                        : "Sem preview"}
+                                  </p>
+                                )}
+                              </div>
+                            ))}
                           </div>
                         </div>
 
@@ -1982,116 +2305,16 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                           </div>
                           <p className="text-[11px] text-slate-500">
                             {outputFormat === "m4b"
-                              ? "M4B inclui a capa (PDF) ou todas as imagens (EPUB) como artwork. Requer ffmpeg."
-                              : "MP3 + JPEG da capa (mesmo nome) na pasta Downloads."}
+                              ? activeDoc.exportCover
+                                ? "M4B inclui a capa (PDF) ou as imagens do EPUB como artwork do audiobook."
+                                : "M4B sem artwork de capa."
+                              : activeDoc.exportCover
+                                ? "MP3 + JPEG da capa (mesmo nome) na pasta Downloads."
+                                : "Somente o MP3 em Downloads (sem JPEG da capa)."}
                           </p>
                         </div>
                       </>
                     )}
-                  </motion.div>
-                )}
-              </div>
-
-              {/* Right Column: Voice Picker and Submit Action */}
-              <div className="lg:col-span-7 space-y-6">
-                <div className="bg-white/5 backdrop-blur-2xl border border-white/15 rounded-3xl p-6 shadow-xl">
-                  <h2 className="text-base font-bold text-white mb-1 flex items-center gap-2">
-                    <Music className="w-4.5 h-4.5 text-blue-400" />
-                    <span>{documents.length > 0 ? "3. Voz do Narrador" : "2. Voz do Narrador"}</span>
-                  </h2>
-                  <p className="text-xs text-slate-400 mb-4">
-                    {ttsEngine === "kokoro"
-                      ? `Kokoro (${kokoroDevice === "gpu" ? "GPU" : "CPU"}). Escolha a voz neural para a narração.`
-                      : "Motor Qwen3. A prévia em cache mantém o mesmo tom em toda a narração."}
-                  </p>
-
-                  {previewError && (
-                    <div className="mb-4 flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-                      <AlertCircle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
-                      <span>{previewError}</span>
-                    </div>
-                  )}
-
-                  <div className="space-y-4">
-                    {(["Feminino", "Masculino"] as const).map((gender) => {
-                      const genderVoices = voices.filter((v) => v.gender === gender);
-                      return (
-                        <div key={gender}>
-                          <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500 mb-2 px-0.5">
-                            {gender}
-                          </p>
-                          <div
-                            className="grid grid-cols-1 sm:grid-cols-2 gap-1.5"
-                            role="radiogroup"
-                            aria-label={`Vozes ${gender.toLowerCase()}s`}
-                          >
-                            {genderVoices.map((voice) => {
-                              const isSelected = selectedVoice === voice.id;
-                              const isLoadingPreview = previewLoadingVoice === voice.id;
-                              const isPlayingPreview = previewPlayingVoice === voice.id;
-                              return (
-                                <div
-                                  key={voice.id}
-                                  role="radio"
-                                  aria-checked={isSelected}
-                                  tabIndex={0}
-                                  title={voice.description}
-                                  onClick={() => setSelectedVoice(voice.id)}
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter" || e.key === " ") {
-                                      e.preventDefault();
-                                      setSelectedVoice(voice.id);
-                                    }
-                                  }}
-                                  className={`group relative flex items-center gap-2.5 rounded-xl border px-2.5 py-2 cursor-pointer transition-all ${
-                                    isSelected
-                                      ? "border-blue-500/60 bg-blue-500/10 shadow-[inset_0_0_0_1px_rgba(59,130,246,0.15)]"
-                                      : "border-white/10 bg-white/[0.02] hover:border-white/20 hover:bg-white/[0.04]"
-                                  }`}
-                                >
-                                  <span className="text-base leading-none shrink-0 w-6 text-center" aria-hidden>
-                                    {voice.icon}
-                                  </span>
-                                  <div className="flex-1 min-w-0">
-                                    <span className={`block text-[13px] font-semibold truncate ${isSelected ? "text-white" : "text-slate-200"}`}>
-                                      {voice.name}
-                                    </span>
-                                    <span className="block text-[10px] text-slate-500 truncate leading-tight mt-0.5">
-                                      {voice.description}
-                                    </span>
-                                  </div>
-                                  <button
-                                    type="button"
-                                    title={isPlayingPreview ? "Parar prévia" : `Ouvir ${voice.name}`}
-                                    aria-label={isPlayingPreview ? "Parar prévia" : `Ouvir exemplo de ${voice.name}`}
-                                    disabled={isLoadingPreview || (!!previewLoadingVoice && !isLoadingPreview)}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      void playVoicePreview(voice.id);
-                                    }}
-                                    className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 border transition-colors disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer ${
-                                      isPlayingPreview
-                                        ? "bg-blue-500/20 border-blue-400/40 text-blue-300"
-                                        : "bg-transparent border-transparent text-slate-500 opacity-70 group-hover:opacity-100 group-hover:bg-white/5 group-hover:border-white/10 hover:text-white"
-                                    }`}
-                                  >
-                                    {isLoadingPreview ? (
-                                      <Loader2 className="w-3 h-3 animate-spin" />
-                                    ) : isPlayingPreview ? (
-                                      <Square className="w-2.5 h-2.5 fill-current" />
-                                    ) : (
-                                      <Play className="w-3 h-3 fill-current" />
-                                    )}
-                                  </button>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-
                   {documents.length > 0 ? (
                     <motion.div
                       initial={{ opacity: 0, y: 10 }}
@@ -2114,11 +2337,23 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                   ) : (
                     <div className="mt-6 p-4 bg-white/5 border border-white/10 rounded-2xl text-center">
                       <p className="text-xs text-slate-400">
-                        Adicione um ou mais documentos PDF/EPUB na coluna ao lado para iniciar a narração.
+                        Adicione um ou mais documentos PDF/EPUB acima para configurar páginas e iniciar a narração.
                       </p>
                     </div>
                   )}
-                </div>
+                  </motion.div>
+                )}
+                {!activeDoc && (
+                  <div className="bg-white/5 backdrop-blur-2xl border border-white/15 rounded-3xl p-6 shadow-xl">
+                    <h2 className="text-base font-bold text-white mb-2 flex items-center gap-2">
+                      <Clock className="w-4.5 h-4.5 text-blue-400" />
+                      <span>3. Páginas e capa</span>
+                    </h2>
+                    <p className="text-xs text-slate-400">
+                      Adicione um PDF ou EPUB na coluna ao lado para escolher o intervalo e ver o preview das páginas.
+                    </p>
+                  </div>
+                )}
               </div>
             </motion.div>
           ) : (

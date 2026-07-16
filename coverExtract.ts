@@ -3,6 +3,7 @@ import path from "path";
 import os from "os";
 import { spawn } from "child_process";
 import { PDFDocument } from "pdf-lib";
+import { ffmpegBin, ffprobeBin } from "./ffmpegBin";
 
 export type CoverResult = {
   jpegPath: string;
@@ -33,7 +34,7 @@ function uniqueTmp(ext: string): string {
 
 async function runFfmpeg(args: string[]): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("ffmpeg", ["-y", ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(ffmpegBin(), ["-y", ...args], { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     child.stderr?.on("data", (d) => {
       stderr += String(d);
@@ -238,7 +239,7 @@ async function probeImageSize(
 ): Promise<{ width: number; height: number } | null> {
   return new Promise((resolve) => {
     const child = spawn(
-      "ffprobe",
+      ffprobeBin(),
       [
         "-v",
         "error",

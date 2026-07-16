@@ -194,7 +194,7 @@ function ConvertWorkingScreen({
       ? [
           { id: "upload", label: "Envio dos arquivos" },
           { id: "cover", label: "Preparação da capa" },
-          { id: "encode", label: "Conversão ffmpeg (AAC)" },
+          { id: "encode", label: "Conversão de áudio (AAC)" },
           { id: "save", label: "Salvar em Downloads" },
         ]
       : [
@@ -321,7 +321,7 @@ function ConvertWorkingScreen({
           )}
         </button>
         <p className="text-[11px] text-slate-400 mt-2">
-          Interrompe o ffmpeg e descarta o arquivo parcial.
+          Interrompe a conversão e descarta o arquivo parcial.
         </p>
       </div>
     </motion.div>

@@ -1,6 +1,6 @@
 # AuraReader
 
-Narrador de PDF/EPUB para **MP3** ou **M4B**. A extração de texto de PDF usa Gemini; a síntese de voz usa **Qwen3-TTS** local via MLX (`qwen3-tts-apple-silicon/`, modelos Lite 0.6B).
+Narrador de PDF/EPUB para **MP3** ou **M4B**. Extração de texto 100% local (pdf.js / epub2); síntese de voz com **Qwen3-TTS** local via MLX (`qwen3-tts-apple-silicon/`, modelos Lite 0.6B).
 
 ## Modos do app
 
@@ -18,7 +18,7 @@ Na narração:
 - Nome do arquivo: `<livro>.mp3` / `.m4b` (sem intervalo de páginas no nome; basename do arquivo original).
 - Capa: `<livro>.jpg` (mesmo basename).
 - **M4B**: PDF embute só a capa; EPUB embute a capa e as demais imagens do livro como artwork.
-- M4B e conversões exigem **ffmpeg** no PATH.
+- M4B e conversões: o app Electron embute **ffmpeg**; em `bun run start:app` use o do sistema se não houver `build/app-resources/bin`.
 
 ## Pré-requisitos
 
@@ -26,8 +26,7 @@ Na narração:
 - macOS Apple Silicon (M1/M2/M3/M4)
 - Python 3.12+ com o venv em `qwen3-tts-apple-silicon/.venv`
 - Modelo **Base** Lite (recomendado, ICL) e/ou CustomVoice em `qwen3-tts-apple-silicon/models/`
-- `ffmpeg` (`brew install ffmpeg`) — obrigatório para M4B e modos de conversão
-- `GEMINI_API_KEY` no `.env` (apenas para extrair texto de PDFs; EPUBs são locais)
+- `ffmpeg` — embutido no pacote Electron (`dist:*`); em desenvolvimento: `brew install ffmpeg` (ou rode `prepare:mac` para baixar em `build/app-resources/bin`)
 
 ## Setup do TTS (uma vez)
 
@@ -69,7 +68,6 @@ Isso sobe:
 ### Variáveis de ambiente
 
 ```bash
-GEMINI_API_KEY=...
 TTS_URL=http://127.0.0.1:8765   # opcional
 TTS_PORT=8765                     # opcional
 QWEN_TTS_MODEL=Qwen3-TTS-12Hz-0.6B-Base-8bit   # ICL; fallback automático para CustomVoice se Base ausente

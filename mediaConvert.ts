@@ -2,18 +2,20 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { spawn } from "child_process";
+import { ffmpegBin, ffprobeBin } from "./ffmpegBin";
 
 let ffmpegAvailable: boolean | null = null;
 
 export async function ensureFfmpeg(): Promise<void> {
   if (ffmpegAvailable === true) return;
+  const bin = ffmpegBin();
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("ffmpeg", ["-version"], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(bin, ["-version"], { stdio: ["ignore", "pipe", "pipe"] });
     child.on("error", () => {
       ffmpegAvailable = false;
       reject(
         new Error(
-          "ffmpeg não encontrado no PATH. Instale com `brew install ffmpeg` (macOS) ou o equivalente do seu sistema."
+          "ffmpeg não encontrado. No app Electron ele vem embutido; em desenvolvimento instale com `brew install ffmpeg` (macOS) ou o equivalente do seu sistema."
         )
       );
     });
@@ -53,7 +55,7 @@ export type FfmpegProgress = {
 export async function probeDurationSeconds(filePath: string): Promise<number | null> {
   return new Promise((resolve) => {
     const child = spawn(
-      "ffprobe",
+      ffprobeBin(),
       ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", filePath],
       { stdio: ["ignore", "pipe", "pipe"] }
     );
@@ -127,7 +129,7 @@ function runFfmpeg(
     }
 
     const child = spawn(
-      "ffmpeg",
+      ffmpegBin(),
       ["-y", "-nostats", "-progress", "pipe:1", ...args],
       { stdio: ["ignore", "pipe", "pipe"] }
     );
