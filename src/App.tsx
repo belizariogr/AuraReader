@@ -949,7 +949,13 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
             } else if (payload.step && payload.step !== "encoding") {
               setEncodePercent(null);
             }
-            if (typeof payload.extractedText === "string" && payload.extractedText.length > 0) {
+            // Do not overwrite the user-edited draft with the server's
+            // re-sanitized copy — "Texto Narrado" must match the review screen.
+            if (
+              !text &&
+              typeof payload.extractedText === "string" &&
+              payload.extractedText.length > 0
+            ) {
               setProcessingPreviewText(payload.extractedText);
               updateDoc(doc.id, { extractedText: payload.extractedText });
             }
@@ -983,7 +989,9 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
 
             updateDoc(doc.id, {
               audioBase64: null,
-              extractedText: payload.extractedText ?? doc.extractedText,
+              // Persist what the user confirmed/edited, not a re-sanitized server copy
+              extractedText: text,
+              editableText: text,
               pagesNarrated,
               audioUrl: url,
               audioFormat: fmt,
@@ -2522,12 +2530,12 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                     <span>Texto Narrado</span>
                   </h3>
                   <p className="text-xs text-slate-400 mb-4 shrink-0">
-                    Acompanhe a leitura visual do texto extraído pela inteligência artificial.
+                    Acompanhe a leitura visual do texto que foi narrado.
                   </p>
 
                   <div className="flex-1 overflow-y-auto bg-slate-950/40 border border-white/5 rounded-2xl p-5 scrollbar-thin scrollbar-thumb-white/10">
                     <p className="text-slate-300 text-sm leading-relaxed whitespace-pre-wrap select-text font-serif">
-                      {resultDoc?.extractedText}
+                      {resultDoc?.editableText || resultDoc?.extractedText}
                     </p>
                   </div>
                 </div>

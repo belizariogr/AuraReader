@@ -519,37 +519,104 @@ function decodeHtmlEntities(raw: string): string {
   return text;
 }
 
+/** Wrap a chapter/section title with em dashes for TTS pacing cues. */
+function formatChapterTitle(title: string): string {
+  const t = title.replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  if (/^—\s*.+\s*—$/.test(t)) return t;
+  return `— ${t} —`;
+}
+
 // Helper: Strip HTML tags and decode basic entities to get plain text from EPUB XHTML
 function stripHtml(html: string): string {
   if (!html) return "";
   
-  // Replace linebreaks and paragraphs
+  // Replace linebreaks and paragraphs; wrap headings with em dashes
   let text = html
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<\/p>/gi, "\n\n")
     .replace(/<p[^>]*>/gi, "")
     .replace(/<div[^>]*>/gi, "")
     .replace(/<\/div>/gi, "\n")
-    .replace(/<h[1-6][^>]*>/gi, "\n\n")
-    .replace(/<\/h[1-6]>/gi, "\n\n");
+    .replace(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/gi, (_, inner: string) => {
+      const title = decodeHtmlEntities(String(inner).replace(/<[^>]*>/g, " "))
+        .replace(/\s+/g, " ")
+        .trim();
+      const wrapped = formatChapterTitle(title);
+      return wrapped ? `\n\n${wrapped}\n\n` : "\n\n";
+    });
     
   // Strip any other tags
   text = text.replace(/<[^>]*>/g, " ");
   text = decodeHtmlEntities(text);
-  
-  // Clean up excessive lines and whitespace
+
+  // Trim each line but keep blank lines so paragraph breaks survive into sanitize
   text = text
     .split("\n")
-    .map(line => line.trim())
-    .filter(line => line.length > 0)
+    .map((line) => line.trim())
     .join("\n");
-    
+
   return sanitizeExtractedText(text);
+}
+
+const QWEN_PAUSE_MARK = "...";
+const BREAK_LINE_RE = /^<break\s+time="([\d.]+)s"\s*\/?\s*>$/i;
+
+function formatKokoroBreak(seconds: number): string {
+  const clamped = Math.min(1, Math.max(0.25, seconds));
+  const label = Number.isInteger(clamped) ? String(clamped) : clamped.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+  return `<break time="${label}s" />`;
+}
+
+/** 2 line-breaks → 0.25s; +0.25s per extra break; capped at 1s. */
+function pauseSecondsForEmptyLines(emptyLineCount: number): number {
+  if (emptyLineCount < 1) return 0;
+  return Math.min(1, emptyLineCount * 0.25);
+}
+
+function isPauseLine(line: string): boolean {
+  const t = line.trim();
+  return t === "*" || t === "..." || BREAK_LINE_RE.test(t);
+}
+
+function parseBreakSeconds(line: string): number | null {
+  const m = line.trim().match(BREAK_LINE_RE);
+  if (!m) return null;
+  const sec = Number(m[1]);
+  return Number.isFinite(sec) && sec > 0 ? Math.min(1, sec) : 0.25;
+}
+
+function pauseSecondsFromMarker(line: string): number {
+  return parseBreakSeconds(line) ?? 0.25;
+}
+
+/** Silent PCM s16le for Kokoro pause markers (engine does not honor SSML). */
+function silencePcmS16le(sampleRate: number, seconds: number): Buffer {
+  const samples = Math.max(0, Math.floor(sampleRate * seconds));
+  return Buffer.alloc(samples * 2);
+}
+
+function pushOrMergePause(collapsed: string[], mark: string, engine: TtsEngineId): void {
+  if (collapsed.length === 0) return; // drop leading pauses
+  const last = collapsed[collapsed.length - 1];
+  if (isPauseLine(last)) {
+    if (engine === "kokoro") {
+      const merged = Math.min(
+        1,
+        Math.max(pauseSecondsFromMarker(last), pauseSecondsFromMarker(mark))
+      );
+      collapsed[collapsed.length - 1] = formatKokoroBreak(merged);
+    }
+    return;
+  }
+  collapsed.push(mark);
 }
 
 /** Remove control chars, markup leftovers, and OCR/LLM junk before TTS and display. */
 function sanitizeExtractedText(raw: string): string {
   if (!raw) return "";
+
+  const engine = activeTtsEngine();
 
   let text = decodeHtmlEntities(raw)
     // Strip Markdown code fences and heading markers often added by LLMs
@@ -574,21 +641,45 @@ function sanitizeExtractedText(raw: string): string {
     .replace(/[•●▪◦]+/g, "•")
     // Normalize whitespace (incl. real nbsp U+00A0)
     .replace(/[\u00A0\u202F\u2007]/g, " ")
-    .replace(/[ ]{2,}/g, " ")
-    .replace(/\n{3,}/g, "\n\n");
+    .replace(/[ ]{2,}/g, " ");
 
-  text = text
-    .split("\n")
-    .map((line) => line.trim())
-    .flatMap((line) => (line === "*" ? ["...", ""] : [line]))
-    .filter((line, i, lines) => {
-      if (line.length > 0) return true;
-      // Keep the blank line inserted after a lone "*" → "..."
-      return i > 0 && lines[i - 1] === "...";
-    })
-    .join("\n");
+  const lines = text.split("\n").map((line) => line.trim());
+  const collapsed: string[] = [];
+  let emptyRun = 0;
 
-  return text.trim();
+  const flushEmptyRun = () => {
+    if (emptyRun < 1) return;
+    const seconds = pauseSecondsForEmptyLines(emptyRun);
+    emptyRun = 0;
+    if (seconds <= 0) return;
+    const mark =
+      engine === "kokoro" ? formatKokoroBreak(seconds) : QWEN_PAUSE_MARK;
+    pushOrMergePause(collapsed, mark, engine);
+  };
+
+  for (const line of lines) {
+    if (!line) {
+      emptyRun += 1;
+      continue;
+    }
+    flushEmptyRun();
+    if (isPauseLine(line)) {
+      const mark =
+        engine === "kokoro"
+          ? formatKokoroBreak(pauseSecondsFromMarker(line))
+          : QWEN_PAUSE_MARK;
+      pushOrMergePause(collapsed, mark, engine);
+      continue;
+    }
+    collapsed.push(line);
+  }
+  // Trailing blank runs are dropped (no flush)
+
+  while (collapsed.length > 0 && isPauseLine(collapsed[collapsed.length - 1])) {
+    collapsed.pop();
+  }
+
+  return collapsed.join("\n").trim();
 }
 
 // Helper: Extract Text from EPUB Chapters using local epub2 library
@@ -634,12 +725,22 @@ async function extractTextFromEpub(filePath: string, startChapter: number, endCh
           if (text) {
             const chapterText = stripHtml(text);
             if (chapterText) {
-              fullText += (fullText ? "\n\n" : "") + chapterText;
+              const rawTitle = String(chapter.title || "").trim();
+              const wrappedTitle = formatChapterTitle(rawTitle);
+              const firstLine = chapterText.split("\n")[0]?.trim() || "";
+              // Prepend spine title when the chapter body doesn't already open with it
+              const block =
+                wrappedTitle &&
+                firstLine !== wrappedTitle &&
+                firstLine !== rawTitle
+                  ? `${wrappedTitle}\n\n${chapterText}`
+                  : chapterText;
+              fullText += (fullText ? "\n\n" : "") + block;
             }
           }
         }
 
-        resolve(fullText.trim());
+        resolve(sanitizeExtractedText(fullText));
       } catch (err) {
         reject(err);
       }
@@ -992,6 +1093,7 @@ async function extractDocumentText(options: {
 
 // Helper: Split text into natural chunks of maximum character count (approx. natural sentence/paragraph bounds)
 // Qwen lite works well with moderate length (~5–20s of speech ≈ 120–280 chars).
+// Pause markers (`...` or Kokoro <break>) stay as their own chunks.
 function splitTextIntoChunks(text: string, maxChunkLength = 240): string[] {
   const paragraphs = text.split(/\n+/);
   const chunks: string[] = [];
@@ -1000,6 +1102,15 @@ function splitTextIntoChunks(text: string, maxChunkLength = 240): string[] {
   for (const para of paragraphs) {
     const trimmed = para.trim();
     if (!trimmed) continue;
+
+    if (isPauseLine(trimmed)) {
+      if (currentChunk) {
+        chunks.push(currentChunk);
+        currentChunk = "";
+      }
+      chunks.push(trimmed);
+      continue;
+    }
 
     if ((currentChunk + "\n" + trimmed).length <= maxChunkLength) {
       currentChunk = currentChunk ? (currentChunk + "\n" + trimmed) : trimmed;
@@ -2166,6 +2277,20 @@ app.post("/api/narrate-stream", async (req, res) => {
         message: `Narrando parte ${partNum} de ${totalChunks} (${engineLabel})...`,
       });
 
+      const breakSeconds =
+        engine === "kokoro"
+          ? parseBreakSeconds(chunk) ?? (chunk.trim() === "..." ? 0.25 : null)
+          : null;
+      if (breakSeconds != null) {
+        const pcm = silencePcmS16le(sampleRate, breakSeconds);
+        if (pcm.length > 0) {
+          await fs.promises.appendFile(pcmPath, pcm);
+          pcmBytes += pcm.length;
+          pcmParts += 1;
+        }
+        continue;
+      }
+
       const heartbeat = setInterval(() => {
         sendEvent({
           type: "status",
@@ -2443,6 +2568,19 @@ app.post("/api/narrate", async (req, res) => {
     for (let i = 0; i < textChunks.length; i++) {
       const chunk = textChunks[i];
       try {
+        const breakSeconds =
+          engine === "kokoro"
+            ? parseBreakSeconds(chunk) ?? (chunk.trim() === "..." ? 0.25 : null)
+            : null;
+        if (breakSeconds != null) {
+          const pcm = silencePcmS16le(sampleRate, breakSeconds);
+          if (pcm.length > 0) {
+            await fs.promises.appendFile(pcmPath, pcm);
+            pcmBytes += pcm.length;
+          }
+          continue;
+        }
+
         const { pcm, sampleRate: sr } = await synthesizeWithTts(
           chunk,
           voice,
