@@ -1241,14 +1241,15 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     return { start, end };
   };
 
-  // Step 1: extract text from all documents, then open editable review
-  const handleExtractForReview = async () => {
-    if (documents.length === 0 || !allDocsReady) return;
+  const allDocsHaveExtractedText = documents.length > 0 && documents.every((d) => d.editableText.trim());
+
+  const extractDocuments = async (docsToExtract: DocItem[]): Promise<boolean> => {
+    if (docsToExtract.length === 0) return true;
 
     const ranges: { id: string; start: number; end: number }[] = [];
-    for (const doc of documents) {
+    for (const doc of docsToExtract) {
       const range = validatePageRange(doc);
-      if (!range) return;
+      if (!range) return false;
       ranges.push({ id: doc.id, ...range });
     }
 
@@ -1257,12 +1258,15 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     setError(null);
     setShowTextReview(false);
     setProgressStep("extraction");
-    setProcessingFileTotal(documents.length);
+    setProcessingFileTotal(docsToExtract.length);
     setProcessingPreviewText("");
 
-    // Clear previous audio results and narration chunk cache (new extraction = new text)
+    const extractIds = new Set(docsToExtract.map((d) => d.id));
+
+    // Clear previous audio / text for docs being re-extracted
     setDocuments((docs) =>
       docs.map((d) => {
+        if (!extractIds.has(d.id)) return d;
         if (d.audioUrl) URL.revokeObjectURL(d.audioUrl);
         if (d.narrationProgress || d.narrationTextHash) {
           void clearChunkCacheOnServer(d.id);
@@ -1281,8 +1285,8 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     );
 
     try {
-      for (let i = 0; i < documents.length; i++) {
-        const doc = documents[i];
+      for (let i = 0; i < docsToExtract.length; i++) {
+        const doc = docsToExtract[i];
         const range = ranges[i];
         setProcessingFileIndex(i + 1);
         setProcessingFileName(doc.file.name);
@@ -1313,17 +1317,49 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
         });
       }
 
-      setReviewDocId(documents[0]?.id ?? null);
-      setShowTextReview(true);
+      return true;
     } catch (err: any) {
       console.error(err);
       setError(err.message || "Não foi possível extrair o texto do documento.");
+      return false;
     } finally {
       setLoading(false);
       setProcessingFileIndex(0);
       setProcessingFileTotal(0);
       setProcessingFileName("");
     }
+  };
+
+  // Step 1: open review from cache when available; otherwise extract first
+  const handleExtractForReview = async () => {
+    if (documents.length === 0 || !allDocsReady) return;
+
+    // Text already in session cache — skip re-extraction and open review
+    if (allDocsHaveExtractedText) {
+      setError(null);
+      setReviewDocId(documents[0]?.id ?? null);
+      setShowTextReview(true);
+      return;
+    }
+
+    const missing = documents.filter((d) => !d.editableText.trim());
+    const ok = await extractDocuments(missing.length > 0 ? missing : documents);
+    if (!ok) return;
+
+    setReviewDocId(documents[0]?.id ?? null);
+    setShowTextReview(true);
+  };
+
+  // Force re-extract the document currently open in review
+  const handleReExtract = async () => {
+    const doc = reviewDoc ?? documents[0];
+    if (!doc || !allDocsReady) return;
+
+    const ok = await extractDocuments([doc]);
+    if (!ok) return;
+
+    setReviewDocId(doc.id);
+    setShowTextReview(true);
   };
 
   const stopVoicePreview = () => {
@@ -2472,6 +2508,14 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                   Cancelar
                 </button>
                 <button
+                  onClick={handleReExtract}
+                  disabled={!allDocsReady || anyDocInfoLoading}
+                  className="sm:flex-1 bg-white/5 hover:bg-white/10 border border-white/15 disabled:opacity-40 disabled:cursor-not-allowed text-slate-200 py-3.5 rounded-2xl text-sm font-semibold flex items-center justify-center gap-2 transition-all cursor-pointer"
+                >
+                  <RotateCcw className="w-4 h-4" />
+                  Extrair novamente
+                </button>
+                <button
                   onClick={handleConfirmNarration}
                   disabled={documents.some((d) => !d.editableText.trim())}
                   className="sm:flex-[2] bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white py-3.5 rounded-2xl font-bold text-sm shadow-lg shadow-blue-900/35 flex items-center justify-center gap-2.5 transition-all cursor-pointer"
@@ -3105,11 +3149,19 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                         disabled={!allDocsReady || anyDocInfoLoading}
                         className="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white py-4 rounded-2xl font-bold text-sm shadow-lg shadow-blue-900/35 flex items-center justify-center gap-2.5 transition-all hover:scale-[1.01] active:scale-[0.99] cursor-pointer"
                       >
-                        <Sparkles className="w-5 h-5" />
+                        {allDocsHaveExtractedText ? (
+                          <BookOpen className="w-5 h-5" />
+                        ) : (
+                          <Sparkles className="w-5 h-5" />
+                        )}
                         <span>
-                          {documents.length > 1
-                            ? `Extrair Textos para Revisar (${documents.length})`
-                            : "Extrair Texto para Revisar"}
+                          {allDocsHaveExtractedText
+                            ? documents.length > 1
+                              ? `Revisar textos (${documents.length})`
+                              : "Revisar texto"
+                            : documents.length > 1
+                              ? `Extrair Textos para Revisar (${documents.length})`
+                              : "Extrair Texto para Revisar"}
                         </span>
                       </button>
                     </motion.div>

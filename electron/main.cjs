@@ -18,6 +18,23 @@ const children = [];
 let shuttingDown = false;
 let mainWindow = null;
 
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    focusMainWindow();
+  });
+}
+
+function focusMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+  if (process.platform === "darwin") app.focus({ steal: true });
+}
+
 function log(...args) {
   console.log("[electron]", ...args);
 }
