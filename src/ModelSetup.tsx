@@ -3,12 +3,12 @@ import { motion } from "motion/react";
 import {
   AlertCircle,
   CheckCircle2,
-  CircleStop,
   Cpu,
   Download,
   HardDrive,
   Loader2,
   Sparkles,
+  Square,
   Trash2,
 } from "lucide-react";
 
@@ -975,7 +975,7 @@ export default function ModelSetup({
                 onClick={cancelDownload}
                 className="w-full inline-flex items-center justify-center gap-2.5 rounded-2xl border border-rose-400/30 bg-rose-500/10 hover:bg-rose-500/20 text-rose-100 font-semibold px-5 py-3.5 transition-colors"
               >
-                <CircleStop className="w-5 h-5 shrink-0" strokeWidth={2.25} />
+                <Square className="w-4 h-4 fill-current shrink-0" />
                 Cancelar instalação
               </button>
             ) : (
