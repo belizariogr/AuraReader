@@ -3,6 +3,7 @@ import path from "path";
 import fs from "fs";
 import os from "os";
 import { once } from "events";
+import { createHash } from "crypto";
 import { spawn, type ChildProcess } from "child_process";
 import multer from "multer";
 import dotenv from "dotenv";
@@ -34,6 +35,7 @@ import {
   coverToBase64Jpeg,
   extractCover,
   extractEpubImages,
+  getEpubChapterPreview,
 } from "./coverExtract";
 import {
   ensureFfmpeg,
@@ -1193,6 +1195,7 @@ type NarrationArtifact = {
 
 const narrationArtifacts = new Map<string, NarrationArtifact>();
 const NARRATION_TMP_DIR = path.join(AURA_DATA_DIR, "tmp", "narration");
+const CHUNK_CACHE_DIR = path.join(AURA_DATA_DIR, "tmp", "chunk-cache");
 
 function ensureNarrationTmpDir() {
   fs.mkdirSync(NARRATION_TMP_DIR, { recursive: true });
@@ -1200,6 +1203,174 @@ function ensureNarrationTmpDir() {
 
 function newNarrationId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+type ChunkCacheMeta = {
+  docId: string;
+  voice: string;
+  engine: string;
+  fingerprint: string;
+  totalChunks: number;
+  completedIndices: number[];
+  sampleRate: number;
+  updatedAt: number;
+};
+
+function isSafeDocId(docId: string): boolean {
+  if (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      docId
+    )
+  ) {
+    return true;
+  }
+  // Legacy / short ids — path-safe only
+  return /^[A-Za-z0-9_-]{6,80}$/.test(docId);
+}
+
+function chunkCacheDirFor(docId: string): string {
+  return path.join(CHUNK_CACHE_DIR, docId);
+}
+
+function chunkPcmPath(docId: string, index: number): string {
+  return path.join(chunkCacheDirFor(docId), `${String(index).padStart(4, "0")}.pcm`);
+}
+
+function chunkMetaPath(docId: string): string {
+  return path.join(chunkCacheDirFor(docId), "meta.json");
+}
+
+function narrationFingerprint(text: string, voice: string, engine: string): string {
+  return createHash("sha256")
+    .update(`${engine}\n${voice}\n${text}`)
+    .digest("hex")
+    .slice(0, 40);
+}
+
+async function readChunkCacheMeta(docId: string): Promise<ChunkCacheMeta | null> {
+  try {
+    const raw = await fs.promises.readFile(chunkMetaPath(docId), "utf8");
+    const meta = JSON.parse(raw) as ChunkCacheMeta;
+    if (!meta || meta.docId !== docId) return null;
+    return meta;
+  } catch {
+    return null;
+  }
+}
+
+async function writeChunkCacheMeta(meta: ChunkCacheMeta): Promise<void> {
+  const dir = chunkCacheDirFor(meta.docId);
+  await fs.promises.mkdir(dir, { recursive: true });
+  await fs.promises.writeFile(chunkMetaPath(meta.docId), JSON.stringify(meta, null, 2), "utf8");
+}
+
+async function clearChunkCache(docId: string): Promise<boolean> {
+  if (!isSafeDocId(docId)) return false;
+  const dir = chunkCacheDirFor(docId);
+  try {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureChunkCache(
+  docId: string,
+  voice: string,
+  engine: string,
+  fingerprint: string,
+  totalChunks: number,
+  sampleRate: number
+): Promise<ChunkCacheMeta> {
+  const existing = await readChunkCacheMeta(docId);
+  if (
+    existing &&
+    existing.fingerprint === fingerprint &&
+    existing.voice === voice &&
+    existing.engine === engine &&
+    existing.totalChunks === totalChunks
+  ) {
+    return existing;
+  }
+  await clearChunkCache(docId);
+  const meta: ChunkCacheMeta = {
+    docId,
+    voice,
+    engine,
+    fingerprint,
+    totalChunks,
+    completedIndices: [],
+    sampleRate,
+    updatedAt: Date.now(),
+  };
+  await writeChunkCacheMeta(meta);
+  return meta;
+}
+
+async function saveChunkPcm(
+  docId: string,
+  index: number,
+  pcm: Buffer,
+  meta: ChunkCacheMeta
+): Promise<ChunkCacheMeta> {
+  const dir = chunkCacheDirFor(docId);
+  await fs.promises.mkdir(dir, { recursive: true });
+  await fs.promises.writeFile(chunkPcmPath(docId, index), pcm);
+  if (!meta.completedIndices.includes(index)) {
+    meta.completedIndices = [...meta.completedIndices, index].sort((a, b) => a - b);
+  }
+  meta.updatedAt = Date.now();
+  await writeChunkCacheMeta(meta);
+  return meta;
+}
+
+async function concatCachedChunksToPcm(
+  docId: string,
+  totalChunks: number,
+  outPath: string
+): Promise<{ bytes: number; parts: number }> {
+  const out = await fs.promises.open(outPath, "w");
+  let bytes = 0;
+  let parts = 0;
+  try {
+    for (let i = 0; i < totalChunks; i++) {
+      const chunkPath = chunkPcmPath(docId, i);
+      try {
+        const pcm = await fs.promises.readFile(chunkPath);
+        if (pcm.length === 0) continue;
+        await out.write(pcm);
+        bytes += pcm.length;
+        parts += 1;
+      } catch {
+        throw new Error(`Bloco ${i + 1} ausente no cache de narração.`);
+      }
+    }
+  } finally {
+    await out.close();
+  }
+  return { bytes, parts };
+}
+
+async function chunkCacheStatus(docId: string): Promise<{
+  exists: boolean;
+  completed: number;
+  total: number;
+  voice: string | null;
+  engine: string | null;
+} | null> {
+  if (!isSafeDocId(docId)) return null;
+  const meta = await readChunkCacheMeta(docId);
+  if (!meta) {
+    return { exists: false, completed: 0, total: 0, voice: null, engine: null };
+  }
+  return {
+    exists: meta.completedIndices.length > 0,
+    completed: meta.completedIndices.length,
+    total: meta.totalChunks,
+    voice: meta.voice,
+    engine: meta.engine,
+  };
 }
 
 /** Stream-encode a PCM s16le file to MP3 on disk (avoids holding the whole book in RAM). */
@@ -1966,7 +2137,7 @@ app.get("/api/narration-cover/:id", async (req, res) => {
   }
 });
 
-// API to stop an active narration stream and wrap up the processed audio so far
+// API to stop an active narration stream (true cancel — no partial audio)
 app.post("/api/narrate-stop", async (req, res) => {
   const { taskId } = req.body;
   console.log(`[NarrateStop] Request received to stop task: ${taskId}`);
@@ -1975,7 +2146,7 @@ app.post("/api/narrate-stop", async (req, res) => {
     const task = activeTasks.get(taskId);
     if (task) {
       task.stopped = true;
-      // Abort in-flight /tts fetch so the stream moves to encoding immediately
+      // Abort in-flight /tts fetch so the stream exits without encoding
       if (!task.abort.signal.aborted) {
         task.abort.abort();
       }
@@ -1983,11 +2154,30 @@ app.post("/api/narrate-stop", async (req, res) => {
       // Best-effort interrupt on TTS server (may finish current generate silently).
       // Model unload happens in narrate-stream finally / after cancelled /tts returns.
       void cancelTtsJob(taskId);
-      return res.json({ success: true, message: "Narração interrompida com sucesso. Gerando áudio até o momento..." });
+      return res.json({ success: true, message: "Narração cancelada." });
     }
   }
   
   res.status(404).json({ error: "Tarefa de narração ativa não encontrada ou já concluída." });
+});
+
+// Chunk-cache progress for a document UUID
+app.get("/api/chunk-cache/:docId", async (req, res) => {
+  const docId = String(req.params.docId || "");
+  if (!isSafeDocId(docId)) {
+    return res.status(400).json({ error: "docId inválido." });
+  }
+  const status = await chunkCacheStatus(docId);
+  return res.json(status);
+});
+
+app.delete("/api/chunk-cache/:docId", async (req, res) => {
+  const docId = String(req.params.docId || "");
+  if (!isSafeDocId(docId)) {
+    return res.status(400).json({ error: "docId inválido." });
+  }
+  const cleared = await clearChunkCache(docId);
+  return res.json({ success: true, cleared });
 });
 
 // Document metadata: PDF page count or EPUB chapter outline
@@ -2096,8 +2286,11 @@ app.post("/api/narrate-stream", async (req, res) => {
       coverPage: reqCoverPage,
       includeCover: reqIncludeCover,
       sourceFileName,
+      docId: reqDocId,
     } = req.body;
     taskId = reqTaskId;
+    const docId =
+      typeof reqDocId === "string" && isSafeDocId(reqDocId) ? reqDocId : null;
     
     if (taskId) {
       activeTasks.set(taskId, { stopped: false, abort: new AbortController() });
@@ -2243,17 +2436,40 @@ app.post("/api/narrate-stream", async (req, res) => {
       }
     }
 
-    // Run Text-To-Speech via local engine for each chunk — PCM goes to disk
+    // Run Text-To-Speech via local engine for each chunk — PCM cached per doc UUID
     ensureNarrationTmpDir();
     const audioId = newNarrationId();
     const pcmPath = path.join(NARRATION_TMP_DIR, `${audioId}.pcm`);
     const mp3Path = path.join(NARRATION_TMP_DIR, `${audioId}.mp3`);
-    let pcmBytes = 0;
-    let pcmParts = 0;
     let sampleRate = 24000;
     let wasStoppedEarly = false;
     const taskAbort = taskId ? activeTasks.get(taskId)?.abort : undefined;
     const engineLabel = engine === "kokoro" ? "Kokoro" : "Qwen3";
+    const fingerprint = narrationFingerprint(extractedText, voice, engine);
+
+    let cacheMeta: ChunkCacheMeta | null = null;
+    if (docId) {
+      cacheMeta = await ensureChunkCache(
+        docId,
+        voice,
+        engine,
+        fingerprint,
+        totalChunks,
+        sampleRate
+      );
+      if (cacheMeta.completedIndices.length > 0) {
+        sendEvent({
+          type: "status",
+          step: "chunks",
+          message: `Retomando cache: ${cacheMeta.completedIndices.length} de ${totalChunks} blocos já narrados.`,
+          current: cacheMeta.completedIndices.length,
+          total: totalChunks,
+          cached: cacheMeta.completedIndices.length,
+        });
+      }
+    }
+
+    const completedSet = new Set(cacheMeta?.completedIndices ?? []);
 
     for (let i = 0; i < totalChunks; i++) {
       // Check if task has been cancelled / stopped
@@ -2269,6 +2485,18 @@ app.post("/api/narrate-stream", async (req, res) => {
       const chunk = textChunks[i];
       const partNum = i + 1;
 
+      if (completedSet.has(i) && docId) {
+        sendEvent({
+          type: "status",
+          step: "tts",
+          current: partNum,
+          total: totalChunks,
+          cached: true,
+          message: `Reutilizando bloco ${partNum} de ${totalChunks} (cache)...`,
+        });
+        continue;
+      }
+
       sendEvent({
         type: "status",
         step: "tts",
@@ -2281,97 +2509,153 @@ app.post("/api/narrate-stream", async (req, res) => {
         engine === "kokoro"
           ? parseBreakSeconds(chunk) ?? (chunk.trim() === "..." ? 0.25 : null)
           : null;
+
+      let pcm: Buffer = Buffer.alloc(0);
+      let cancelled = false;
+
       if (breakSeconds != null) {
-        const pcm = silencePcmS16le(sampleRate, breakSeconds);
-        if (pcm.length > 0) {
-          await fs.promises.appendFile(pcmPath, pcm);
-          pcmBytes += pcm.length;
-          pcmParts += 1;
+        pcm = silencePcmS16le(sampleRate, breakSeconds);
+      } else {
+        const heartbeat = setInterval(() => {
+          sendEvent({
+            type: "status",
+            step: "tts",
+            current: partNum,
+            total: totalChunks,
+            message: `Narrando parte ${partNum} de ${totalChunks} — ${engineLabel} ainda gerando...`,
+          });
+        }, 10_000);
+
+        try {
+          const result = await synthesizeWithTts(
+            chunk,
+            voice,
+            taskId,
+            taskAbort?.signal,
+            voiceAnchor
+              ? {
+                  refAudioPath: voiceAnchor.refAudioPath,
+                  refText: voiceAnchor.refText,
+                }
+              : { skipIcl: true }
+          );
+          pcm = result.pcm;
+          sampleRate = result.sampleRate;
+          cancelled = result.cancelled;
+          if (i === 0) {
+            console.log(
+              `[NarrateStream] Chunk 1 TTS done (engine=${engine}, voice=${voice}, icl=${!!result.icl}, cancelled=${cancelled})`
+            );
+          }
+          if (engine === "qwen3" && !result.icl && !cancelled) {
+            console.warn(
+              `[NarrateStream] Chunk ${partNum}: ICL not used for voice=${voice} — ` +
+                "preview anchor may be missing or Base encoder not ready."
+            );
+          }
+        } catch (ttsErr: any) {
+          console.warn(`[NarrateStream] Chunk ${partNum} failed:`, ttsErr?.message || ttsErr);
+          if (taskId && activeTasks.get(taskId)?.stopped) {
+            wasStoppedEarly = true;
+            break;
+          }
+          continue;
+        } finally {
+          clearInterval(heartbeat);
         }
-        continue;
       }
 
-      const heartbeat = setInterval(() => {
-        sendEvent({
-          type: "status",
-          step: "tts",
-          current: partNum,
-          total: totalChunks,
-          message: `Narrando parte ${partNum} de ${totalChunks} — ${engineLabel} ainda gerando...`,
-        });
-      }, 10_000);
+      if (cancelled) {
+        console.log(`[NarrateStream] TTS cancelled mid-chunk at index ${i}.`);
+        wasStoppedEarly = true;
+        break;
+      }
 
-      try {
-        const { pcm, sampleRate: sr, cancelled, icl } = await synthesizeWithTts(
-          chunk,
-          voice,
-          taskId,
-          taskAbort?.signal,
-          voiceAnchor
-            ? {
-                refAudioPath: voiceAnchor.refAudioPath,
-                refText: voiceAnchor.refText,
-              }
-            : { skipIcl: true }
-        );
-        sampleRate = sr;
-        if (i === 0) {
-          console.log(
-            `[NarrateStream] Chunk 1 TTS done (engine=${engine}, voice=${voice}, icl=${!!icl}, cancelled=${cancelled})`
-          );
-        }
-        if (engine === "qwen3" && !icl && !cancelled) {
-          console.warn(
-            `[NarrateStream] Chunk ${partNum}: ICL not used for voice=${voice} — ` +
-              "preview anchor may be missing or Base encoder not ready."
-          );
-        }
-        if (pcm.length > 0) {
-          await fs.promises.appendFile(pcmPath, pcm);
-          pcmBytes += pcm.length;
-          pcmParts += 1;
-        }
-        if (cancelled) {
-          console.log(`[NarrateStream] TTS cancelled mid-chunk at index ${i}.`);
-          wasStoppedEarly = true;
-          break;
-        }
-      } catch (ttsErr: any) {
-        console.warn(`[NarrateStream] Chunk ${partNum} failed:`, ttsErr?.message || ttsErr);
-        if (taskId && activeTasks.get(taskId)?.stopped) {
-          wasStoppedEarly = true;
-          break;
-        }
-      } finally {
-        clearInterval(heartbeat);
+      if (pcm.length > 0 && docId && cacheMeta) {
+        cacheMeta = await saveChunkPcm(docId, i, pcm, {
+          ...cacheMeta,
+          sampleRate,
+        });
+        completedSet.add(i);
+      } else if (pcm.length > 0 && !docId) {
+        // Fallback without doc UUID: append to ephemeral PCM (no resume)
+        await fs.promises.appendFile(pcmPath, pcm);
+        completedSet.add(i);
       }
     }
 
-    if (pcmParts === 0 || pcmBytes === 0) {
+    const completedCount = completedSet.size;
+
+    // True cancel: keep disk chunk cache for resume, do not encode partial audio
+    if (wasStoppedEarly) {
       await fs.promises.unlink(pcmPath).catch(() => undefined);
-      if (wasStoppedEarly) {
-        sendEvent({ type: "error", error: "A geração de áudio foi interrompida pelo usuário antes que qualquer parte pudesse ser narrada." });
-      } else {
-        sendEvent({
-          type: "error",
-          error: `A geração de áudio falhou para todas as partes do texto. Verifique se o servidor ${engineLabel} TTS está rodando.`,
-        });
-      }
+      sendEvent({
+        type: "cancelled",
+        docId,
+        completed: completedCount,
+        total: totalChunks,
+        message: `Narração cancelada. ${completedCount} de ${totalChunks} blocos salvos para retomar.`,
+      });
+      return res.end();
+    }
+
+    if (completedCount === 0) {
+      await fs.promises.unlink(pcmPath).catch(() => undefined);
+      sendEvent({
+        type: "error",
+        error: `A geração de áudio falhou para todas as partes do texto. Verifique se o servidor ${engineLabel} TTS está rodando.`,
+      });
+      return res.end();
+    }
+
+    if (completedCount < totalChunks) {
+      await fs.promises.unlink(pcmPath).catch(() => undefined);
+      sendEvent({
+        type: "error",
+        error: `Narração incompleta: ${completedCount} de ${totalChunks} blocos. Tente novamente para retomar o cache.`,
+      });
       return res.end();
     }
 
     sendEvent({
       type: "status",
       step: "encoding",
-      current: pcmParts,
+      current: completedCount,
       total: totalChunks,
       percent: 0,
-      message: wasStoppedEarly
-        ? "Geração interrompida. Codificando áudio gerado até o momento..."
-        : outputFormat === "m4b"
+      message:
+        outputFormat === "m4b"
           ? "Codificando áudio e montando o arquivo M4B..."
           : "Codificando e compactando áudio para o formato MP3...",
     });
+
+    let pcmBytes = 0;
+    let pcmParts = completedCount;
+    if (docId) {
+      const concat = await concatCachedChunksToPcm(docId, totalChunks, pcmPath);
+      pcmBytes = concat.bytes;
+      pcmParts = concat.parts;
+      if (cacheMeta) {
+        cacheMeta.sampleRate = sampleRate;
+        await writeChunkCacheMeta(cacheMeta);
+      }
+    } else {
+      try {
+        const st = await fs.promises.stat(pcmPath);
+        pcmBytes = st.size;
+      } catch {
+        pcmBytes = 0;
+      }
+    }
+
+    if (pcmBytes === 0) {
+      await fs.promises.unlink(pcmPath).catch(() => undefined);
+      sendEvent({
+        type: "error",
+        error: "Nenhum áudio PCM disponível para codificar.",
+      });
+      return res.end();
+    }
 
     const mp3Bytes = await encodePcmFileToMp3File(
       pcmPath,
@@ -2496,6 +2780,10 @@ app.post("/api/narrate-stream", async (req, res) => {
     });
     // PCM no longer needed after encode
     await fs.promises.unlink(pcmPath).catch(() => undefined);
+    // Chunk cache was consumed into the final audio — clear after use
+    if (docId) {
+      await clearChunkCache(docId);
+    }
 
     sendEvent({
       type: "done",
@@ -2504,9 +2792,8 @@ app.post("/api/narrate-stream", async (req, res) => {
       coverUrl: coverPath ? `/api/narration-cover/${audioId}` : null,
       format: finalFormat,
       voiceName: voice,
-      pagesNarrated: wasStoppedEarly
-        ? `${pagesLabel} (Interrompido na parte ${pcmParts} de ${totalChunks})`
-        : pagesLabel,
+      pagesNarrated: pagesLabel,
+      docId,
     });
 
     res.end();
@@ -2680,6 +2967,28 @@ app.post("/api/cover-preview", async (req, res) => {
     return res.status(400).json({
       found: false,
       error: err?.message || "Não foi possível gerar o preview da capa.",
+    });
+  }
+});
+
+app.post("/api/chapter-preview", async (req, res) => {
+  try {
+    const { fileData, chapterIndex } = req.body as {
+      fileData?: string;
+      chapterIndex?: number | string | null;
+    };
+    if (!fileData) {
+      return res.status(400).json({ error: "O conteúdo do arquivo é obrigatório." });
+    }
+    const index = Math.max(1, parseInt(String(chapterIndex ?? 1), 10) || 1);
+    const bytes = Buffer.from(fileData, "base64");
+    const preview = await getEpubChapterPreview(bytes, index);
+    return res.json({ found: true, ...preview });
+  } catch (err: any) {
+    console.error("[ChapterPreview]", err);
+    return res.status(400).json({
+      found: false,
+      error: err?.message || "Não foi possível gerar o preview do capítulo.",
     });
   }
 });

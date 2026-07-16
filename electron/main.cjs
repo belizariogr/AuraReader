@@ -412,6 +412,7 @@ async function startBackend(auraRoot) {
   fs.mkdirSync(modelsDir, { recursive: true });
 
   const runner = resolveServerRunner(auraRoot);
+  const nodeModulesDir = path.join(auraRoot, "node_modules");
   spawnInherit(runner.command, runner.args, {
     cwd: auraRoot,
     name: "aura-app",
@@ -419,6 +420,9 @@ async function startBackend(auraRoot) {
       ...process.env,
       PATH: guiPath(auraRoot),
       ...(runner.envExtra || {}),
+      ...(fs.existsSync(nodeModulesDir)
+        ? { NODE_PATH: nodeModulesDir }
+        : {}),
       NODE_ENV: "production",
       AURA_ROOT: auraRoot,
       AURA_DATA_DIR: dataDir,

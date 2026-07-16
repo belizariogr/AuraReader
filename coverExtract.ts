@@ -9,7 +9,7 @@ export type CoverResult = {
   jpegPath: string;
   width: number;
   height: number;
-  source: "pdf-page" | "epub-cover" | "epub-image";
+  source: "pdf-page" | "epub-cover" | "epub-image" | "epub-chapter";
 };
 
 export type EpubImageEntry = {
@@ -292,6 +292,183 @@ export async function extractCoverFromEpub(epubBytes: Buffer): Promise<CoverResu
     width: dims.width,
     height: dims.height,
     source: "epub-cover",
+  };
+}
+
+function stripHtmlSimple(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n\n")
+    .replace(/<\/h[1-6]>/gi, "\n\n")
+    .replace(/<\/div>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+async function readEpubChapter(
+  epubBytes: Buffer,
+  chapterIndex: number
+): Promise<{ title: string; text: string; index: number; total: number }> {
+  const workDir = path.join(tmpDir(), `epub-ch-${Date.now().toString(36)}`);
+  fs.mkdirSync(workDir, { recursive: true });
+  const epubPath = path.join(workDir, "book.epub");
+  await fs.promises.writeFile(epubPath, epubBytes);
+
+  try {
+    const { EPub } = await import("epub2");
+    return await new Promise((resolve, reject) => {
+      const epub = new EPub(epubPath);
+      epub.on("error", reject);
+      epub.on("end", () => {
+        void (async () => {
+          try {
+            const flow = epub.flow || [];
+            if (flow.length === 0) {
+              reject(new Error("O EPUB não possui seções legíveis."));
+              return;
+            }
+            if (chapterIndex < 1 || chapterIndex > flow.length) {
+              reject(
+                new Error(
+                  `Seção ${chapterIndex} fora do intervalo (1–${flow.length}).`
+                )
+              );
+              return;
+            }
+            const chapter = flow[chapterIndex - 1];
+            const title =
+              String(chapter.title || "").trim() || `Seção ${chapterIndex}`;
+            const html = await new Promise<string>((res) => {
+              epub.getChapter(chapter.id, (err, text) => {
+                res(err ? "" : text || "");
+              });
+            });
+            resolve({
+              title,
+              text: stripHtmlSimple(html),
+              index: chapterIndex,
+              total: flow.length,
+            });
+          } catch (err) {
+            reject(err);
+          }
+        })();
+      });
+      epub.parse();
+    });
+  } finally {
+    await fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+/** Chapter/section text preview (no canvas — works in packaged app without @napi-rs/canvas). */
+export async function getEpubChapterPreview(
+  epubBytes: Buffer,
+  chapterIndex: number
+): Promise<{ title: string; text: string; index: number; total: number }> {
+  const chapter = await readEpubChapter(epubBytes, chapterIndex);
+  const excerpt =
+    chapter.text.length > 900 ? `${chapter.text.slice(0, 900).trim()}…` : chapter.text;
+  return { ...chapter, text: excerpt || "Sem texto legível nesta seção." };
+}
+
+function wrapCanvasLines(
+  ctx: { measureText: (t: string) => { width: number } },
+  text: string,
+  maxWidth: number,
+  maxLines: number
+): string[] {
+  const words = text.split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let current = "";
+  for (const word of words) {
+    const next = current ? `${current} ${word}` : word;
+    if (ctx.measureText(next).width <= maxWidth) {
+      current = next;
+      continue;
+    }
+    if (current) lines.push(current);
+    current = word;
+    if (lines.length >= maxLines) break;
+  }
+  if (current && lines.length < maxLines) lines.push(current);
+  if (words.length > 0 && lines.length >= maxLines) {
+    const last = lines[lines.length - 1];
+    lines[lines.length - 1] =
+      last.length > 3 ? `${last.slice(0, Math.max(1, last.length - 1))}…` : `${last}…`;
+  }
+  return lines;
+}
+
+/** Render a chapter/section preview card (title + opening text) as JPEG. */
+export async function renderEpubChapterPreview(
+  epubBytes: Buffer,
+  chapterIndex: number
+): Promise<CoverResult> {
+  const chapter = await readEpubChapter(epubBytes, chapterIndex);
+  const { createCanvas } = await import("@napi-rs/canvas");
+
+  const width = 480;
+  const height = 640;
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext("2d");
+
+  ctx.fillStyle = "#f7f4ef";
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.strokeStyle = "#e2ddd4";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(16, 16, width - 32, height - 32);
+
+  ctx.fillStyle = "#8a847a";
+  ctx.font = "600 13px sans-serif";
+  ctx.fillText(`Seção ${chapter.index} de ${chapter.total}`, 36, 52);
+
+  ctx.fillStyle = "#1c1917";
+  ctx.font = "700 28px Georgia, serif";
+  const titleLines = wrapCanvasLines(ctx, chapter.title, width - 72, 3);
+  let y = 96;
+  for (const line of titleLines) {
+    ctx.fillText(line, 36, y);
+    y += 36;
+  }
+
+  y += 12;
+  ctx.strokeStyle = "#d6d0c6";
+  ctx.beginPath();
+  ctx.moveTo(36, y);
+  ctx.lineTo(width - 36, y);
+  ctx.stroke();
+  y += 36;
+
+  const body = chapter.text || "Sem texto legível nesta seção.";
+  ctx.fillStyle = "#44403c";
+  ctx.font = "400 16px Georgia, serif";
+  const bodyLines = wrapCanvasLines(ctx, body, width - 72, 22);
+  for (const line of bodyLines) {
+    ctx.fillText(line, 36, y);
+    y += 24;
+    if (y > height - 40) break;
+  }
+
+  const jpegPath = uniqueTmp("jpg");
+  await fs.promises.writeFile(jpegPath, canvas.toBuffer("image/jpeg", 85));
+  return {
+    jpegPath,
+    width,
+    height,
+    source: "epub-chapter",
   };
 }
 

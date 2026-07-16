@@ -50,6 +50,13 @@ interface EpubChapter {
   title: string;
 }
 
+interface ChapterPreview {
+  title: string;
+  text: string;
+  index: number;
+  total: number;
+}
+
 interface DocItem {
   id: string;
   file: File;
@@ -74,12 +81,37 @@ interface DocItem {
   coverPreviewUrl: string | null;
   startPreviewUrl: string | null;
   endPreviewUrl: string | null;
+  /** Persisted JPEG base64 for faster restore / re-render. */
+  coverPreviewBase64: string | null;
+  startPreviewBase64: string | null;
+  endPreviewBase64: string | null;
+  /** EPUB section previews (text cards; no canvas required). */
+  startChapterPreview: ChapterPreview | null;
+  endChapterPreview: ChapterPreview | null;
+  /** Cached narration block progress (resume after cancel). */
+  narrationProgress: { completed: number; total: number } | null;
+  /** Hash of the text that produced the cached chunks — invalidate on edit. */
+  narrationTextHash: string | null;
 }
 
 type PagePreviewKey = "start" | "end" | "cover";
 
 function createDocId() {
-  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** Stable hash of narration text — used to invalidate chunk cache on edits. */
+function hashNarrationText(text: string): string {
+  const normalized = text.replace(/\r\n/g, "\n").trim();
+  let h = 2166136261;
+  for (let i = 0; i < normalized.length; i++) {
+    h ^= normalized.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return `${normalized.length.toString(36)}_${(h >>> 0).toString(16).padStart(8, "0")}`;
 }
 
 function isPdfOrEpub(file: File): boolean {
@@ -111,6 +143,43 @@ const FALLBACK_QWEN_VOICES: Voice[] = [
 
 const VOICE_STORAGE_KEY = "aura-reader-voice";
 const ENGINE_VOICE_STORAGE_KEY = "aura-reader-voice-by-engine";
+const DOCS_DB_NAME = "aura-reader";
+const DOCS_DB_VERSION = 1;
+const DOCS_STORE = "session";
+const DOCS_STORAGE_KEY = "documents";
+
+interface PersistedDoc {
+  id: string;
+  fileName: string;
+  fileSize: number;
+  fileMime: string;
+  fileBase64: string;
+  fileType: "pdf" | "epub";
+  startPage: number;
+  endPage: string;
+  coverPage: string;
+  exportCover: boolean;
+  pdfPageCount: number | null;
+  epubChapters: EpubChapter[];
+  docInfoMessage: string;
+  editableText: string;
+  extractedText: string;
+  pagesNarrated: string;
+  audioFormat: OutputFormat;
+  coverPreviewBase64: string | null;
+  startPreviewBase64: string | null;
+  endPreviewBase64: string | null;
+  startChapterPreview: ChapterPreview | null;
+  endChapterPreview: ChapterPreview | null;
+  narrationProgress: { completed: number; total: number } | null;
+  narrationTextHash: string | null;
+}
+
+interface PersistedDocumentsState {
+  activeDocId: string | null;
+  outputFormat?: OutputFormat;
+  docs: PersistedDoc[];
+}
 
 function loadSavedVoice(voices: Voice[], engine: string): string {
   try {
@@ -145,6 +214,182 @@ function persistVoice(engine: string, voiceId: string) {
   }
 }
 
+function openDocsDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DOCS_DB_NAME, DOCS_DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(DOCS_STORE)) {
+        db.createObjectStore(DOCS_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error ?? new Error("Falha ao abrir IndexedDB"));
+  });
+}
+
+async function loadPersistedDocuments(): Promise<PersistedDocumentsState | null> {
+  try {
+    const db = await openDocsDb();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(DOCS_STORE, "readonly");
+      const req = tx.objectStore(DOCS_STORE).get(DOCS_STORAGE_KEY);
+      req.onsuccess = () => {
+        const value = req.result as PersistedDocumentsState | undefined;
+        resolve(value?.docs?.length ? value : null);
+      };
+      req.onerror = () => reject(req.error);
+      tx.oncomplete = () => db.close();
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function persistDocumentsState(state: PersistedDocumentsState): Promise<void> {
+  try {
+    const db = await openDocsDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(DOCS_STORE, "readwrite");
+      tx.objectStore(DOCS_STORE).put(state, DOCS_STORAGE_KEY);
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // ignore quota / private mode failures
+  }
+}
+
+async function clearPersistedDocuments(): Promise<void> {
+  try {
+    const db = await openDocsDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(DOCS_STORE, "readwrite");
+      tx.objectStore(DOCS_STORE).delete(DOCS_STORAGE_KEY);
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // ignore
+  }
+}
+
+function base64ToFile(base64: string, fileName: string, mime: string): Promise<File> {
+  return fetch(`data:${mime || "application/octet-stream"};base64,${base64}`)
+    .then((res) => res.blob())
+    .then((blob) => new File([blob], fileName, { type: mime || "application/octet-stream" }));
+}
+
+function base64JpegToObjectUrl(base64: string | null | undefined): string | null {
+  if (!base64) return null;
+  try {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
+  } catch {
+    return null;
+  }
+}
+
+function serializeDoc(doc: DocItem): PersistedDoc | null {
+  if (!doc.fileBase64) return null;
+  return {
+    id: doc.id,
+    fileName: doc.file.name,
+    fileSize: doc.file.size,
+    fileMime: doc.file.type,
+    fileBase64: doc.fileBase64,
+    fileType: doc.fileType,
+    startPage: doc.startPage,
+    endPage: doc.endPage,
+    coverPage: doc.coverPage,
+    exportCover: doc.exportCover,
+    pdfPageCount: doc.pdfPageCount,
+    epubChapters: doc.epubChapters,
+    docInfoMessage: doc.docInfoMessage,
+    editableText: doc.editableText,
+    extractedText: doc.extractedText,
+    pagesNarrated: doc.pagesNarrated,
+    audioFormat: doc.audioFormat,
+    coverPreviewBase64: doc.coverPreviewBase64,
+    startPreviewBase64: doc.startPreviewBase64,
+    endPreviewBase64: doc.endPreviewBase64,
+    startChapterPreview: doc.startChapterPreview,
+    endChapterPreview: doc.endChapterPreview,
+    narrationProgress: doc.narrationProgress,
+    narrationTextHash: doc.narrationTextHash,
+  };
+}
+
+async function restoreDoc(saved: PersistedDoc): Promise<DocItem> {
+  const mime =
+    saved.fileMime ||
+    (saved.fileType === "epub" ? "application/epub+zip" : "application/pdf");
+  const file = await base64ToFile(saved.fileBase64, saved.fileName, mime);
+  return {
+    id: saved.id,
+    file,
+    fileBase64: saved.fileBase64,
+    fileType: saved.fileType,
+    startPage: saved.startPage,
+    endPage: saved.endPage,
+    coverPage: saved.coverPage,
+    exportCover: saved.exportCover,
+    pdfPageCount: saved.pdfPageCount,
+    epubChapters: saved.epubChapters ?? [],
+    docInfoMessage: saved.docInfoMessage || "",
+    docInfoLoading: false,
+    editableText: saved.editableText || "",
+    extractedText: saved.extractedText || "",
+    pagesNarrated: saved.pagesNarrated || "",
+    audioBase64: null,
+    audioUrl: null,
+    audioFormat: saved.audioFormat || "mp3",
+    coverPreviewBase64: saved.coverPreviewBase64 ?? null,
+    startPreviewBase64: saved.startPreviewBase64 ?? null,
+    endPreviewBase64: saved.endPreviewBase64 ?? null,
+    coverPreviewUrl: base64JpegToObjectUrl(saved.coverPreviewBase64),
+    startPreviewUrl: base64JpegToObjectUrl(saved.startPreviewBase64),
+    endPreviewUrl: base64JpegToObjectUrl(saved.endPreviewBase64),
+    startChapterPreview: saved.startChapterPreview ?? null,
+    endChapterPreview: saved.endChapterPreview ?? null,
+    narrationProgress: saved.narrationProgress ?? null,
+    narrationTextHash: saved.narrationTextHash ?? null,
+  };
+}
+
+async function fetchChunkCacheStatus(
+  docId: string
+): Promise<{ completed: number; total: number } | null> {
+  try {
+    const res = await fetch(`/api/chunk-cache/${encodeURIComponent(docId)}`);
+    if (!res.ok) return null;
+    const body = await res.json();
+    if (!body?.exists) return null;
+    const completed = Number(body.completed) || 0;
+    const total = Number(body.total) || 0;
+    if (completed <= 0 || total <= 0) return null;
+    return { completed, total };
+  } catch {
+    return null;
+  }
+}
+
+async function clearChunkCacheOnServer(docId: string): Promise<void> {
+  try {
+    await fetch(`/api/chunk-cache/${encodeURIComponent(docId)}`, { method: "DELETE" });
+  } catch {
+    // ignore
+  }
+}
+
 export default function App({ onManageModels }: { onManageModels?: () => void }) {
   const [appMode, setAppMode] = useState<AppMode>("narrate");
   const [outputFormat, setOutputFormat] = useState<OutputFormat>("mp3");
@@ -154,6 +399,10 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   const [activeDocId, setActiveDocId] = useState<string | null>(null);
   const [reviewDocId, setReviewDocId] = useState<string | null>(null);
   const [resultDocId, setResultDocId] = useState<string | null>(null);
+  const [docsHydrated, setDocsHydrated] = useState(false);
+  const [isRestoringSession, setIsRestoringSession] = useState(false);
+  const [restorePercent, setRestorePercent] = useState(0);
+  const [batchDone, setBatchDone] = useState(false);
   const [dragActive, setDragActive] = useState<boolean>(false);
   const [previewLoadingKeys, setPreviewLoadingKeys] = useState<
     Partial<Record<PagePreviewKey, boolean>>
@@ -182,6 +431,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     documents.find((d) => d.id === resultDocId) ?? completedDocs[0] ?? null;
   const anyDocInfoLoading = documents.some((d) => d.docInfoLoading);
   const allDocsReady = documents.length > 0 && documents.every((d) => d.fileBase64 && !d.docInfoLoading);
+  const hasResults = batchDone || completedDocs.length > 0;
 
   useEffect(() => {
     let cancelled = false;
@@ -216,6 +466,130 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     persistVoice(ttsEngine, selectedVoice);
   }, [selectedVoice, ttsEngine]);
 
+  // Restore document queue from IndexedDB on launch
+  useEffect(() => {
+    let cancelled = false;
+    let finishTimer: number | undefined;
+    (async () => {
+      const saved = await loadPersistedDocuments();
+      if (cancelled) return;
+
+      if (!saved?.docs?.length) {
+        setDocsHydrated(true);
+        return;
+      }
+
+      setIsRestoringSession(true);
+      setRestorePercent(4);
+
+      try {
+        const total = saved.docs.length;
+        const restored: DocItem[] = [];
+
+        for (let i = 0; i < saved.docs.length; i++) {
+          if (cancelled) return;
+          const doc = await restoreDoc(saved.docs[i]);
+          // Reading file bytes is the heavy step — map 8% → 78%
+          setRestorePercent(8 + Math.round(((i + 1) / total) * 70));
+          restored.push(doc);
+        }
+
+        if (cancelled) return;
+        setRestorePercent(82);
+
+        const withProgress: DocItem[] = [];
+        for (let i = 0; i < restored.length; i++) {
+          if (cancelled) return;
+          const doc = restored[i];
+          const textHash = hashNarrationText(doc.editableText || "");
+          const hashMatches =
+            !!doc.narrationTextHash && doc.narrationTextHash === textHash;
+
+          if (doc.narrationProgress && !hashMatches) {
+            void clearChunkCacheOnServer(doc.id);
+            withProgress.push({
+              ...doc,
+              narrationProgress: null,
+              narrationTextHash: null,
+            });
+          } else {
+            const progress = await fetchChunkCacheStatus(doc.id);
+            if (!progress) {
+              withProgress.push({
+                ...doc,
+                narrationProgress: null,
+                narrationTextHash: hashMatches ? doc.narrationTextHash : null,
+              });
+            } else if (!hashMatches) {
+              void clearChunkCacheOnServer(doc.id);
+              withProgress.push({
+                ...doc,
+                narrationProgress: null,
+                narrationTextHash: null,
+              });
+            } else {
+              withProgress.push({
+                ...doc,
+                narrationProgress: progress,
+                narrationTextHash: textHash,
+              });
+            }
+          }
+          // Sync chunk status — map 82% → 98%
+          setRestorePercent(82 + Math.round(((i + 1) / total) * 16));
+        }
+
+        if (cancelled) return;
+        setDocuments(withProgress);
+        const activeStillExists = withProgress.some((d) => d.id === saved.activeDocId);
+        setActiveDocId(activeStillExists ? saved.activeDocId : withProgress[0]?.id ?? null);
+        if (saved.outputFormat === "mp3" || saved.outputFormat === "m4b") {
+          setOutputFormat(saved.outputFormat);
+        }
+        setRestorePercent(100);
+      } catch (err) {
+        console.error("Falha ao restaurar documentos salvos:", err);
+        void clearPersistedDocuments();
+      } finally {
+        if (!cancelled) {
+          // Brief beat at 100% so the circle can finish visually
+          finishTimer = window.setTimeout(() => {
+            if (cancelled) return;
+            setIsRestoringSession(false);
+            setDocsHydrated(true);
+            setRestorePercent(0);
+          }, 220);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (finishTimer) window.clearTimeout(finishTimer);
+    };
+  }, []);
+
+  // Persist document queue whenever it settles
+  useEffect(() => {
+    if (!docsHydrated) return;
+
+    if (documents.length === 0) {
+      void clearPersistedDocuments();
+      return;
+    }
+
+    const readyDocs = documents.filter((d) => d.fileBase64 && !d.docInfoLoading);
+    if (readyDocs.length === 0) return;
+
+    const docs = readyDocs
+      .map(serializeDoc)
+      .filter((d): d is PersistedDoc => d != null);
+
+    const t = window.setTimeout(() => {
+      void persistDocumentsState({ activeDocId, outputFormat, docs });
+    }, 400);
+    return () => window.clearTimeout(t);
+  }, [documents, activeDocId, outputFormat, docsHydrated]);
+
   // Processing & Result State
   const [loading, setLoading] = useState<boolean>(false);
   const [loadingMode, setLoadingMode] = useState<"extract" | "narrate">("extract");
@@ -234,7 +608,6 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   const [savedFilesCount, setSavedFilesCount] = useState<number>(0);
   
   const [error, setError] = useState<string | null>(null);
-  const hasResults = completedDocs.length > 0;
 
   const buildDownloadFileName = (doc: DocItem, format?: OutputFormat) => {
     const safeName = doc.file.name.replace(/\.[^/.]+$/, "") || "narracao";
@@ -326,11 +699,11 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   };
 
   // Page / cover previews for active document (refresh only the slots that changed)
-  const fetchPageJpegUrl = async (
+  const fetchPageJpeg = async (
     fileBase64: string,
     fileType: "pdf" | "epub",
     coverPage?: string | number
-  ): Promise<string | null> => {
+  ): Promise<{ url: string; base64: string } | null> => {
     const res = await fetch("/api/cover-preview", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -342,10 +715,33 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     });
     const payload = await res.json();
     if (!res.ok || !payload.found || !payload.imageData) return null;
-    const binary = atob(payload.imageData as string);
+    const base64 = String(payload.imageData);
+    const binary = atob(base64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
+    return {
+      url: URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" })),
+      base64,
+    };
+  };
+
+  const fetchChapterPreview = async (
+    fileBase64: string,
+    chapterIndex: number
+  ): Promise<ChapterPreview | null> => {
+    const res = await fetch("/api/chapter-preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileData: fileBase64, chapterIndex }),
+    });
+    const payload = await res.json();
+    if (!res.ok || !payload.found) return null;
+    return {
+      title: String(payload.title || `Seção ${chapterIndex}`),
+      text: String(payload.text || ""),
+      index: Number(payload.index) || chapterIndex,
+      total: Number(payload.total) || 0,
+    };
   };
 
   const revokePreviewUrl = (url: string | null) => {
@@ -375,74 +771,111 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       const patch: Partial<DocItem> = {};
 
       try {
+        const { startPage, endPage } =
+          doc.fileType === "pdf"
+            ? resolvePdfEndPage(doc)
+            : {
+                startPage: Math.max(1, doc.startPage || 1),
+                endPage: (() => {
+                  const start = Math.max(1, doc.startPage || 1);
+                  const endNum = doc.endPage.trim()
+                    ? parseInt(doc.endPage, 10)
+                    : start;
+                  return Number.isFinite(endNum) && endNum >= start
+                    ? endNum
+                    : start;
+                })(),
+              };
+
         if (doc.fileType === "epub") {
           if (uniqueKeys.includes("start")) {
             revokePreviewUrl(doc.startPreviewUrl);
             patch.startPreviewUrl = null;
+            patch.startPreviewBase64 = null;
+            patch.startChapterPreview = await fetchChapterPreview(
+              doc.fileBase64,
+              startPage
+            );
           }
           if (uniqueKeys.includes("end")) {
             if (doc.endPreviewUrl && doc.endPreviewUrl !== doc.startPreviewUrl) {
               revokePreviewUrl(doc.endPreviewUrl);
             }
             patch.endPreviewUrl = null;
-          }
-          if (uniqueKeys.includes("cover")) {
-            revokePreviewUrl(doc.coverPreviewUrl);
-            if (!doc.exportCover) {
-              patch.coverPreviewUrl = null;
-              setCoverPreviewMessage(null);
+            patch.endPreviewBase64 = null;
+            if (endPage === startPage) {
+              patch.endChapterPreview = null;
             } else {
-              const coverUrl = await fetchPageJpegUrl(doc.fileBase64, "epub");
-              patch.coverPreviewUrl = coverUrl;
-              setCoverPreviewMessage(coverUrl ? null : "Capa não encontrada");
+              patch.endChapterPreview = await fetchChapterPreview(
+                doc.fileBase64,
+                endPage
+              );
             }
           }
-          updateDoc(doc.id, patch);
-          return;
-        }
-
-        const { startPage, endPage } = resolvePdfEndPage(doc);
-
-        if (uniqueKeys.includes("start")) {
-          revokePreviewUrl(doc.startPreviewUrl);
-          patch.startPreviewUrl = await fetchPageJpegUrl(
-            doc.fileBase64,
-            "pdf",
-            startPage
-          );
-        }
-
-        if (uniqueKeys.includes("end")) {
-          if (doc.endPreviewUrl && doc.endPreviewUrl !== doc.startPreviewUrl) {
-            revokePreviewUrl(doc.endPreviewUrl);
-          }
-          if (endPage === startPage) {
-            patch.endPreviewUrl = null;
-          } else {
-            patch.endPreviewUrl = await fetchPageJpegUrl(
+        } else {
+          if (uniqueKeys.includes("start")) {
+            revokePreviewUrl(doc.startPreviewUrl);
+            const startImg = await fetchPageJpeg(
               doc.fileBase64,
               "pdf",
-              endPage
+              startPage
             );
+            patch.startPreviewUrl = startImg?.url ?? null;
+            patch.startPreviewBase64 = startImg?.base64 ?? null;
+            patch.startChapterPreview = null;
+          }
+
+          if (uniqueKeys.includes("end")) {
+            if (doc.endPreviewUrl && doc.endPreviewUrl !== doc.startPreviewUrl) {
+              revokePreviewUrl(doc.endPreviewUrl);
+            }
+            if (endPage === startPage) {
+              patch.endPreviewUrl = null;
+              patch.endPreviewBase64 = null;
+            } else {
+              const endImg = await fetchPageJpeg(
+                doc.fileBase64,
+                "pdf",
+                endPage
+              );
+              patch.endPreviewUrl = endImg?.url ?? null;
+              patch.endPreviewBase64 = endImg?.base64 ?? null;
+            }
+            patch.endChapterPreview = null;
           }
         }
 
         if (uniqueKeys.includes("cover")) {
           revokePreviewUrl(doc.coverPreviewUrl);
-          const coverEmpty = doc.coverPage.trim() === "";
-          const wantCover = doc.exportCover && !coverEmpty;
-          if (!wantCover) {
-            patch.coverPreviewUrl = null;
-            setCoverPreviewMessage(null);
+          if (doc.fileType === "epub") {
+            if (!doc.exportCover) {
+              patch.coverPreviewUrl = null;
+              patch.coverPreviewBase64 = null;
+              setCoverPreviewMessage(null);
+            } else {
+              const coverImg = await fetchPageJpeg(doc.fileBase64, "epub");
+              patch.coverPreviewUrl = coverImg?.url ?? null;
+              patch.coverPreviewBase64 = coverImg?.base64 ?? null;
+              setCoverPreviewMessage(coverImg ? null : "Capa não encontrada");
+            }
           } else {
-            const coverPage = Math.max(1, parseInt(doc.coverPage, 10) || 1);
-            const coverUrl = await fetchPageJpegUrl(
-              doc.fileBase64,
-              "pdf",
-              coverPage
-            );
-            patch.coverPreviewUrl = coverUrl;
-            setCoverPreviewMessage(coverUrl ? null : "Capa não encontrada");
+            const coverEmpty = doc.coverPage.trim() === "";
+            const wantCover = doc.exportCover && !coverEmpty;
+            if (!wantCover) {
+              patch.coverPreviewUrl = null;
+              patch.coverPreviewBase64 = null;
+              setCoverPreviewMessage(null);
+            } else {
+              const coverPage = Math.max(1, parseInt(doc.coverPage, 10) || 1);
+              const coverImg = await fetchPageJpeg(
+                doc.fileBase64,
+                "pdf",
+                coverPage
+              );
+              patch.coverPreviewUrl = coverImg?.url ?? null;
+              patch.coverPreviewBase64 = coverImg?.base64 ?? null;
+              setCoverPreviewMessage(coverImg ? null : "Capa não encontrada");
+            }
           }
         }
 
@@ -450,9 +883,20 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       } catch (err: any) {
         const failPatch: Partial<DocItem> = {};
         for (const k of uniqueKeys) {
-          if (k === "start") failPatch.startPreviewUrl = null;
-          if (k === "end") failPatch.endPreviewUrl = null;
-          if (k === "cover") failPatch.coverPreviewUrl = null;
+          if (k === "start") {
+            failPatch.startPreviewUrl = null;
+            failPatch.startPreviewBase64 = null;
+            failPatch.startChapterPreview = null;
+          }
+          if (k === "end") {
+            failPatch.endPreviewUrl = null;
+            failPatch.endPreviewBase64 = null;
+            failPatch.endChapterPreview = null;
+          }
+          if (k === "cover") {
+            failPatch.coverPreviewUrl = null;
+            failPatch.coverPreviewBase64 = null;
+          }
         }
         updateDoc(doc.id, failPatch);
         if (uniqueKeys.includes("cover")) {
@@ -483,17 +927,15 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     };
     const prev = previewDepsRef.current;
 
-    let keys: PagePreviewKey[];
-    if (
+    const isDocSwitch =
       !prev ||
       prev.id !== next.id ||
       prev.fileBase64 !== next.fileBase64 ||
-      prev.fileType !== next.fileType
-    ) {
-      keys =
-        next.fileType === "epub"
-          ? (["cover"] as PagePreviewKey[])
-          : (["start", "end", "cover"] as PagePreviewKey[]);
+      prev.fileType !== next.fileType;
+
+    let keys: PagePreviewKey[];
+    if (isDocSwitch) {
+      keys = ["start", "end", "cover"];
     } else {
       keys = [];
       if (prev.startPage !== next.startPage) keys.push("start");
@@ -509,8 +951,32 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     previewDepsRef.current = next;
     if (keys.length === 0) return;
 
+    // Reuse persisted previews only when switching/restoring a doc.
+    // When start/end/cover change, always regenerate and save the new version.
+    const needed = isDocSwitch
+      ? keys.filter((key) => {
+          if (key === "start") {
+            if (activeDoc.fileType === "epub") return !activeDoc.startChapterPreview;
+            return !(activeDoc.startPreviewUrl || activeDoc.startPreviewBase64);
+          }
+          if (key === "end") {
+            if (activeDoc.fileType === "epub") {
+              const endNum = parseInt(activeDoc.endPage, 10) || activeDoc.startPage;
+              if (endNum === activeDoc.startPage) return false;
+              return !activeDoc.endChapterPreview;
+            }
+            const endNum = parseInt(activeDoc.endPage, 10) || activeDoc.startPage;
+            if (endNum === activeDoc.startPage) return false;
+            return !(activeDoc.endPreviewUrl || activeDoc.endPreviewBase64);
+          }
+          if (!activeDoc.exportCover) return false;
+          return !(activeDoc.coverPreviewUrl || activeDoc.coverPreviewBase64);
+        })
+      : keys;
+    if (needed.length === 0) return;
+
     const t = window.setTimeout(() => {
-      void refreshPagePreviews(activeDoc, keys);
+      void refreshPagePreviews(activeDoc, needed);
     }, 400);
     return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh only changed preview slots
@@ -624,6 +1090,13 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       coverPreviewUrl: null,
       startPreviewUrl: null,
       endPreviewUrl: null,
+      coverPreviewBase64: null,
+      startPreviewBase64: null,
+      endPreviewBase64: null,
+      startChapterPreview: null,
+      endChapterPreview: null,
+      narrationProgress: null,
+      narrationTextHash: null,
     }));
 
     setDocuments((prev) => [...prev, ...newDocs]);
@@ -647,13 +1120,20 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     }
   };
 
-  const handleRemoveFile = (docId: string) => {
+  const revokeDocUrls = (doc: DocItem) => {
+    if (doc.audioUrl) URL.revokeObjectURL(doc.audioUrl);
+    if (doc.coverPreviewUrl) URL.revokeObjectURL(doc.coverPreviewUrl);
+    if (doc.startPreviewUrl) URL.revokeObjectURL(doc.startPreviewUrl);
+    if (doc.endPreviewUrl) URL.revokeObjectURL(doc.endPreviewUrl);
+  };
+
+  const removeDocFromState = (docId: string, opts?: { clearChunkCache?: boolean }) => {
+    if (opts?.clearChunkCache !== false) {
+      void clearChunkCacheOnServer(docId);
+    }
     setDocuments((prev) => {
       const target = prev.find((d) => d.id === docId);
-      if (target?.audioUrl) URL.revokeObjectURL(target.audioUrl);
-      if (target?.coverPreviewUrl) URL.revokeObjectURL(target.coverPreviewUrl);
-      if (target?.startPreviewUrl) URL.revokeObjectURL(target.startPreviewUrl);
-      if (target?.endPreviewUrl) URL.revokeObjectURL(target.endPreviewUrl);
+      if (target) revokeDocUrls(target);
       const next = prev.filter((d) => d.id !== docId);
       setActiveDocId((current) => {
         if (current !== docId) return current;
@@ -672,6 +1152,59 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       }
       return next;
     });
+    if (previewDepsRef.current?.id === docId) {
+      previewDepsRef.current = null;
+    }
+  };
+
+  const handleRemoveFile = (docId: string) => {
+    removeDocFromState(docId, { clearChunkCache: true });
+  };
+
+  const handleClearNarrationProgress = (docId: string) => {
+    void clearChunkCacheOnServer(docId);
+    updateDoc(docId, { narrationProgress: null, narrationTextHash: null });
+  };
+
+  const updateEditableText = (docId: string, value: string) => {
+    setDocuments((docs) =>
+      docs.map((d) => {
+        if (d.id !== docId) return d;
+        const nextHash = hashNarrationText(value);
+        const shouldInvalidate =
+          !!d.narrationProgress &&
+          !!d.narrationTextHash &&
+          d.narrationTextHash !== nextHash;
+        if (shouldInvalidate) {
+          void clearChunkCacheOnServer(d.id);
+          return {
+            ...d,
+            editableText: value,
+            narrationProgress: null,
+            narrationTextHash: null,
+          };
+        }
+        return { ...d, editableText: value };
+      })
+    );
+  };
+
+  const handleClearAllFiles = () => {
+    setDocuments((prev) => {
+      for (const doc of prev) {
+        revokeDocUrls(doc);
+        void clearChunkCacheOnServer(doc.id);
+      }
+      return [];
+    });
+    setActiveDocId(null);
+    setReviewDocId(null);
+    setResultDocId(null);
+    setShowTextReview(false);
+    setBatchDone(false);
+    setError(null);
+    previewDepsRef.current = null;
+    void clearPersistedDocuments();
   };
 
   const validatePageRange = (doc: DocItem): { start: number; end: number } | null => {
@@ -727,10 +1260,13 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     setProcessingFileTotal(documents.length);
     setProcessingPreviewText("");
 
-    // Clear previous audio results
+    // Clear previous audio results and narration chunk cache (new extraction = new text)
     setDocuments((docs) =>
       docs.map((d) => {
         if (d.audioUrl) URL.revokeObjectURL(d.audioUrl);
+        if (d.narrationProgress || d.narrationTextHash) {
+          void clearChunkCacheOnServer(d.id);
+        }
         return {
           ...d,
           editableText: "",
@@ -738,6 +1274,8 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
           pagesNarrated: "",
           audioBase64: null,
           audioUrl: null,
+          narrationProgress: null,
+          narrationTextHash: null,
         };
       })
     );
@@ -858,11 +1396,24 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     }
   };
 
-  // Step 2: narrate all (possibly edited) texts sequentially
-  const narrateDocument = async (doc: DocItem): Promise<void> => {
+  // Step 2: narrate one document (reuses disk chunk cache keyed by doc UUID)
+  type NarrateResult =
+    | { status: "done"; fileName: string }
+    | { status: "cancelled"; completed: number; total: number };
+
+  const narrateDocument = async (doc: DocItem): Promise<NarrateResult> => {
     const text = doc.editableText.trim();
     if (!text) {
       throw new Error(`${doc.file.name}: edite ou confirme um texto antes de narrar.`);
+    }
+
+    const textHash = hashNarrationText(text);
+    // If text changed since last cached run, drop old progress (server also clears by fingerprint)
+    if (doc.narrationTextHash && doc.narrationTextHash !== textHash) {
+      void clearChunkCacheOnServer(doc.id);
+      updateDoc(doc.id, { narrationProgress: null, narrationTextHash: null });
+    } else {
+      updateDoc(doc.id, { narrationTextHash: textHash });
     }
 
     setProcessingPreviewText(text);
@@ -888,6 +1439,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
         text,
         voiceName: selectedVoice,
         taskId,
+        docId: doc.id,
         pagesNarrated: doc.pagesNarrated,
         fileData: doc.fileBase64,
         fileType: doc.fileType,
@@ -918,6 +1470,8 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
     let gotDone = false;
+    let cancelledResult: NarrateResult | null = null;
+    let savedFileName = "";
 
     while (true) {
       const { value, done } = await reader.read();
@@ -949,8 +1503,25 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
             } else if (payload.step && payload.step !== "encoding") {
               setEncodePercent(null);
             }
-            // Do not overwrite the user-edited draft with the server's
-            // re-sanitized copy — "Texto Narrado" must match the review screen.
+            if (
+              typeof payload.current === "number" &&
+              typeof payload.total === "number" &&
+              payload.total > 0
+            ) {
+              const completed =
+                payload.step === "tts"
+                  ? payload.cached
+                    ? payload.current
+                    : Math.max(0, payload.current - 1)
+                  : payload.current;
+              updateDoc(doc.id, {
+                narrationProgress: {
+                  completed: Math.min(payload.total, completed),
+                  total: payload.total,
+                },
+                narrationTextHash: textHash,
+              });
+            }
             if (
               !text &&
               typeof payload.extractedText === "string" &&
@@ -959,6 +1530,15 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
               setProcessingPreviewText(payload.extractedText);
               updateDoc(doc.id, { extractedText: payload.extractedText });
             }
+          } else if (payload.type === "cancelled") {
+            const completed = Number(payload.completed) || 0;
+            const total = Number(payload.total) || 0;
+            updateDoc(doc.id, {
+              narrationProgress:
+                total > 0 ? { completed, total } : null,
+              narrationTextHash: total > 0 && completed > 0 ? textHash : null,
+            });
+            cancelledResult = { status: "cancelled", completed, total };
           } else if (payload.type === "done") {
             setProgressStep("done");
             gotDone = true;
@@ -975,7 +1555,6 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
               const blob = await audioRes.blob();
               url = URL.createObjectURL(blob);
             } else if (typeof payload.audioData === "string" && payload.audioData) {
-              // Legacy base64 fallback
               const binary = atob(payload.audioData);
               const bytes = new Uint8Array(binary.length);
               for (let i = 0; i < binary.length; i++) {
@@ -987,29 +1566,37 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
               throw new Error(`${doc.file.name}: resposta sem áudio.`);
             }
 
-            updateDoc(doc.id, {
-              audioBase64: null,
-              // Persist what the user confirmed/edited, not a re-sanitized server copy
-              extractedText: text,
-              editableText: text,
-              pagesNarrated,
-              audioUrl: url,
-              audioFormat: fmt,
-            });
-
+            const downloadName = buildDownloadFileName(doc, fmt);
             const saved = await saveAudioToDownloads({
               audioId: typeof payload.audioId === "string" ? payload.audioId : undefined,
               audioData: typeof payload.audioData === "string" ? payload.audioData : undefined,
-              fileName: buildDownloadFileName(doc, fmt),
+              fileName: downloadName,
               saveCover: doc.exportCover,
             });
             if (saved) {
               const label = saved.coverFileName
                 ? `${saved.fileName} + ${saved.coverFileName}`
                 : saved.fileName;
+              savedFileName = label;
               setLastSavedFileName(label);
               setSavedFilesCount((n) => n + 1);
+            } else {
+              savedFileName = downloadName;
             }
+
+            // Keep audio briefly only if we somehow stay on results with this doc;
+            // normally the item is removed from the queue after success.
+            if (url) URL.revokeObjectURL(url);
+            updateDoc(doc.id, {
+              audioBase64: null,
+              extractedText: text,
+              editableText: text,
+              pagesNarrated,
+              audioUrl: null,
+              audioFormat: fmt,
+              narrationProgress: null,
+              narrationTextHash: null,
+            });
           } else if (payload.type === "error") {
             throw new Error(`${doc.file.name}: ${payload.error || "Ocorreu um erro durante o processamento."}`);
           }
@@ -1022,9 +1609,15 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       }
     }
 
+    if (cancelledResult) {
+      return cancelledResult;
+    }
+
     if (!gotDone) {
       throw new Error(`${doc.file.name}: a narração terminou sem áudio gerado.`);
     }
+
+    return { status: "done", fileName: savedFileName || doc.file.name };
   };
 
   const handleConfirmNarration = async () => {
@@ -1040,6 +1633,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     setLoading(true);
     setLoadingMode("narrate");
     setError(null);
+    setBatchDone(false);
     setProcessingFileTotal(docsSnapshot.length);
     setIsPlaying(false);
     setCurrentTime(0);
@@ -1047,33 +1641,51 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     setSavedFilesCount(0);
     stopBatchRef.current = false;
 
-    let lastCompletedId: string | null = null;
+    let savedCount = 0;
+    let lastName = "";
+    let wasCancelled = false;
 
     try {
       for (let i = 0; i < docsSnapshot.length; i++) {
         const doc = docsSnapshot[i];
         setProcessingFileIndex(i + 1);
         setProcessingFileName(doc.file.name);
-        await narrateDocument(doc);
-        lastCompletedId = doc.id;
+        const result = await narrateDocument(doc);
+
+        if (result.status === "cancelled") {
+          wasCancelled = true;
+          break;
+        }
+
+        savedCount += 1;
+        lastName = result.fileName || doc.file.name;
+        // Completed: drop from queue + clear preview/chunk caches (server already cleared chunks)
+        removeDocFromState(doc.id, { clearChunkCache: true });
 
         if (stopBatchRef.current) break;
 
-        // After each file, reset stop flag for the next one
         setIsStopping(false);
         isStoppingRef.current = false;
         setCurrentTaskId(null);
       }
 
-      setResultDocId(lastCompletedId ?? docsSnapshot[0]?.id ?? null);
+      if (wasCancelled) {
+        // Keep cancelled item in state with progress; return to setup
+        setShowTextReview(false);
+      } else if (savedCount > 0) {
+        setBatchDone(true);
+        setSavedFilesCount(savedCount);
+        if (lastName) setLastSavedFileName(lastName);
+      }
       setIsPlaying(false);
       setCurrentTime(0);
     } catch (err: any) {
       console.error(err);
       setError(err.message || "Não foi possível completar a narração. Verifique sua conexão e tente novamente.");
-      // If some files already finished, show results; otherwise return to review
-      if (lastCompletedId) {
-        setResultDocId(lastCompletedId);
+      if (savedCount > 0) {
+        setBatchDone(true);
+        setSavedFilesCount(savedCount);
+        if (lastName) setLastSavedFileName(lastName);
       } else {
         setShowTextReview(true);
       }
@@ -1090,16 +1702,14 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     }
   };
 
-  // Stop current narration stream and compile whatever is completed (ends the batch)
+  // Stop current narration — true cancel (no partial audio); keep item + chunk cache
   const handleStopNarration = async () => {
     if (!currentTaskId || isStopping) return;
     isStoppingRef.current = true;
     stopBatchRef.current = true;
     setIsStopping(true);
-    // Advance UI immediately — server aborts the in-flight TTS fetch next
-    setProgressStep("encoding");
-    setCurrentChunk((c) => Math.max(0, c - 1)); // drop the in-progress part that will be discarded
-    
+    setProgressStep("chunks");
+
     try {
       await fetch("/api/narrate-stop", {
         method: "POST",
@@ -1198,6 +1808,9 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   const resetAll = () => {
     setShowTextReview(false);
     setResultDocId(null);
+    setBatchDone(false);
+    setSavedFilesCount(0);
+    setLastSavedFileName("");
     setDocuments((docs) =>
       docs.map((d) => {
         if (d.audioUrl) URL.revokeObjectURL(d.audioUrl);
@@ -1398,6 +2011,59 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
         <div className="absolute bottom-[-100px] right-[-100px] w-[600px] h-[600px] bg-purple-600/15 rounded-full blur-[150px]" />
         <div className="absolute top-[20%] right-[10%] w-[300px] h-[300px] bg-emerald-500/8 rounded-full blur-[100px]" />
       </div>
+
+      <AnimatePresence>
+        {isRestoringSession && (
+          <motion.div
+            key="session-restore"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/70 backdrop-blur-md"
+            role="status"
+            aria-live="polite"
+            aria-label="Restaurando sessão"
+          >
+            <div className="flex flex-col items-center gap-4 rounded-3xl border border-white/10 bg-slate-900/80 px-8 py-7 shadow-2xl">
+              <div className="relative h-20 w-20">
+                <svg className="h-20 w-20 -rotate-90" viewBox="0 0 80 80" aria-hidden>
+                  <circle
+                    cx="40"
+                    cy="40"
+                    r="34"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="6"
+                    className="text-white/10"
+                  />
+                  <circle
+                    cx="40"
+                    cy="40"
+                    r="34"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="6"
+                    strokeLinecap="round"
+                    className="text-blue-400 transition-[stroke-dashoffset] duration-200 ease-out"
+                    strokeDasharray={2 * Math.PI * 34}
+                    strokeDashoffset={2 * Math.PI * 34 * (1 - Math.min(100, Math.max(0, restorePercent)) / 100)}
+                  />
+                </svg>
+                <span className="absolute inset-0 flex items-center justify-center text-sm font-bold tabular-nums text-white">
+                  {Math.min(100, Math.max(0, Math.round(restorePercent)))}%
+                </span>
+              </div>
+              <div className="text-center">
+                <p className="text-sm font-semibold text-white">Restaurando sessão</p>
+                <p className="mt-1 text-xs text-slate-400">
+                  Carregando documentos e progresso salvos…
+                </p>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Hidden audio tag linked with React state */}
       {resultDoc?.audioUrl && (
@@ -1615,17 +2281,17 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                         {isStopping ? (
                           <>
                             <Loader2 className="w-4.5 h-4.5 animate-spin" />
-                            <span>Compilando áudio gerado...</span>
+                            <span>Cancelando…</span>
                           </>
                         ) : (
                           <>
                             <Square className="w-4 h-4 fill-current" />
-                            <span>Parar e Gerar Áudio até Aqui</span>
+                            <span>Cancelar narração</span>
                           </>
                         )}
                       </button>
                       <p className="text-[11px] text-slate-400 mt-2 text-center">
-                        Interrompe a narração e monta o áudio MP3 com o conteúdo processado até este momento.
+                        Cancela sem gerar áudio parcial. Os blocos já narrados ficam em cache para retomar depois.
                         {processingFileTotal > 1
                           ? " Os arquivos seguintes não serão narrados."
                           : ""}
@@ -1789,7 +2455,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                 onChange={(e) => {
                   const id = reviewDocId ?? documents[0]?.id;
                   if (!id) return;
-                  updateDoc(id, { editableText: e.target.value });
+                  updateEditableText(id, e.target.value);
                 }}
                 rows={18}
                 className="w-full min-h-[320px] bg-slate-950/60 border border-white/10 focus:border-blue-500/60 rounded-2xl p-5 text-sm text-slate-200 leading-relaxed font-serif whitespace-pre-wrap outline-none resize-y scrollbar-thin scrollbar-thumb-white/10"
@@ -1831,10 +2497,23 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
               {/* Left Column: Upload or Document Detail */}
               <div className="lg:col-span-5 space-y-6">
                 <div className="bg-white/5 backdrop-blur-2xl border border-white/15 rounded-3xl p-6 shadow-xl">
-                  <h2 className="text-base font-bold text-white mb-4 flex items-center gap-2">
-                    <FileText className="w-4.5 h-4.5 text-blue-400" />
-                    <span>1. Documentos PDF ou EPUB</span>
-                  </h2>
+                  <div className="flex items-center justify-between gap-3 mb-4">
+                    <h2 className="text-base font-bold text-white flex items-center gap-2">
+                      <FileText className="w-4.5 h-4.5 text-blue-400" />
+                      <span>1. Documentos PDF ou EPUB</span>
+                    </h2>
+                    {documents.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={handleClearAllFiles}
+                        className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/5 hover:bg-rose-500/15 hover:border-rose-500/30 px-2.5 py-1 text-[11px] font-semibold text-slate-300 hover:text-rose-300 transition-colors cursor-pointer"
+                        title="Remover todos os arquivos"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        Limpar todos
+                      </button>
+                    )}
+                  </div>
 
                   {documents.length === 0 ? (
                     // Drag and Drop Zone
@@ -1871,8 +2550,8 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                       </span>
                     </div>
                   ) : (
-                    <div className="space-y-3">
-                      <div className="space-y-2">
+                    <div className="space-y-2.5">
+                      <div className="max-h-[15.75rem] space-y-1.5 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10">
                         {documents.map((doc, index) => {
                           const isActive = activeDocId === doc.id;
                           return (
@@ -1887,50 +2566,89 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                                   setActiveDocId(doc.id);
                                 }
                               }}
-                              className={`border rounded-2xl p-3 flex items-center justify-between gap-3 cursor-pointer transition-all ${
+                              className={`border rounded-xl px-2.5 py-1.5 cursor-pointer transition-all ${
                                 isActive
                                   ? "border-blue-500/50 bg-blue-500/10"
                                   : "border-white/15 bg-white/5 hover:border-white/25"
                               }`}
                             >
-                              <div className="flex items-center gap-3 overflow-hidden min-w-0">
-                                <div className="bg-gradient-to-br from-red-500/20 to-red-600/20 border border-red-500/30 text-red-400 p-2 rounded-xl shrink-0">
-                                  {doc.fileType === "epub" ? (
-                                    <Book className="w-4 h-4 text-indigo-400" />
-                                  ) : (
-                                    <FileText className="w-4 h-4" />
-                                  )}
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-2 overflow-hidden min-w-0">
+                                  <div className="bg-gradient-to-br from-red-500/20 to-red-600/20 border border-red-500/30 text-red-400 p-1.5 rounded-lg shrink-0">
+                                    {doc.fileType === "epub" ? (
+                                      <Book className="w-3.5 h-3.5 text-indigo-400" />
+                                    ) : (
+                                      <FileText className="w-3.5 h-3.5" />
+                                    )}
+                                  </div>
+                                  <div className="overflow-hidden min-w-0">
+                                    <h4 className="text-xs font-semibold text-white truncate leading-tight" title={doc.file.name}>
+                                      <span className="text-slate-500 font-medium mr-1">{index + 1}.</span>
+                                      {doc.file.name}
+                                    </h4>
+                                    <p className="text-[11px] text-slate-400 leading-tight mt-0.5">
+                                      {(doc.file.size / (1024 * 1024)).toFixed(2)} MB • {doc.fileType.toUpperCase()}
+                                      {doc.docInfoLoading ? " • lendo…" : ""}
+                                    </p>
+                                  </div>
                                 </div>
-                                <div className="overflow-hidden min-w-0">
-                                  <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                                    Arquivo {index + 1}
-                                  </p>
-                                  <h4 className="text-sm font-semibold text-white truncate" title={doc.file.name}>
-                                    {doc.file.name}
-                                  </h4>
-                                  <p className="text-xs text-slate-400">
-                                    {(doc.file.size / (1024 * 1024)).toFixed(2)} MB • {doc.fileType.toUpperCase()}
-                                    {doc.docInfoLoading ? " • lendo…" : ""}
-                                  </p>
-                                </div>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleRemoveFile(doc.id);
+                                  }}
+                                  className="bg-white/5 hover:bg-rose-500/20 text-slate-300 hover:text-rose-400 border border-white/10 rounded-lg p-1.5 transition-all shadow-sm shrink-0 cursor-pointer"
+                                  title="Remover arquivo"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
                               </div>
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleRemoveFile(doc.id);
-                                }}
-                                className="bg-white/5 hover:bg-rose-500/20 text-slate-300 hover:text-rose-400 border border-white/10 rounded-xl p-2 transition-all shadow-sm shrink-0 cursor-pointer"
-                                title="Remover arquivo"
-                              >
-                                <Trash2 className="w-4 h-4" />
-                              </button>
+                              {doc.narrationProgress &&
+                                doc.narrationProgress.completed > 0 &&
+                                doc.narrationProgress.total > 0 && (
+                                <div className="mt-1.5 flex items-center gap-2">
+                                  <div className="flex-1 min-w-0">
+                                    <div className="flex items-center justify-between gap-2 mb-0.5">
+                                      <span className="text-[10px] font-semibold text-amber-200/90">
+                                        Progresso {doc.narrationProgress.completed}/{doc.narrationProgress.total}
+                                      </span>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleClearNarrationProgress(doc.id);
+                                        }}
+                                        className="text-[10px] font-semibold text-slate-400 hover:text-rose-300 transition-colors cursor-pointer"
+                                        title="Limpar blocos narrados em cache"
+                                      >
+                                        Limpar progresso
+                                      </button>
+                                    </div>
+                                    <div className="h-1 rounded-full bg-white/10 overflow-hidden">
+                                      <div
+                                        className="h-full rounded-full bg-amber-400/80 transition-all"
+                                        style={{
+                                          width: `${Math.min(
+                                            100,
+                                            Math.round(
+                                              (doc.narrationProgress.completed /
+                                                doc.narrationProgress.total) *
+                                                100
+                                            )
+                                          )}%`,
+                                        }}
+                                      />
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
                             </div>
                           );
                         })}
                       </div>
 
-                      <label className="relative flex items-center justify-center gap-2 rounded-xl border border-dashed border-white/15 hover:border-blue-500/40 hover:bg-white/5 px-3 py-2.5 text-xs font-semibold text-slate-300 hover:text-white transition-all cursor-pointer">
+                      <label className="relative flex items-center justify-center gap-2 rounded-xl border border-dashed border-white/15 hover:border-blue-500/40 hover:bg-white/5 px-3 py-2 text-xs font-semibold text-slate-300 hover:text-white transition-all cursor-pointer">
                         <Plus className="w-3.5 h-3.5" />
                         Adicionar mais arquivos
                         <input
@@ -2235,6 +2953,19 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                                       ? `Inicial (${activeDoc.startPage})`
                                       : `Início (§${activeDoc.startPage})`,
                                   url: activeDoc.startPreviewUrl,
+                                  chapter:
+                                    activeDoc.startChapterPreview ||
+                                    (activeDoc.fileType === "epub"
+                                      ? {
+                                          title:
+                                            activeDoc.epubChapters.find(
+                                              (ch) => ch.index === activeDoc.startPage
+                                            )?.title || `Seção ${activeDoc.startPage}`,
+                                          text: "",
+                                          index: activeDoc.startPage,
+                                          total: activeDoc.epubChapters.length,
+                                        }
+                                      : null),
                                 },
                                 {
                                   key: "end" as const,
@@ -2243,6 +2974,26 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                                       ? `Final (${activeDoc.endPage.trim() || activeDoc.startPage})`
                                       : `Fim (§${activeDoc.endPage.trim() || activeDoc.startPage})`,
                                   url: activeDoc.endPreviewUrl || activeDoc.startPreviewUrl,
+                                  chapter:
+                                    activeDoc.endChapterPreview ||
+                                    activeDoc.startChapterPreview ||
+                                    (activeDoc.fileType === "epub"
+                                      ? {
+                                          title:
+                                            activeDoc.epubChapters.find(
+                                              (ch) =>
+                                                ch.index ===
+                                                (parseInt(activeDoc.endPage, 10) ||
+                                                  activeDoc.startPage)
+                                            )?.title ||
+                                            `Seção ${activeDoc.endPage.trim() || activeDoc.startPage}`,
+                                          text: "",
+                                          index:
+                                            parseInt(activeDoc.endPage, 10) ||
+                                            activeDoc.startPage,
+                                          total: activeDoc.epubChapters.length,
+                                        }
+                                      : null),
                                 },
                                 {
                                   key: "cover" as const,
@@ -2250,6 +3001,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                                   url: activeDoc.exportCover
                                     ? activeDoc.coverPreviewUrl
                                     : null,
+                                  chapter: null as ChapterPreview | null,
                                 },
                               ] as const
                             ).map((item) => (
@@ -2268,15 +3020,34 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                                     alt={item.label}
                                     className="max-h-28 w-full object-contain rounded-md"
                                   />
+                                ) : item.chapter ? (
+                                  <div className="w-full flex-1 rounded-md bg-[#f7f4ef] text-[#1c1917] px-2 py-1.5 overflow-hidden">
+                                    <p className="text-[9px] font-semibold text-[#8a847a] uppercase tracking-wide mb-0.5">
+                                      Seção {item.chapter.index}
+                                      {item.chapter.total
+                                        ? ` / ${item.chapter.total}`
+                                        : ""}
+                                    </p>
+                                    <p className="text-[11px] font-bold leading-snug line-clamp-2 mb-1">
+                                      {item.chapter.title}
+                                    </p>
+                                    {item.chapter.text ? (
+                                      <p className="text-[10px] leading-snug text-[#44403c] line-clamp-4">
+                                        {item.chapter.text}
+                                      </p>
+                                    ) : (
+                                      <p className="text-[10px] text-[#8a847a] italic">
+                                        Carregando trecho…
+                                      </p>
+                                    )}
+                                  </div>
                                 ) : (
                                   <p className="text-[10px] text-slate-500 text-center px-1 my-auto leading-snug">
                                     {item.key === "cover"
                                       ? !activeDoc.exportCover
                                         ? "Não exportar"
                                         : coverPreviewMessage || "Sem capa"
-                                      : activeDoc.fileType === "epub"
-                                        ? "—"
-                                        : "Sem preview"}
+                                      : "Sem preview"}
                                   </p>
                                 )}
                               </div>
@@ -2365,7 +3136,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
               </div>
             </motion.div>
           ) : (
-            /* Narration Result Panel (Split-Screen Layout) */
+            /* Narration Result Panel */
             <motion.div
               key="result"
               initial={{ opacity: 0, scale: 0.98 }}
@@ -2373,7 +3144,6 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
               exit={{ opacity: 0, scale: 0.98 }}
               className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start"
             >
-              {/* Left Column: Player Controls */}
               <div className="lg:col-span-5 space-y-6">
                 <div className="bg-white/5 backdrop-blur-2xl border border-white/15 rounded-3xl p-6 shadow-xl">
                   <button 
@@ -2384,6 +3154,38 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                     <span>Narrar Outro Trecho</span>
                   </button>
 
+                  {batchDone && !resultDoc ? (
+                    <div className="text-center py-4">
+                      <div className="inline-flex bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 px-3 py-1.5 rounded-full text-xs font-bold gap-1.5 items-center mb-4">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>
+                          {savedFilesCount > 1
+                            ? `${savedFilesCount} ÁUDIOS SALVOS`
+                            : "ÁUDIO SALVO"}
+                        </span>
+                      </div>
+                      <h2 className="text-lg font-bold text-white px-2">
+                        Narração concluída
+                      </h2>
+                      <p className="text-xs text-slate-400 mt-2 px-2">
+                        O arquivo foi salvo em Downloads
+                        {lastSavedFileName ? (
+                          <>
+                            :{" "}
+                            <strong className="text-slate-200" title={lastSavedFileName}>
+                              {lastSavedFileName}
+                            </strong>
+                          </>
+                        ) : (
+                          "."
+                        )}
+                      </p>
+                      <p className="text-[11px] text-slate-500 mt-4">
+                        Os itens concluídos foram removidos da fila. O cache de blocos e previews foi limpo.
+                      </p>
+                    </div>
+                  ) : (
+                    <>
                   {completedDocs.length > 1 && (
                     <div className="flex gap-2 overflow-x-auto pb-3 mb-4 scrollbar-thin scrollbar-thumb-white/10">
                       {completedDocs.map((doc, index) => {
@@ -2519,6 +3321,8 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                   <p className="text-[10px] text-center text-slate-400">
                     O áudio gerado pode ser reproduzido offline e é compatível com celulares e computadores.
                   </p>
+                    </>
+                  )}
                 </div>
               </div>
 
@@ -2527,16 +3331,32 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                 <div className="bg-white/5 backdrop-blur-2xl border border-white/15 rounded-3xl p-6 shadow-xl h-[520px] flex flex-col">
                   <h3 className="text-base font-bold text-white mb-1 flex items-center gap-2 shrink-0">
                     <BookOpen className="w-4.5 h-4.5 text-blue-400" />
-                    <span>Texto Narrado</span>
+                    <span>{batchDone && !resultDoc ? "Resumo" : "Texto Narrado"}</span>
                   </h3>
                   <p className="text-xs text-slate-400 mb-4 shrink-0">
-                    Acompanhe a leitura visual do texto que foi narrado.
+                    {batchDone && !resultDoc
+                      ? "Os arquivos foram exportados. Você pode iniciar uma nova narração quando quiser."
+                      : "Acompanhe a leitura visual do texto que foi narrado."}
                   </p>
 
                   <div className="flex-1 overflow-y-auto bg-slate-950/40 border border-white/5 rounded-2xl p-5 scrollbar-thin scrollbar-thumb-white/10">
-                    <p className="text-slate-300 text-sm leading-relaxed whitespace-pre-wrap select-text font-serif">
-                      {resultDoc?.editableText || resultDoc?.extractedText}
-                    </p>
+                    {batchDone && !resultDoc ? (
+                      <div className="text-slate-300 text-sm leading-relaxed space-y-3">
+                        <p>
+                          <strong className="text-white">{savedFilesCount}</strong>{" "}
+                          {savedFilesCount === 1 ? "arquivo salvo" : "arquivos salvos"} em Downloads.
+                        </p>
+                        {lastSavedFileName && (
+                          <p className="text-slate-400 break-all">
+                            Último: {lastSavedFileName}
+                          </p>
+                        )}
+                      </div>
+                    ) : (
+                      <p className="text-slate-300 text-sm leading-relaxed whitespace-pre-wrap select-text font-serif">
+                        {resultDoc?.editableText || resultDoc?.extractedText}
+                      </p>
+                    )}
                   </div>
                 </div>
               </div>
