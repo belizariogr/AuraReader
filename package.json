@@ -17,7 +17,7 @@
     "start:tts:kokoro": "cd tts/kokoro && (.venv/bin/python tts_server.py 2>/dev/null || .venv/Scripts/python.exe tts_server.py)",
     "start:app": "bun run server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
-    "build:app": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --external:vite --sourcemap --outfile=dist/server.cjs",
+    "build:app": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --external:vite --external:@napi-rs/canvas --external:@napi-rs/canvas-* --external:pdfjs-dist --sourcemap --outfile=dist/server.cjs",
     "electron": "bun run build && node scripts/ensure-electron.cjs && electron .",
     "electron:dev": "bun run build && node scripts/ensure-electron.cjs && NODE_ENV=production electron .",
     "prepare:mac": "node scripts/prepare-app-resources.cjs --platform=darwin",
@@ -41,6 +41,7 @@
   "dependencies": {
     "@breezystack/lamejs": "^1.2.7",
     "@google/genai": "^2.4.0",
+    "@napi-rs/canvas": "^1.0.2",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
     "dotenv": "^17.2.3",
@@ -48,13 +49,16 @@
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
+    "multer": "^2.2.0",
     "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.1.200",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "vite": "^6.2.3"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
+    "@types/multer": "^2.2.0",
     "@types/node": "^22.14.0",
     "autoprefixer": "^10.4.21",
     "electron": "^37.2.0",

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import { 
   FileText, 
   Play, 
@@ -20,9 +20,20 @@ import {
   Loader2,
   Book,
   Square,
-  Plus
+  Plus,
+  Image as ImageIcon,
+  ArrowRightLeft,
+  Mic2,
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import {
+  ExtractCoverPanel,
+  Mp3ToM4bPanel,
+  M4bToMp3Panel,
+} from "./ModePanels";
+
+type AppMode = "narrate" | "extract-cover" | "mp3-to-m4b" | "m4b-to-mp3";
+type OutputFormat = "mp3" | "m4b";
 
 // Voice catalog loaded from active TTS engine
 interface Voice {
@@ -46,6 +57,8 @@ interface DocItem {
   fileType: "pdf" | "epub";
   startPage: number;
   endPage: string;
+  /** PDF cover page (1-based). Empty string = no cover. */
+  coverPage: string;
   pdfPageCount: number | null;
   epubChapters: EpubChapter[];
   docInfoMessage: string;
@@ -55,6 +68,8 @@ interface DocItem {
   pagesNarrated: string;
   audioBase64: string | null;
   audioUrl: string | null;
+  audioFormat: OutputFormat;
+  coverPreviewUrl: string | null;
 }
 
 function createDocId() {
@@ -125,12 +140,17 @@ function persistVoice(engine: string, voiceId: string) {
 }
 
 export default function App({ onManageModels }: { onManageModels?: () => void }) {
+  const [appMode, setAppMode] = useState<AppMode>("narrate");
+  const [outputFormat, setOutputFormat] = useState<OutputFormat>("mp3");
+
   // Multi-document state
   const [documents, setDocuments] = useState<DocItem[]>([]);
   const [activeDocId, setActiveDocId] = useState<string | null>(null);
   const [reviewDocId, setReviewDocId] = useState<string | null>(null);
   const [resultDocId, setResultDocId] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState<boolean>(false);
+  const [coverPreviewLoading, setCoverPreviewLoading] = useState(false);
+  const [coverPreviewMessage, setCoverPreviewMessage] = useState<string | null>(null);
 
   // Shared configuration
   const [voices, setVoices] = useState<Voice[]>(FALLBACK_QWEN_VOICES);
@@ -184,6 +204,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   const [loadingMode, setLoadingMode] = useState<"extract" | "narrate">("extract");
   const [showTextReview, setShowTextReview] = useState<boolean>(false);
   const [progressStep, setProgressStep] = useState<string>("init"); // 'init', 'extraction', 'pre_tts', 'chunks', 'tts', 'encoding', 'done'
+  const [encodePercent, setEncodePercent] = useState<number | null>(null);
   const [currentChunk, setCurrentChunk] = useState<number>(0);
   const [totalChunks, setTotalChunks] = useState<number>(0);
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
@@ -198,15 +219,15 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   const [error, setError] = useState<string | null>(null);
   const hasResults = completedDocs.length > 0;
 
-  const buildDownloadFileName = (doc: DocItem, pagesNarrated?: string) => {
+  const buildDownloadFileName = (doc: DocItem, format?: OutputFormat) => {
     const safeName = doc.file.name.replace(/\.[^/.]+$/, "") || "narracao";
-    const range = (pagesNarrated ?? doc.pagesNarrated ?? "").replace(/\s+/g, "");
-    return range ? `narracao_${safeName}_${range}.mp3` : `narracao_${safeName}.mp3`;
+    const ext = format || doc.audioFormat || outputFormat || "mp3";
+    return `${safeName}.${ext}`;
   };
 
   const saveAudioToDownloads = async (
-    opts: { audioId?: string; audioData?: string; fileName: string }
-  ): Promise<{ fileName: string; path: string } | null> => {
+    opts: { audioId?: string; audioData?: string; fileName: string; saveCover?: boolean }
+  ): Promise<{ fileName: string; path: string; coverFileName?: string | null } | null> => {
     try {
       const res = await fetch("/api/save-to-downloads", {
         method: "POST",
@@ -215,6 +236,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
           audioId: opts.audioId,
           audioData: opts.audioData,
           fileName: opts.fileName,
+          saveCover: opts.saveCover !== false,
         }),
       });
       const payload = await res.json();
@@ -224,6 +246,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       return {
         fileName: payload.fileName as string,
         path: payload.path as string,
+        coverFileName: (payload.coverFileName as string | null) ?? null,
       };
     } catch (err) {
       console.error("Erro ao salvar áudio em Downloads:", err);
@@ -284,6 +307,70 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   const updateDoc = (id: string, patch: Partial<DocItem>) => {
     setDocuments((docs) => docs.map((d) => (d.id === id ? { ...d, ...patch } : d)));
   };
+
+  // Cover preview for active document
+  const refreshCoverPreview = useCallback(async (doc: DocItem) => {
+    if (!doc.fileBase64) return;
+    const wantsCover =
+      doc.fileType === "epub" ||
+      (doc.fileType === "pdf" && doc.coverPage.trim() !== "");
+    if (!wantsCover) {
+      if (doc.coverPreviewUrl) {
+        URL.revokeObjectURL(doc.coverPreviewUrl);
+        updateDoc(doc.id, { coverPreviewUrl: null });
+      }
+      setCoverPreviewMessage("Sem capa (página vazia)");
+      return;
+    }
+
+    setCoverPreviewLoading(true);
+    setCoverPreviewMessage(null);
+    try {
+      const res = await fetch("/api/cover-preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileData: doc.fileBase64,
+          fileType: doc.fileType,
+          coverPage: doc.fileType === "pdf" ? doc.coverPage : undefined,
+        }),
+      });
+      const payload = await res.json();
+      if (doc.coverPreviewUrl) URL.revokeObjectURL(doc.coverPreviewUrl);
+      if (!res.ok || !payload.found) {
+        updateDoc(doc.id, { coverPreviewUrl: null });
+        setCoverPreviewMessage(payload.error || payload.message || "Capa não encontrada");
+        return;
+      }
+      const binary = atob(payload.imageData as string);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
+      updateDoc(doc.id, { coverPreviewUrl: url });
+      setCoverPreviewMessage(null);
+    } catch (err: any) {
+      updateDoc(doc.id, { coverPreviewUrl: null });
+      setCoverPreviewMessage(err?.message || "Falha no preview da capa");
+    } finally {
+      setCoverPreviewLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!activeDoc?.fileBase64 || activeDoc.docInfoLoading) return;
+    const t = window.setTimeout(() => {
+      void refreshCoverPreview(activeDoc);
+    }, 400);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh on cover page / file changes
+  }, [
+    activeDoc?.id,
+    activeDoc?.fileBase64,
+    activeDoc?.coverPage,
+    activeDoc?.fileType,
+    activeDoc?.docInfoLoading,
+    refreshCoverPreview,
+  ]);
 
   // Drag-and-drop handlers
   const handleDrag = (e: React.DragEvent) => {
@@ -368,6 +455,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       fileType: detectFileType(file),
       startPage: 1,
       endPage: "",
+      coverPage: "1",
       pdfPageCount: null,
       epubChapters: [],
       docInfoMessage: "",
@@ -377,6 +465,8 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       pagesNarrated: "",
       audioBase64: null,
       audioUrl: null,
+      audioFormat: outputFormat,
+      coverPreviewUrl: null,
     }));
 
     setDocuments((prev) => [...prev, ...newDocs]);
@@ -404,6 +494,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     setDocuments((prev) => {
       const target = prev.find((d) => d.id === docId);
       if (target?.audioUrl) URL.revokeObjectURL(target.audioUrl);
+      if (target?.coverPreviewUrl) URL.revokeObjectURL(target.coverPreviewUrl);
       const next = prev.filter((d) => d.id !== docId);
       setActiveDocId((current) => {
         if (current !== docId) return current;
@@ -617,6 +708,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
 
     setProcessingPreviewText(text);
     setProgressStep("pre_tts");
+    setEncodePercent(null);
     setCurrentChunk(0);
     setTotalChunks(0);
     setIsStopping(false);
@@ -638,6 +730,19 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
         voiceName: selectedVoice,
         taskId,
         pagesNarrated: doc.pagesNarrated,
+        fileData: doc.fileBase64,
+        fileType: doc.fileType,
+        outputFormat,
+        coverPage:
+          doc.fileType === "pdf"
+            ? doc.coverPage.trim() === ""
+              ? null
+              : doc.coverPage
+            : undefined,
+        includeCover:
+          doc.fileType === "epub" ||
+          (doc.fileType === "pdf" && doc.coverPage.trim() !== ""),
+        sourceFileName: doc.file.name,
       }),
     });
 
@@ -679,6 +784,11 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
             if (payload.step) setProgressStep(payload.step);
             if (payload.current !== undefined) setCurrentChunk(payload.current);
             if (payload.total !== undefined) setTotalChunks(payload.total);
+            if (typeof payload.percent === "number") {
+              setEncodePercent(payload.percent);
+            } else if (payload.step && payload.step !== "encoding") {
+              setEncodePercent(null);
+            }
             if (typeof payload.extractedText === "string" && payload.extractedText.length > 0) {
               setProcessingPreviewText(payload.extractedText);
               updateDoc(doc.id, { extractedText: payload.extractedText });
@@ -688,6 +798,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
             gotDone = true;
 
             const pagesNarrated = payload.pagesNarrated || doc.pagesNarrated;
+            const fmt: OutputFormat = payload.format === "m4b" ? "m4b" : "mp3";
             let url: string | null = null;
 
             if (typeof payload.audioUrl === "string" && payload.audioUrl) {
@@ -715,15 +826,20 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
               extractedText: payload.extractedText ?? doc.extractedText,
               pagesNarrated,
               audioUrl: url,
+              audioFormat: fmt,
             });
 
             const saved = await saveAudioToDownloads({
               audioId: typeof payload.audioId === "string" ? payload.audioId : undefined,
               audioData: typeof payload.audioData === "string" ? payload.audioData : undefined,
-              fileName: buildDownloadFileName(doc, pagesNarrated),
+              fileName: buildDownloadFileName(doc, fmt),
+              saveCover: true,
             });
             if (saved) {
-              setLastSavedFileName(saved.fileName);
+              const label = saved.coverFileName
+                ? `${saved.fileName} + ${saved.coverFileName}`
+                : saved.fileName;
+              setLastSavedFileName(label);
               setSavedFilesCount((n) => n + 1);
             }
           } else if (payload.type === "error") {
@@ -900,13 +1016,12 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     return `${minutes}:${seconds < 10 ? "0" : ""}${seconds}`;
   };
 
-  // Force physical browser download of the MP3
+  // Force physical browser download of the audio
   const downloadMp3 = (doc: DocItem | null = resultDoc) => {
     if (!doc?.audioUrl) return;
     const a = document.createElement("a");
     a.href = doc.audioUrl;
-    const safeName = doc.file.name.replace(/\.[^/.]+$/, "");
-    a.download = `narracao_${safeName}_${(doc.pagesNarrated || "").replace(/\s+/g, "")}.mp3`;
+    a.download = buildDownloadFileName(doc);
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -925,6 +1040,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
           pagesNarrated: "",
           audioBase64: null,
           audioUrl: null,
+          audioFormat: outputFormat,
         };
       })
     );
@@ -971,13 +1087,16 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       return;
     }
 
+    // Encoding uses real encoder/ffmpeg percent when available
+    if (progressStep === "encoding") {
+      return;
+    }
+
     const started = Date.now();
     const tau =
       loadingMode === "extract" || progressStep === "extraction"
         ? 14
-        : progressStep === "encoding"
-          ? 1.2
-          : 3.5;
+        : 3.5;
 
     const id = window.setInterval(() => {
       const elapsedSec = (Date.now() - started) / 1000;
@@ -1034,6 +1153,10 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
       return Math.min(99, Math.round((finished / totalChunks) * 100));
     }
 
+    if (progressStep === "encoding" && encodePercent != null) {
+      return Math.min(100, Math.max(0, Math.round(encodePercent)));
+    }
+
     return stageBarPercent;
   };
 
@@ -1088,7 +1211,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
 
     setEtaLabel(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- recompute on tick / chunk / bar changes
-  }, [loading, progressStep, currentChunk, totalChunks, stageBarPercent, etaTick, progressStageKey]);
+  }, [loading, progressStep, currentChunk, totalChunks, stageBarPercent, etaTick, progressStageKey, encodePercent]);
 
   const getStageProgressLabel = () => {
     if (loadingMode === "extract") return "Extração";
@@ -1122,7 +1245,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
 
       {/* Modern minimalist Header */}
       <header className="relative z-10 backdrop-blur-md bg-slate-950/40 border-b border-white/10 px-6 py-4">
-        <div className="max-w-7xl mx-auto flex items-center justify-between">
+        <div className="max-w-[1400px] mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="bg-gradient-to-br from-blue-500 to-purple-600 text-white p-2.5 rounded-xl shadow-lg shadow-blue-500/10">
               <Sparkles className="w-5 h-5 animate-pulse" />
@@ -1147,7 +1270,48 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
         </div>
       </header>
 
-      <main className="flex-1 max-w-7xl w-full mx-auto px-6 py-10 relative z-10">
+      <div className="relative z-10 flex-1 flex min-h-0">
+        {/* Side navigation */}
+        <aside className="w-56 shrink-0 border-r border-white/10 bg-slate-950/50 backdrop-blur-md px-3 py-6 flex flex-col gap-1">
+          {(
+            [
+              { id: "narrate" as const, label: "Narrar", icon: Mic2 },
+              { id: "extract-cover" as const, label: "Extrair capa", icon: ImageIcon },
+              { id: "mp3-to-m4b" as const, label: "MP3 → M4B", icon: ArrowRightLeft },
+              { id: "m4b-to-mp3" as const, label: "M4B → MP3", icon: FileAudio },
+            ] as const
+          ).map((item) => {
+            const Icon = item.icon;
+            const active = appMode === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => {
+                  setAppMode(item.id);
+                  setError(null);
+                }}
+                className={`flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm font-medium transition-colors text-left ${
+                  active
+                    ? "bg-blue-500/15 text-white border border-blue-500/30"
+                    : "text-slate-400 hover:text-white hover:bg-white/5 border border-transparent"
+                }`}
+              >
+                <Icon className="w-4 h-4 shrink-0" />
+                {item.label}
+              </button>
+            );
+          })}
+        </aside>
+
+      <main className="flex-1 max-w-7xl w-full mx-auto px-6 py-10 relative z-10 overflow-y-auto">
+        {appMode === "extract-cover" ? (
+          <ExtractCoverPanel />
+        ) : appMode === "mp3-to-m4b" ? (
+          <Mp3ToM4bPanel />
+        ) : appMode === "m4b-to-mp3" ? (
+          <M4bToMp3Panel />
+        ) : (
         <AnimatePresence mode="wait">
           {/* Main Error Banner */}
           {error && (
@@ -1375,7 +1539,10 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                         <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                       )}
                       <span className={progressStep === "encoding" ? "text-white font-medium animate-pulse" : ["pre_tts", "chunks", "tts"].includes(progressStep) ? "text-slate-500" : "text-slate-400"}>
-                        Codificando áudio para formato MP3
+                        Codificando áudio ({outputFormat === "m4b" ? "M4B" : "MP3"})
+                        {progressStep === "encoding" && encodePercent != null
+                          ? ` — ${Math.round(encodePercent)}%`
+                          : ""}
                       </span>
                     </div>
                   </div>
@@ -1739,6 +1906,86 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                             </p>
                           </div>
                         )}
+
+                        {/* Cover page + preview */}
+                        <div className="pt-2 border-t border-white/10 space-y-3">
+                          <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                            <ImageIcon className="w-4 h-4 text-blue-400" />
+                            Capa do livro
+                          </h3>
+                          {activeDoc.fileType === "pdf" ? (
+                            <div className="space-y-1.5">
+                              <label className="text-xs font-bold text-slate-300">
+                                Página da capa{" "}
+                                <span className="text-slate-400 font-normal">(vazio = sem capa)</span>
+                              </label>
+                              <input
+                                type="number"
+                                min={1}
+                                max={activeDoc.pdfPageCount ?? undefined}
+                                value={activeDoc.coverPage}
+                                placeholder="1"
+                                onChange={(e) =>
+                                  updateDoc(activeDoc.id, { coverPage: e.target.value })
+                                }
+                                className="w-full bg-slate-900/50 border border-white/15 text-white focus:border-blue-500 rounded-xl px-4 py-3 text-sm font-semibold outline-none"
+                              />
+                            </div>
+                          ) : (
+                            <p className="text-[11px] text-slate-400">
+                              A capa é detectada automaticamente no EPUB (metadata OPF).
+                            </p>
+                          )}
+                          <div className="rounded-2xl border border-white/10 bg-black/20 p-3 flex items-center justify-center min-h-[140px]">
+                            {coverPreviewLoading ? (
+                              <Loader2 className="w-6 h-6 text-blue-400 animate-spin" />
+                            ) : activeDoc.coverPreviewUrl ? (
+                              <img
+                                src={activeDoc.coverPreviewUrl}
+                                alt="Preview da capa"
+                                className="max-h-40 max-w-full object-contain rounded-lg"
+                              />
+                            ) : (
+                              <p className="text-xs text-slate-500 text-center px-2">
+                                {coverPreviewMessage || "Preview da capa"}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Output format */}
+                        <div className="pt-2 border-t border-white/10 space-y-2">
+                          <label className="text-xs font-bold text-slate-300">Formato de saída</label>
+                          <div className="grid grid-cols-2 gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setOutputFormat("mp3")}
+                              className={`rounded-xl border px-3 py-2.5 text-sm font-semibold transition-colors ${
+                                outputFormat === "mp3"
+                                  ? "border-blue-500/50 bg-blue-500/15 text-white"
+                                  : "border-white/10 bg-white/5 text-slate-400 hover:text-white"
+                              }`}
+                            >
+                              MP3
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setOutputFormat("m4b")}
+                              className={`rounded-xl border px-3 py-2.5 text-sm font-semibold transition-colors ${
+                                outputFormat === "m4b"
+                                  ? "border-violet-500/50 bg-violet-500/15 text-white"
+                                  : "border-white/10 bg-white/5 text-slate-400 hover:text-white"
+                              }`}
+                            >
+                              M4B
+                            </button>
+                          </div>
+                          <p className="text-[11px] text-slate-500">
+                            {outputFormat === "m4b"
+                              ? "M4B inclui a capa (PDF) ou todas as imagens (EPUB) como artwork. Requer ffmpeg."
+                              : "MP3 + JPEG da capa (mesmo nome) na pasta Downloads."}
+                          </p>
+                        </div>
                       </>
                     )}
                   </motion.div>
@@ -1925,8 +2172,8 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                       <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
                       <span>
                         {completedDocs.length > 1
-                          ? `${completedDocs.length} ÁUDIOS MP3 PRONTOS`
-                          : "ÁUDIO MP3 PRONTO"}
+                          ? `${completedDocs.length} ÁUDIOS PRONTOS`
+                          : `ÁUDIO ${((resultDoc?.audioFormat || outputFormat) === "m4b" ? "M4B" : "MP3")} PRONTO`}
                       </span>
                     </div>
 
@@ -2020,7 +2267,10 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                     className="w-full bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 disabled:opacity-40 disabled:cursor-not-allowed text-white py-4 rounded-2xl font-bold text-sm shadow-lg shadow-emerald-950/20 flex items-center justify-center gap-2.5 transition-all hover:scale-[1.01] active:scale-[0.99] mb-4 cursor-pointer"
                   >
                     <Download className="w-5 h-5" />
-                    <span>Baixar Áudio (.mp3)</span>
+                    <span>
+                      Baixar Áudio (.
+                      {(resultDoc?.audioFormat || outputFormat) === "m4b" ? "m4b" : "mp3"})
+                    </span>
                   </button>
 
                   <p className="text-[10px] text-center text-slate-400">
@@ -2050,7 +2300,9 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
             </motion.div>
           )}
         </AnimatePresence>
+        )}
       </main>
+      </div>
 
     </div>
   );

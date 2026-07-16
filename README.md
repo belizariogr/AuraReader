@@ -1,6 +1,24 @@
 # AuraReader
 
-Narrador de PDF/EPUB para MP3. A extração de texto de PDF usa Gemini; a síntese de voz usa **Qwen3-TTS** local via MLX (`qwen3-tts-apple-silicon/`, modelos Lite 0.6B).
+Narrador de PDF/EPUB para **MP3** ou **M4B**. A extração de texto de PDF usa Gemini; a síntese de voz usa **Qwen3-TTS** local via MLX (`qwen3-tts-apple-silicon/`, modelos Lite 0.6B).
+
+## Modos do app
+
+Menu lateral:
+
+| Modo | O que faz |
+|------|-----------|
+| **Narrar** | Extrai texto (PDF/EPUB), revisa e narra. Saída MP3 ou M4B; capa JPEG com o mesmo nome do áudio. |
+| **Extrair capa** | Salva só a capa do livro como JPEG em Downloads. |
+| **MP3 → M4B** | Empacota um MP3 + capa (imagem, PDF ou EPUB) em audiobook M4B. |
+| **M4B → MP3** | Extrai MP3 + imagem de capa embutida. |
+
+Na narração:
+
+- Nome do arquivo: `<livro>.mp3` / `.m4b` (sem intervalo de páginas no nome; basename do arquivo original).
+- Capa: `<livro>.jpg` (mesmo basename).
+- **M4B**: PDF embute só a capa; EPUB embute a capa e as demais imagens do livro como artwork.
+- M4B e conversões exigem **ffmpeg** no PATH.
 
 ## Pré-requisitos
 
@@ -8,7 +26,7 @@ Narrador de PDF/EPUB para MP3. A extração de texto de PDF usa Gemini; a sínte
 - macOS Apple Silicon (M1/M2/M3/M4)
 - Python 3.12+ com o venv em `qwen3-tts-apple-silicon/.venv`
 - Modelo **Base** Lite (recomendado, ICL) e/ou CustomVoice em `qwen3-tts-apple-silicon/models/`
-- `ffmpeg` (`brew install ffmpeg`)
+- `ffmpeg` (`brew install ffmpeg`) — obrigatório para M4B e modos de conversão
 - `GEMINI_API_KEY` no `.env` (apenas para extrair texto de PDFs; EPUBs são locais)
 
 ## Setup do TTS (uma vez)

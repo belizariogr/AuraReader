@@ -103,6 +103,32 @@ function seedCommon() {
   mustExist(path.join(root, "dist", "index.html"), "dist/index.html");
   fs.cpSync(path.join(root, "dist"), path.join(out, "dist"), { recursive: true });
 
+  // Native / heavy packages externalized from server.cjs bundle
+  const nmOut = path.join(out, "node_modules");
+  const externalPkgs = ["@napi-rs/canvas", "pdfjs-dist"];
+  for (const pkg of externalPkgs) {
+    const src = path.join(root, "node_modules", pkg);
+    if (!fs.existsSync(src)) {
+      console.warn(`[prepare-app-resources] Missing ${pkg} — cover extract may fail in packaged app`);
+      continue;
+    }
+    const dst = path.join(nmOut, pkg);
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    fs.cpSync(src, dst, { recursive: true });
+    console.log(`[prepare-app-resources] Bundled node_modules/${pkg}`);
+  }
+  // Platform-specific canvas binaries (optionalDependencies)
+  const canvasPlatform = fs
+    .readdirSync(path.join(root, "node_modules", "@napi-rs"))
+    .filter((n) => n.startsWith("canvas-"));
+  for (const name of canvasPlatform) {
+    const src = path.join(root, "node_modules", "@napi-rs", name);
+    const dst = path.join(nmOut, "@napi-rs", name);
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    fs.cpSync(src, dst, { recursive: true });
+    console.log(`[prepare-app-resources] Bundled node_modules/@napi-rs/${name}`);
+  }
+
   const previewSrc = path.join(root, "assets", "voice-previews");
   const previewDst = path.join(out, "assets", "voice-previews");
   if (fs.existsSync(previewSrc)) {

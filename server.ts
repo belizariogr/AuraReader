@@ -4,6 +4,7 @@ import fs from "fs";
 import os from "os";
 import { once } from "events";
 import { spawn, type ChildProcess } from "child_process";
+import multer from "multer";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import { Mp3Encoder } from "./lamejsBridge";
@@ -29,6 +30,17 @@ import {
   isKokoroDeviceId,
   type TtsEngineId,
 } from "./ttsEngine";
+import {
+  convertImageToJpeg,
+  coverToBase64Jpeg,
+  extractCover,
+  extractEpubImages,
+} from "./coverExtract";
+import {
+  ensureFfmpeg,
+  m4bToMp3AndCover,
+  mp3ToM4b,
+} from "./mediaConvert";
 
 /** Packaged app root (Resources/aura) or project cwd. */
 const AURA_ROOT = process.env.AURA_ROOT
@@ -448,9 +460,15 @@ process.once("SIGTERM", () => {
   process.exit(0);
 });
 
-// Set up larger limits for base64 file payloads
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ limit: "50mb", extended: true }));
+// Set up larger limits for base64 file payloads (document extract / previews)
+app.use(express.json({ limit: "200mb" }));
+app.use(express.urlencoded({ limit: "200mb", extended: true }));
+
+const convertUpload = multer({
+  dest: path.join(os.tmpdir(), "aura-uploads"),
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2 GB
+});
+fs.mkdirSync(path.join(os.tmpdir(), "aura-uploads"), { recursive: true });
 
 // Initialize the Gemini SDK (PDF text extraction only; TTS is handled by Qwen3 locally)
 const ai = new GoogleGenAI({
@@ -1048,10 +1066,14 @@ function encodePcmToMp3(samples: Int16Array, sampleRate = 24000, kbps = 128): Bu
 }
 
 type NarrationArtifact = {
+  /** Primary audio file (mp3 or m4b). */
   mp3Path: string;
   pcmPath: string;
   fileName: string;
   createdAt: number;
+  format?: "mp3" | "m4b";
+  coverPath?: string | null;
+  mimeType?: string;
 };
 
 const narrationArtifacts = new Map<string, NarrationArtifact>();
@@ -1070,7 +1092,8 @@ async function encodePcmFileToMp3File(
   pcmPath: string,
   mp3Path: string,
   sampleRate = 24000,
-  kbps = 128
+  kbps = 128,
+  onProgress?: (percent: number) => void
 ): Promise<number> {
   const mp3encoder = new Mp3Encoder(1, sampleRate, kbps);
   const out = fs.createWriteStream(mp3Path);
@@ -1078,10 +1101,12 @@ async function encodePcmFileToMp3File(
   const bytesPerBlock = sampleBlockSize * 2;
   const fd = await fs.promises.open(pcmPath, "r");
   let written = 0;
+  let lastEmit = 0;
   try {
     const buf = Buffer.alloc(bytesPerBlock);
     let position = 0;
     const stat = await fd.stat();
+    const total = Math.max(1, stat.size);
     while (position < stat.size) {
       const { bytesRead } = await fd.read(buf, 0, bytesPerBlock, position);
       if (bytesRead <= 0) break;
@@ -1098,6 +1123,13 @@ async function encodePcmFileToMp3File(
         written += chunk.length;
         if (!out.write(chunk)) await once(out, "drain");
       }
+      if (onProgress) {
+        const now = Date.now();
+        if (now - lastEmit >= 150 || position >= stat.size) {
+          lastEmit = now;
+          onProgress(Math.min(99, Math.round((position / total) * 100)));
+        }
+      }
     }
     const flush = mp3encoder.flush();
     if (flush.length > 0) {
@@ -1105,6 +1137,7 @@ async function encodePcmFileToMp3File(
       written += chunk.length;
       if (!out.write(chunk)) await once(out, "drain");
     }
+    onProgress?.(100);
   } finally {
     await fd.close();
     await new Promise<void>((resolve, reject) => {
@@ -1121,6 +1154,7 @@ async function cleanupNarrationArtifact(id: string) {
   narrationArtifacts.delete(id);
   await fs.promises.unlink(art.mp3Path).catch(() => undefined);
   await fs.promises.unlink(art.pcmPath).catch(() => undefined);
+  if (art.coverPath) await fs.promises.unlink(art.coverPath).catch(() => undefined);
 }
 
 const VOICE_PREVIEW_TEXT =
@@ -1643,43 +1677,88 @@ function sanitizeDownloadBaseName(name: string): string {
   return cleaned || "narracao";
 }
 
+function splitDownloadName(baseName: string): { stem: string; ext: string } {
+  const raw = String(baseName || "narracao.mp3").trim() || "narracao.mp3";
+  const m = raw.match(/^(.+?)(\.[a-z0-9]+)?$/i);
+  const stem = sanitizeDownloadBaseName((m?.[1] || "narracao").replace(/\.(mp3|m4b|jpg|jpeg)$/i, ""));
+  let ext = (m?.[2] || ".mp3").toLowerCase();
+  if (!ext.startsWith(".")) ext = `.${ext}`;
+  if (![".mp3", ".m4b", ".jpg", ".jpeg"].includes(ext)) ext = ".mp3";
+  if (ext === ".jpeg") ext = ".jpg";
+  return { stem, ext };
+}
+
 function uniqueDownloadPath(dir: string, baseName: string): string {
-  const safeBase = sanitizeDownloadBaseName(baseName.replace(/\.mp3$/i, ""));
-  let candidate = path.join(dir, `${safeBase}.mp3`);
+  const { stem, ext } = splitDownloadName(baseName);
+  let candidate = path.join(dir, `${stem}${ext}`);
   if (!fs.existsSync(candidate)) return candidate;
 
   for (let i = 1; i < 1000; i++) {
-    candidate = path.join(dir, `${safeBase} (${i}).mp3`);
+    candidate = path.join(dir, `${stem} (${i})${ext}`);
     if (!fs.existsSync(candidate)) return candidate;
   }
-  return path.join(dir, `${safeBase}-${Date.now()}.mp3`);
+  return path.join(dir, `${stem}-${Date.now()}${ext}`);
 }
 
-// Save a completed MP3 into the user's Downloads folder as soon as narration finishes
+async function copyToDownloads(
+  srcPath: string,
+  fileName: string
+): Promise<{ path: string; fileName: string; directory: string }> {
+  const downloadsDir = resolveDownloadsDir();
+  const destPath = uniqueDownloadPath(downloadsDir, fileName);
+  await fs.promises.copyFile(srcPath, destPath);
+  return {
+    path: destPath,
+    fileName: path.basename(destPath),
+    directory: downloadsDir,
+  };
+}
+
+// Save completed audio (and optional cover) into the user's Downloads folder
 app.post("/api/save-to-downloads", async (req, res) => {
   try {
-    const { audioData, audioId, fileName } = req.body as {
+    const { audioData, audioId, fileName, coverData, coverFileName, saveCover } = req.body as {
       audioData?: string;
       audioId?: string;
       fileName?: string;
+      coverData?: string;
+      coverFileName?: string;
+      saveCover?: boolean;
     };
 
     const downloadsDir = resolveDownloadsDir();
-    const destPath = uniqueDownloadPath(downloadsDir, fileName || "narracao.mp3");
+    const saved: { path: string; fileName: string }[] = [];
 
     if (audioId && typeof audioId === "string") {
       const art = narrationArtifacts.get(audioId);
       if (!art || !fs.existsSync(art.mp3Path)) {
         return res.status(404).json({ error: "Áudio não encontrado (expirou ou id inválido)." });
       }
-      await fs.promises.copyFile(art.mp3Path, destPath);
-      const st = await fs.promises.stat(destPath);
-      console.log(`[SaveDownloads] Copied ${st.size} bytes → ${destPath}`);
+      const fmt = art.format || "mp3";
+      const audioName =
+        fileName ||
+        `${sanitizeDownloadBaseName(art.fileName)}.${fmt}`;
+      const audioSaved = await copyToDownloads(art.mp3Path, audioName);
+      saved.push(audioSaved);
+      console.log(`[SaveDownloads] Copied audio → ${audioSaved.path}`);
+
+      let coverSaved: { path: string; fileName: string } | null = null;
+      if (saveCover !== false && art.coverPath && fs.existsSync(art.coverPath)) {
+        const { stem } = splitDownloadName(audioSaved.fileName);
+        const coverName = coverFileName || `${stem}.jpg`;
+        coverSaved = await copyToDownloads(art.coverPath, coverName);
+        saved.push(coverSaved);
+        console.log(`[SaveDownloads] Copied cover → ${coverSaved.path}`);
+      }
+
       return res.json({
         success: true,
-        path: destPath,
-        fileName: path.basename(destPath),
+        path: audioSaved.path,
+        fileName: audioSaved.fileName,
+        coverFileName: coverSaved?.fileName ?? null,
+        coverPath: coverSaved?.path ?? null,
         directory: downloadsDir,
+        files: saved,
       });
     }
 
@@ -1692,13 +1771,31 @@ app.post("/api/save-to-downloads", async (req, res) => {
       return res.status(400).json({ error: "Áudio vazio — nada para salvar." });
     }
 
+    const destPath = uniqueDownloadPath(downloadsDir, fileName || "narracao.mp3");
     await fs.promises.writeFile(destPath, buffer);
+    saved.push({ path: destPath, fileName: path.basename(destPath) });
     console.log(`[SaveDownloads] Saved ${buffer.length} bytes → ${destPath}`);
+
+    let coverSaved: { path: string; fileName: string } | null = null;
+    if (coverData && typeof coverData === "string") {
+      const coverBuf = Buffer.from(coverData, "base64");
+      if (coverBuf.length > 0) {
+        const { stem } = splitDownloadName(path.basename(destPath));
+        const coverDest = uniqueDownloadPath(downloadsDir, coverFileName || `${stem}.jpg`);
+        await fs.promises.writeFile(coverDest, coverBuf);
+        coverSaved = { path: coverDest, fileName: path.basename(coverDest) };
+        saved.push(coverSaved);
+      }
+    }
+
     return res.json({
       success: true,
       path: destPath,
       fileName: path.basename(destPath),
+      coverFileName: coverSaved?.fileName ?? null,
+      coverPath: coverSaved?.path ?? null,
       directory: downloadsDir,
+      files: saved,
     });
   } catch (err: any) {
     console.error("[SaveDownloads] Failed:", err);
@@ -1708,7 +1805,7 @@ app.post("/api/save-to-downloads", async (req, res) => {
   }
 });
 
-/** Stream a narration MP3 from disk (no base64 / no full-file RAM load on the SSE path). */
+/** Stream a narration audio file from disk. */
 app.get("/api/narration-audio/:id", async (req, res) => {
   try {
     const id = String(req.params.id || "");
@@ -1716,12 +1813,15 @@ app.get("/api/narration-audio/:id", async (req, res) => {
     if (!art || !fs.existsSync(art.mp3Path)) {
       return res.status(404).json({ error: "Áudio não encontrado." });
     }
+    const fmt = art.format || "mp3";
+    const mime =
+      art.mimeType || (fmt === "m4b" ? "audio/mp4" : "audio/mpeg");
     const st = await fs.promises.stat(art.mp3Path);
-    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Type", mime);
     res.setHeader("Content-Length", String(st.size));
     res.setHeader(
       "Content-Disposition",
-      `inline; filename="${sanitizeDownloadBaseName(art.fileName)}.mp3"`
+      `inline; filename="${sanitizeDownloadBaseName(art.fileName)}.${fmt}"`
     );
     const stream = fs.createReadStream(art.mp3Path);
     stream.on("error", (err) => {
@@ -1732,6 +1832,22 @@ app.get("/api/narration-audio/:id", async (req, res) => {
     stream.pipe(res);
   } catch (err: any) {
     res.status(500).json({ error: err?.message || "Falha ao servir áudio." });
+  }
+});
+
+app.get("/api/narration-cover/:id", async (req, res) => {
+  try {
+    const id = String(req.params.id || "");
+    const art = narrationArtifacts.get(id);
+    if (!art?.coverPath || !fs.existsSync(art.coverPath)) {
+      return res.status(404).json({ error: "Capa não encontrada." });
+    }
+    const st = await fs.promises.stat(art.coverPath);
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Content-Length", String(st.size));
+    fs.createReadStream(art.coverPath).pipe(res);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "Falha ao servir capa." });
   }
 });
 
@@ -1861,6 +1977,10 @@ app.post("/api/narrate-stream", async (req, res) => {
       taskId: reqTaskId,
       text: providedText,
       pagesNarrated: providedPagesLabel,
+      outputFormat: reqOutputFormat,
+      coverPage: reqCoverPage,
+      includeCover: reqIncludeCover,
+      sourceFileName,
     } = req.body;
     taskId = reqTaskId;
     
@@ -1871,6 +1991,13 @@ app.post("/api/narrate-stream", async (req, res) => {
     const activeData = fileData || pdfData;
     const type = (fileType || "pdf") as "pdf" | "epub";
     const voice = voiceName || "Vivian";
+    const outputFormat: "mp3" | "m4b" =
+      reqOutputFormat === "m4b" ? "m4b" : "mp3";
+    const includeCover = reqIncludeCover !== false;
+    const coverPageNum =
+      reqCoverPage === "" || reqCoverPage == null || reqCoverPage === undefined
+        ? null
+        : Math.max(1, parseInt(String(reqCoverPage), 10) || 1);
 
     let start = 1;
     let end = 1;
@@ -2109,26 +2236,134 @@ app.post("/api/narrate-stream", async (req, res) => {
       step: "encoding",
       current: pcmParts,
       total: totalChunks,
+      percent: 0,
       message: wasStoppedEarly
         ? "Geração interrompida. Codificando áudio gerado até o momento..."
-        : "Codificando e compactando áudio para o formato MP3...",
+        : outputFormat === "m4b"
+          ? "Codificando áudio e montando o arquivo M4B..."
+          : "Codificando e compactando áudio para o formato MP3...",
     });
 
-    const mp3Bytes = await encodePcmFileToMp3File(pcmPath, mp3Path, sampleRate, 128);
+    const mp3Bytes = await encodePcmFileToMp3File(
+      pcmPath,
+      mp3Path,
+      sampleRate,
+      128,
+      (percent) => {
+        sendEvent({
+          type: "status",
+          step: "encoding",
+          current: pcmParts,
+          total: totalChunks,
+          percent: outputFormat === "m4b" ? Math.round(percent * 0.7) : percent,
+          message:
+            outputFormat === "m4b"
+              ? `Codificando MP3… ${percent}%`
+              : `Codificando MP3… ${percent}%`,
+        });
+      }
+    );
     console.log(
       `[NarrateStream] Encoded MP3 ${mp3Bytes} bytes from ${pcmBytes} PCM bytes (${pcmParts} parts)`
     );
 
-    const downloadBase = sanitizeDownloadBaseName(
-      wasStoppedEarly
-        ? `${pagesLabel} (Interrompido na parte ${pcmParts} de ${totalChunks})`
-        : pagesLabel
+    const bookStem = sanitizeDownloadBaseName(
+      String(sourceFileName || "")
+        .replace(/\.[^/.]+$/, "")
+        .trim() || "narracao"
     );
+    const downloadBase = bookStem;
+
+    // Extract cover JPEG when requested
+    let coverPath: string | null = null;
+    let artworkPaths: string[] = [];
+    if (includeCover && activeData) {
+      try {
+        if (type === "pdf" && coverPageNum != null) {
+          const cover = await extractCover({
+            fileData: activeData,
+            fileType: "pdf",
+            coverPage: coverPageNum,
+          });
+          coverPath = cover.jpegPath;
+          artworkPaths = [cover.jpegPath];
+        } else if (type === "epub") {
+          const bytes = Buffer.from(activeData, "base64");
+          const { coverJpegPath, artworks } = await extractEpubImages(bytes);
+          coverPath = coverJpegPath;
+          artworkPaths = artworks.length > 0 ? artworks : coverJpegPath ? [coverJpegPath] : [];
+        }
+      } catch (coverErr: any) {
+        console.warn(`[NarrateStream] Cover extraction skipped:`, coverErr?.message || coverErr);
+      }
+    } else if (includeCover && type === "pdf" && coverPageNum != null && !activeData) {
+      // Text-only narrate without file — cannot extract cover
+      console.warn(`[NarrateStream] Cover requested but no fileData provided.`);
+    }
+
+    let finalAudioPath = mp3Path;
+    let finalFormat: "mp3" | "m4b" = "mp3";
+    let mimeType = "audio/mpeg";
+
+    if (outputFormat === "m4b") {
+      try {
+        await ensureFfmpeg();
+        const m4bPath = path.join(NARRATION_TMP_DIR, `${audioId}.m4b`);
+        sendEvent({
+          type: "status",
+          step: "encoding",
+          current: pcmParts,
+          total: totalChunks,
+          percent: 70,
+          message: "Montando arquivo M4B…",
+        });
+        await mp3ToM4b({
+          mp3Path,
+          outputPath: m4bPath,
+          artworkPaths:
+            type === "epub"
+              ? artworkPaths
+              : coverPath
+                ? [coverPath]
+                : [],
+          title: bookStem,
+          onProgress: (p) => {
+            const pct =
+              p.percent != null ? Math.round(70 + p.percent * 0.3) : null;
+            sendEvent({
+              type: "status",
+              step: "encoding",
+              current: pcmParts,
+              total: totalChunks,
+              percent: pct,
+              message:
+                p.percent != null
+                  ? `Montando M4B… ${Math.round(p.percent)}%`
+                  : "Montando M4B…",
+            });
+          },
+        });
+        await fs.promises.unlink(mp3Path).catch(() => undefined);
+        finalAudioPath = m4bPath;
+        finalFormat = "m4b";
+        mimeType = "audio/mp4";
+      } catch (m4bErr: any) {
+        sendEvent({
+          type: "error",
+          error: m4bErr?.message || "Falha ao gerar o arquivo M4B.",
+        });
+        return res.end();
+      }
+    }
+
     narrationArtifacts.set(audioId, {
-      mp3Path,
+      mp3Path: finalAudioPath,
       pcmPath,
       fileName: downloadBase,
       createdAt: Date.now(),
+      format: finalFormat,
+      coverPath,
+      mimeType,
     });
     // PCM no longer needed after encode
     await fs.promises.unlink(pcmPath).catch(() => undefined);
@@ -2137,6 +2372,8 @@ app.post("/api/narrate-stream", async (req, res) => {
       type: "done",
       audioId,
       audioUrl: `/api/narration-audio/${audioId}`,
+      coverUrl: coverPath ? `/api/narration-cover/${audioId}` : null,
+      format: finalFormat,
       voiceName: voice,
       pagesNarrated: wasStoppedEarly
         ? `${pagesLabel} (Interrompido na parte ${pcmParts} de ${totalChunks})`
@@ -2254,6 +2491,442 @@ app.post("/api/narrate", async (req, res) => {
   } finally {
     await unloadTtsModel();
   }
+});
+
+// --- Cover preview / extract ---
+app.post("/api/cover-preview", async (req, res) => {
+  try {
+    const { fileData, fileType, coverPage } = req.body as {
+      fileData?: string;
+      fileType?: "pdf" | "epub";
+      coverPage?: number | string | null;
+    };
+    if (!fileData) {
+      return res.status(400).json({ error: "O conteúdo do arquivo é obrigatório." });
+    }
+    const type = fileType === "epub" ? "epub" : "pdf";
+    const page =
+      coverPage === "" || coverPage == null
+        ? type === "pdf"
+          ? 1
+          : null
+        : Math.max(1, parseInt(String(coverPage), 10) || 1);
+
+    if (type === "pdf" && page == null) {
+      return res.json({ found: false, message: "Informe a página da capa." });
+    }
+
+    const cover = await extractCover({
+      fileData,
+      fileType: type,
+      coverPage: page,
+    });
+    const encoded = await coverToBase64Jpeg(cover.jpegPath);
+    // Keep tmp for a bit; preview is ephemeral — unlink after encoding
+    await fs.promises.unlink(cover.jpegPath).catch(() => undefined);
+
+    return res.json({
+      found: true,
+      imageData: encoded.imageData,
+      mimeType: encoded.mimeType,
+      width: encoded.width || cover.width,
+      height: encoded.height || cover.height,
+      source: cover.source,
+    });
+  } catch (err: any) {
+    console.error("[CoverPreview]", err);
+    return res.status(400).json({
+      found: false,
+      error: err?.message || "Não foi possível gerar o preview da capa.",
+    });
+  }
+});
+
+app.post("/api/extract-cover", async (req, res) => {
+  try {
+    const { fileData, fileType, coverPage, fileName } = req.body as {
+      fileData?: string;
+      fileType?: "pdf" | "epub";
+      coverPage?: number | string | null;
+      fileName?: string;
+    };
+    if (!fileData) {
+      return res.status(400).json({ error: "O conteúdo do arquivo é obrigatório." });
+    }
+    const type = fileType === "epub" ? "epub" : "pdf";
+    const page =
+      coverPage === "" || coverPage == null
+        ? type === "pdf"
+          ? 1
+          : null
+        : Math.max(1, parseInt(String(coverPage), 10) || 1);
+
+    const cover = await extractCover({
+      fileData,
+      fileType: type,
+      coverPage: page,
+    });
+
+    const stem = sanitizeDownloadBaseName(
+      String(fileName || "capa")
+        .replace(/\.[^/.]+$/, "")
+        .trim() || "capa"
+    );
+    const saved = await copyToDownloads(cover.jpegPath, `${stem}.jpg`);
+    await fs.promises.unlink(cover.jpegPath).catch(() => undefined);
+
+    return res.json({
+      success: true,
+      path: saved.path,
+      fileName: saved.fileName,
+      directory: saved.directory,
+    });
+  } catch (err: any) {
+    console.error("[ExtractCover]", err);
+    return res.status(400).json({
+      error: err?.message || "Não foi possível extrair a capa.",
+    });
+  }
+});
+
+app.post(
+  "/api/convert/mp3-to-m4b",
+  convertUpload.fields([
+    { name: "mp3", maxCount: 1 },
+    { name: "cover", maxCount: 1 },
+  ]),
+  async (req, res) => {
+    let tmpCover: string | null = null;
+    let tmpRawImage: string | null = null;
+    let tmpM4b: string | null = null;
+    const uploaded: string[] = [];
+    let sseStarted = false;
+    const abort = new AbortController();
+    const onClientGone = () => {
+      if (!res.writableEnded && !abort.signal.aborted) abort.abort();
+    };
+    req.on("aborted", onClientGone);
+    res.on("close", onClientGone);
+
+    const startSse = () => {
+      if (sseStarted) return;
+      sseStarted = true;
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      (res as any).flushHeaders?.();
+    };
+
+    const sendEvent = (data: Record<string, unknown>) => {
+      if (abort.signal.aborted) return;
+      startSse();
+      try {
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      } catch {
+        // connection closed
+      }
+    };
+
+    try {
+      await ensureFfmpeg();
+      const files = req.files as { [field: string]: Express.Multer.File[] } | undefined;
+      const mp3File = files?.mp3?.[0];
+      const coverFile = files?.cover?.[0];
+      const fileType = String(req.body?.fileType || "image") as "pdf" | "epub" | "image";
+      const coverPage = req.body?.coverPage as string | undefined;
+      const fileName = String(req.body?.fileName || mp3File?.originalname || "audio");
+
+      if (!mp3File?.path) {
+        return res.status(400).json({ error: "O arquivo MP3 é obrigatório." });
+      }
+      if (!coverFile?.path) {
+        return res.status(400).json({
+          error: "A capa é obrigatória (imagem JPEG/PNG/WebP/GIF, PDF ou EPUB).",
+        });
+      }
+      uploaded.push(mp3File.path, coverFile.path);
+
+      sendEvent({
+        type: "status",
+        stage: "cover",
+        percent: 0,
+        message: "Preparando capa...",
+      });
+
+      if (fileType === "image") {
+        const ext = path.extname(coverFile.originalname || "").replace(/^\./, "").toLowerCase() || "jpg";
+        const safeExt = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "tif"].includes(ext)
+          ? ext.replace(/jpeg/, "jpg")
+          : "jpg";
+        tmpRawImage = `${coverFile.path}.${safeExt}`;
+        await fs.promises.rename(coverFile.path, tmpRawImage);
+        uploaded[1] = tmpRawImage;
+        tmpCover = await convertImageToJpeg(tmpRawImage);
+      } else {
+        const type = fileType === "epub" ? "epub" : "pdf";
+        const page =
+          coverPage === "" || coverPage == null
+            ? type === "pdf"
+              ? 1
+              : null
+            : Math.max(1, parseInt(String(coverPage), 10) || 1);
+        const buf = await fs.promises.readFile(coverFile.path);
+        const cover = await extractCover({
+          fileData: buf.toString("base64"),
+          fileType: type,
+          coverPage: page,
+        });
+        tmpCover = cover.jpegPath;
+      }
+
+      const stem = sanitizeDownloadBaseName(
+        String(fileName).replace(/\.[^/.]+$/, "").trim() || "audio"
+      );
+      tmpM4b = path.join(NARRATION_TMP_DIR, `convert-${Date.now().toString(36)}.m4b`);
+      ensureNarrationTmpDir();
+
+      sendEvent({
+        type: "status",
+        stage: "encode",
+        percent: 0,
+        message: "Convertendo áudio para M4B (AAC)...",
+      });
+
+      await mp3ToM4b({
+        mp3Path: mp3File.path,
+        outputPath: tmpM4b,
+        artworkPaths: tmpCover ? [tmpCover] : [],
+        title: stem,
+        signal: abort.signal,
+        onProgress: (p) => {
+          sendEvent({
+            type: "status",
+            stage: "encode",
+            percent: p.percent != null ? Math.round(p.percent) : null,
+            timeSec: Math.round(p.timeSec),
+            totalSec: p.totalSec != null ? Math.round(p.totalSec) : null,
+            message:
+              p.percent != null
+                ? `Convertendo… ${Math.round(p.percent)}%`
+                : `Convertendo… ${Math.round(p.timeSec)}s processados`,
+          });
+        },
+      });
+
+      if (abort.signal.aborted) {
+        sendEvent({ type: "error", error: "Conversão cancelada." });
+        res.end();
+        return;
+      }
+
+      sendEvent({
+        type: "status",
+        stage: "save",
+        percent: 100,
+        message: "Salvando em Downloads...",
+      });
+
+      const savedAudio = await copyToDownloads(tmpM4b, `${stem}.m4b`);
+      const savedCover = tmpCover
+        ? await copyToDownloads(tmpCover, `${stem}.jpg`)
+        : null;
+
+      sendEvent({
+        type: "done",
+        success: true,
+        fileName: savedAudio.fileName,
+        path: savedAudio.path,
+        coverFileName: savedCover?.fileName ?? null,
+        coverPath: savedCover?.path ?? null,
+        directory: savedAudio.directory,
+      });
+      res.end();
+    } catch (err: any) {
+      console.error("[ConvertMp3ToM4b]", err);
+      const cancelled =
+        abort.signal.aborted ||
+        err?.name === "AbortError" ||
+        /cancelad/i.test(String(err?.message || ""));
+      if (sseStarted) {
+        sendEvent({
+          type: "error",
+          error: cancelled
+            ? "Conversão cancelada."
+            : err?.message || "Falha ao converter MP3 para M4B.",
+        });
+        res.end();
+      } else {
+        return res.status(400).json({
+          error: cancelled
+            ? "Conversão cancelada."
+            : err?.message || "Falha ao converter MP3 para M4B.",
+        });
+      }
+    } finally {
+      req.off("aborted", onClientGone);
+      res.off("close", onClientGone);
+      for (const p of uploaded) await fs.promises.unlink(p).catch(() => undefined);
+      if (tmpRawImage && !uploaded.includes(tmpRawImage)) {
+        await fs.promises.unlink(tmpRawImage).catch(() => undefined);
+      }
+      if (tmpCover) await fs.promises.unlink(tmpCover).catch(() => undefined);
+      if (tmpM4b) await fs.promises.unlink(tmpM4b).catch(() => undefined);
+    }
+  }
+);
+
+app.post(
+  "/api/convert/m4b-to-mp3",
+  convertUpload.single("m4b"),
+  async (req, res) => {
+    let tmpMp3: string | null = null;
+    let tmpCover: string | null = null;
+    const uploadedPath = req.file?.path || null;
+    let sseStarted = false;
+    const abort = new AbortController();
+    const onClientGone = () => {
+      if (!res.writableEnded && !abort.signal.aborted) abort.abort();
+    };
+    req.on("aborted", onClientGone);
+    res.on("close", onClientGone);
+
+    const startSse = () => {
+      if (sseStarted) return;
+      sseStarted = true;
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      (res as any).flushHeaders?.();
+    };
+
+    const sendEvent = (data: Record<string, unknown>) => {
+      if (abort.signal.aborted) return;
+      startSse();
+      try {
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      } catch {
+        // closed
+      }
+    };
+
+    try {
+      await ensureFfmpeg();
+      if (!uploadedPath) {
+        return res.status(400).json({ error: "O arquivo M4B é obrigatório." });
+      }
+
+      const fileName = String(req.body?.fileName || req.file?.originalname || "audio");
+
+      sendEvent({
+        type: "status",
+        stage: "encode",
+        percent: 0,
+        message: "Extraindo áudio MP3...",
+      });
+
+      const result = await m4bToMp3AndCover({
+        m4bPath: uploadedPath,
+        signal: abort.signal,
+        onProgress: (p) => {
+          sendEvent({
+            type: "status",
+            stage: "encode",
+            percent: p.percent != null ? Math.round(p.percent) : null,
+            timeSec: Math.round(p.timeSec),
+            totalSec: p.totalSec != null ? Math.round(p.totalSec) : null,
+            message:
+              p.percent != null
+                ? `Extraindo… ${Math.round(p.percent)}%`
+                : `Extraindo… ${Math.round(p.timeSec)}s processados`,
+          });
+        },
+      });
+      tmpMp3 = result.mp3Path;
+      tmpCover = result.coverPath;
+
+      if (abort.signal.aborted) {
+        sendEvent({ type: "error", error: "Conversão cancelada." });
+        res.end();
+        return;
+      }
+
+      sendEvent({
+        type: "status",
+        stage: "save",
+        percent: 100,
+        message: "Salvando em Downloads...",
+      });
+
+      const stem = sanitizeDownloadBaseName(
+        String(fileName).replace(/\.[^/.]+$/, "").trim() || "audio"
+      );
+      const savedAudio = await copyToDownloads(tmpMp3, `${stem}.mp3`);
+      let coverFileName: string | null = null;
+      let coverPathOut: string | null = null;
+      if (tmpCover) {
+        const savedCover = await copyToDownloads(tmpCover, `${stem}.jpg`);
+        coverFileName = savedCover.fileName;
+        coverPathOut = savedCover.path;
+      }
+
+      sendEvent({
+        type: "done",
+        success: true,
+        fileName: savedAudio.fileName,
+        path: savedAudio.path,
+        coverFileName,
+        coverPath: coverPathOut,
+        directory: savedAudio.directory,
+        hasCover: !!tmpCover,
+      });
+      res.end();
+    } catch (err: any) {
+      console.error("[ConvertM4bToMp3]", err);
+      const cancelled =
+        abort.signal.aborted ||
+        err?.name === "AbortError" ||
+        /cancelad/i.test(String(err?.message || ""));
+      if (sseStarted) {
+        sendEvent({
+          type: "error",
+          error: cancelled
+            ? "Conversão cancelada."
+            : err?.message || "Falha ao converter M4B para MP3.",
+        });
+        res.end();
+      } else {
+        return res.status(400).json({
+          error: cancelled
+            ? "Conversão cancelada."
+            : err?.message || "Falha ao converter M4B para MP3.",
+        });
+      }
+    } finally {
+      req.off("aborted", onClientGone);
+      res.off("close", onClientGone);
+      if (uploadedPath) await fs.promises.unlink(uploadedPath).catch(() => undefined);
+      if (tmpMp3) await fs.promises.unlink(tmpMp3).catch(() => undefined);
+      if (tmpCover) await fs.promises.unlink(tmpCover).catch(() => undefined);
+    }
+  }
+);
+
+// Express error handler (payload / multer)
+app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err?.type === "entity.too.large" || err?.name === "PayloadTooLargeError") {
+    return res.status(413).json({
+      error: "Arquivo grande demais para este tipo de envio.",
+    });
+  }
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({
+      error:
+        err.code === "LIMIT_FILE_SIZE"
+          ? "Arquivo excede o limite de 2 GB."
+          : err.message || "Falha no upload.",
+    });
+  }
+  return next(err);
 });
 
 // Configure Vite middleware in development or serve static built files in production
