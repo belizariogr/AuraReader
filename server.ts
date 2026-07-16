@@ -16,7 +16,9 @@ import {
   deleteModels,
   downloadMissingModels,
   getModelsStatus as getModelsStatusFromManager,
+  isKokoroMlxPlatform,
   isModelDownloadActive,
+  resolveKokoroWeightsDir,
   resolveModelsDir,
 } from "./modelManager";
 import { detectGpu } from "./gpuDetect";
@@ -141,35 +143,90 @@ function resolveKokoroLaunch(): {
   env: NodeJS.ProcessEnv;
 } {
   const ttsDir = path.join(AURA_ROOT, "tts", "kokoro");
-  const sitePackages = path.join(ttsDir, "site-packages");
-  const modelsDir = resolveModelsDir(AURA_ROOT, AURA_DATA_DIR, "kokoro");
-  const cacheRoot = path.join(AURA_DATA_DIR, "kokoro-ort-cache");
+  const modelsDir = resolveKokoroWeightsDir(AURA_ROOT, AURA_DATA_DIR);
   const kokoroDevice = readKokoroDevice(AURA_DATA_DIR);
+
+  // macOS: Kokoro runs on the shared Qwen MLX Python stack (no ONNX in the bundle).
+  if (isKokoroMlxPlatform()) {
+    const mlxDir = path.join(AURA_ROOT, "qwen3-tts-apple-silicon");
+    const sitePackages = path.join(mlxDir, "site-packages");
+    const scriptName = "tts_server_mlx.py";
+    if (!fs.existsSync(path.join(ttsDir, scriptName))) {
+      throw new Error(
+        `Kokoro MLX server missing: ${path.join(ttsDir, scriptName)}`
+      );
+    }
+
+    const baseEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      QWEN_TTS_PORT: String(TTS_PORT),
+      TTS_PORT: String(TTS_PORT),
+      QWEN_TTS_PRELOAD: process.env.QWEN_TTS_PRELOAD ?? "0",
+      KOKORO_MODEL_DIR: modelsDir,
+      KOKORO_DEVICE: kokoroDevice,
+      AURA_KOKORO_BACKEND: "mlx",
+    };
+
+    const pythonHome =
+      process.env.AURA_PYTHON_HOME ||
+      path.join(AURA_ROOT, "python", "Python.framework", "Versions", "3.12");
+    const bundledPython = path.join(pythonHome, "bin", "python3.12");
+    const venvPython = path.join(mlxDir, ".venv", "bin", "python");
+
+    if (fs.existsSync(bundledPython) && fs.existsSync(sitePackages)) {
+      return {
+        command: bundledPython,
+        args: [scriptName, "--host", "127.0.0.1", "--port", String(TTS_PORT)],
+        cwd: ttsDir,
+        env: {
+          ...baseEnv,
+          PYTHONHOME: pythonHome,
+          PYTHONPATH: sitePackages,
+          PYTHONNOUSERSITE: "1",
+        },
+      };
+    }
+
+    if (fs.existsSync(venvPython)) {
+      return {
+        command: venvPython,
+        args: [scriptName, "--host", "127.0.0.1", "--port", String(TTS_PORT)],
+        cwd: ttsDir,
+        env: baseEnv,
+      };
+    }
+
+    throw new Error(
+      `Kokoro TTS (MLX) runtime não encontrado.\n` +
+        `Precisa do stack MLX em ${mlxDir} (site-packages ou .venv).\n` +
+        `O setup do Qwen3/MLX também prepara o Kokoro no macOS.`
+    );
+  }
+
+  // Windows / Linux: ONNX Runtime (+ CUDA / MIGraphX / DirectML).
+  const sitePackages = path.join(ttsDir, "site-packages");
+  const cacheRoot = path.join(AURA_DATA_DIR, "kokoro-ort-cache");
   const baseEnv: NodeJS.ProcessEnv = {
     ...process.env,
-    // AMD RDNA2 + MIGraphX / ROCm (same overrides as Qwen torch).
     ...(kokoroDevice === "gpu" ? rocmSpawnEnv() : {}),
     QWEN_TTS_PORT: String(TTS_PORT),
     TTS_PORT: String(TTS_PORT),
     QWEN_TTS_PRELOAD: process.env.QWEN_TTS_PRELOAD ?? "0",
     KOKORO_MODEL_DIR: modelsDir,
     KOKORO_DEVICE: kokoroDevice,
-    // Persist MIGraphX compile cache across runs (first load can be slow).
+    AURA_KOKORO_BACKEND: "onnx",
     ORT_MIGRAPHX_CACHE_PATH: process.env.ORT_MIGRAPHX_CACHE_PATH || cacheRoot,
     ORT_MIGRAPHX_MODEL_CACHE_PATH:
       process.env.ORT_MIGRAPHX_MODEL_CACHE_PATH || cacheRoot,
   };
-  // Force CPU EP when the user picks CPU; otherwise clear overrides so GPU EPs win.
   if (kokoroDevice === "cpu") {
     baseEnv.AURA_ONNX_PROVIDER = "CPUExecutionProvider";
     baseEnv.ONNX_PROVIDER = "CPUExecutionProvider";
   } else {
     delete baseEnv.AURA_ONNX_PROVIDER;
     delete baseEnv.ONNX_PROVIDER;
-    // MIGraphX libs live under /opt/rocm/lib — ensure the loader can find them.
     const libPath = kokoroGpuLibraryPath();
     if (libPath) baseEnv.LD_LIBRARY_PATH = libPath;
-    // Parallel MIGraphX GPU kernel compile across CPU cores.
     if (!baseEnv.MIGRAPHX_GPU_COMPILE_PARALLEL) {
       baseEnv.MIGRAPHX_GPU_COMPILE_PARALLEL = String(Math.max(1, os.cpus().length));
     }
@@ -182,7 +239,6 @@ function resolveKokoroLaunch(): {
     path.join(pythonHome, "bin", "python3.12"),
     path.join(pythonHome, "bin", "python3"),
     path.join(pythonHome, "bin", "python"),
-    // mac packaged framework (shared with MLX builds)
     path.join(AURA_ROOT, "python", "Python.framework", "Versions", "3.12", "bin", "python3.12"),
   ];
   const bundledPython = bundledCandidates.find((p) => fs.existsSync(p));
@@ -2029,7 +2085,13 @@ app.post("/api/save-to-downloads", async (req, res) => {
       console.log(`[SaveDownloads] Copied audio → ${audioSaved.path}`);
 
       let coverSaved: { path: string; fileName: string } | null = null;
-      if (saveCover !== false && art.coverPath && fs.existsSync(art.coverPath)) {
+      // M4B already embeds artwork — skip writing a separate cover JPEG.
+      if (
+        saveCover !== false &&
+        fmt !== "m4b" &&
+        art.coverPath &&
+        fs.existsSync(art.coverPath)
+      ) {
         const { stem } = splitDownloadName(audioSaved.fileName);
         const coverName = coverFileName || `${stem}.jpg`;
         coverSaved = await copyToDownloads(art.coverPath, coverName);

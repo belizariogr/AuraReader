@@ -228,6 +228,11 @@ export default function ModelSetup({
 
   const showGpu = Boolean(gpu?.supported) && engine === "qwen3";
   const isTorch = backend === "torch" || (showGpu && engine === "qwen3");
+  const kokoroIsMlx =
+    engine === "kokoro" &&
+    (backend === "mlx" ||
+      (kokoroAccel?.availableProviders?.length === 1 &&
+        kokoroAccel.availableProviders[0] === "MLX"));
   const badge = vendorBadge(gpu?.primary ?? null);
   const accelMismatch =
     showGpu &&
@@ -579,7 +584,7 @@ export default function ModelSetup({
             <Sparkles className="w-5 h-5" />
           </div>
           <div>
-            <h1 className="text-lg font-bold tracking-tight">AuraReader</h1>
+            <h1 className="text-lg font-bold tracking-tight">Aura Converter</h1>
             <p className="text-xs text-slate-400">Instalação dos modelos de voz</p>
           </div>
         </div>
@@ -625,7 +630,9 @@ export default function ModelSetup({
                   title: engines?.kokoro?.label || "Kokoro",
                   desc:
                     engines?.kokoro?.description ||
-                    "Rápido e leve (ONNX) — ideal em AMD/CPU.",
+                    (backend === "mlx"
+                      ? "Rápido no Apple Silicon (MLX bf16)."
+                      : "Rápido e leve (ONNX) — ideal em AMD/CPU."),
                   ready: engines?.kokoro?.ready,
                 },
               ] as const
@@ -666,94 +673,147 @@ export default function ModelSetup({
                 <Cpu className="w-3.5 h-3.5 text-slate-400" />
                 <span className="text-xs text-slate-300 font-medium">Aceleração Kokoro</span>
               </div>
-              <div className="grid grid-cols-2 gap-2">
-                {(
-                  [
-                    {
-                      id: "gpu" as const,
-                      title: "GPU",
-                      desc: "MIGraphX / CUDA / DirectML quando disponível",
-                    },
-                    {
-                      id: "cpu" as const,
-                      title: "CPU",
-                      desc: "Mais estável; sem dependência de ROCm/CUDA",
-                    },
-                  ] as const
-                ).map((opt) => {
-                  const selected = kokoroDevice === opt.id;
-                  return (
-                    <button
-                      key={opt.id}
-                      type="button"
-                      disabled={downloading || switching}
-                      onClick={() => selectKokoroDevice(opt.id)}
-                      className={`text-left rounded-xl border px-3 py-2.5 transition-colors disabled:opacity-50 ${
-                        selected
-                          ? "border-emerald-400/45 bg-emerald-500/10"
-                          : "border-white/10 bg-slate-950/40 hover:bg-white/5"
-                      }`}
-                    >
-                      <span className="text-sm font-semibold text-white">{opt.title}</span>
-                      <p className="text-[11px] text-slate-400 leading-snug mt-0.5">{opt.desc}</p>
-                    </button>
-                  );
-                })}
-              </div>
-              <p className="text-[11px] text-slate-500 leading-relaxed">
-                Em AMD, GPU exige o pacote de sistema <span className="font-mono">migraphx</span>.
-                Sem ele, o Kokoro cai automaticamente para CPU.
-              </p>
-              {kokoroDevice === "gpu" && kokoroAccel && !kokoroAccel.gpuReady && (
-                <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100 leading-relaxed">
-                  <p className="font-semibold text-amber-50 mb-1">GPU marcada, mas ainda no CPU</p>
-                  <p>{kokoroAccel.hint || "Dependências de GPU não estão prontas."}</p>
-                </div>
-              )}
-              {kokoroDevice === "gpu" && kokoroAccel?.gpuReady && (
-                <div className="space-y-2">
-                  <p className="text-[11px] text-emerald-300/90 leading-relaxed">
-                    Runtime GPU pronto (
-                    {kokoroAccel.availableProviders
-                      .filter((p) => p !== "CPUExecutionProvider")
-                      .join(", ") || "GPU"}
-                    ).
-                  </p>
-                  <button
-                    type="button"
-                    disabled={warming || downloading || switching}
-                    onClick={() => startKokoroWarmup()}
-                    className="w-full inline-flex items-center justify-center gap-2 rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-100 hover:bg-emerald-500/20 disabled:opacity-50 transition-colors"
-                  >
-                    {warming ? (
-                      <>
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        Aquecendo GPU…
-                      </>
-                    ) : (
-                      "Aquecer GPU (pré-compilar)"
-                    )}
-                  </button>
+              {kokoroIsMlx ? (
+                <>
+                  <div className="rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-2.5">
+                    <span className="text-sm font-semibold text-white">Apple GPU (MLX)</span>
+                    <p className="text-[11px] text-slate-400 leading-snug mt-0.5">
+                      Kokoro 82M bf16 via Metal — mesma qualidade do modelo completo, sem ONNX no app.
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {(
+                      [
+                        {
+                          id: "gpu" as const,
+                          title: "GPU",
+                          desc: "Metal / MLX (recomendado)",
+                        },
+                        {
+                          id: "cpu" as const,
+                          title: "CPU",
+                          desc: "Mais lento; útil só para diagnóstico",
+                        },
+                      ] as const
+                    ).map((opt) => {
+                      const selected = kokoroDevice === opt.id;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          disabled={downloading || switching}
+                          onClick={() => selectKokoroDevice(opt.id)}
+                          className={`text-left rounded-xl border px-3 py-2.5 transition-colors disabled:opacity-50 ${
+                            selected
+                              ? "border-emerald-400/45 bg-emerald-500/10"
+                              : "border-white/10 bg-slate-950/40 hover:bg-white/5"
+                          }`}
+                        >
+                          <span className="text-sm font-semibold text-white">{opt.title}</span>
+                          <p className="text-[11px] text-slate-400 leading-snug mt-0.5">{opt.desc}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {kokoroDevice === "gpu" && kokoroAccel && !kokoroAccel.gpuReady && (
+                    <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100 leading-relaxed">
+                      <p className="font-semibold text-amber-50 mb-1">MLX ainda não pronto</p>
+                      <p>{kokoroAccel.hint || "Instale as dependências MLX (misaki + mlx-audio)."}</p>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
+                  <div className="grid grid-cols-2 gap-2">
+                    {(
+                      [
+                        {
+                          id: "gpu" as const,
+                          title: "GPU",
+                          desc: "MIGraphX / CUDA / DirectML quando disponível",
+                        },
+                        {
+                          id: "cpu" as const,
+                          title: "CPU",
+                          desc: "Mais estável; sem dependência de ROCm/CUDA",
+                        },
+                      ] as const
+                    ).map((opt) => {
+                      const selected = kokoroDevice === opt.id;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          disabled={downloading || switching}
+                          onClick={() => selectKokoroDevice(opt.id)}
+                          className={`text-left rounded-xl border px-3 py-2.5 transition-colors disabled:opacity-50 ${
+                            selected
+                              ? "border-emerald-400/45 bg-emerald-500/10"
+                              : "border-white/10 bg-slate-950/40 hover:bg-white/5"
+                          }`}
+                        >
+                          <span className="text-sm font-semibold text-white">{opt.title}</span>
+                          <p className="text-[11px] text-slate-400 leading-snug mt-0.5">{opt.desc}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
                   <p className="text-[11px] text-slate-500 leading-relaxed">
-                    Compila vários tamanhos de texto com todas as cores da CPU (
-                    <span className="font-mono">MIGRAPHX_GPU_COMPILE_PARALLEL</span>
-                    ). Pode levar vários minutos na 1ª vez; depois a narração fica bem mais rápida.
+                    Em AMD, GPU exige o pacote de sistema <span className="font-mono">migraphx</span>.
+                    Sem ele, o Kokoro cai automaticamente para CPU.
                   </p>
-                  {(warming || warmup) && (
-                    <div className="rounded-xl border border-white/10 bg-slate-950/50 px-3 py-2 text-[11px] text-slate-300 space-y-1">
-                      <p>{warmup?.phase || "…"}</p>
-                      {typeof warmup?.current === "number" && typeof warmup?.total === "number" && warmup.total > 0 && (
-                        <p className="font-mono text-slate-400">
-                          {warmup.current}/{warmup.total}
-                          {warmup.elapsedMs
-                            ? ` · ${(warmup.elapsedMs / 1000).toFixed(0)}s`
-                            : ""}
-                          {warmup.done ? " · pronto" : ""}
-                        </p>
+                  {kokoroDevice === "gpu" && kokoroAccel && !kokoroAccel.gpuReady && (
+                    <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100 leading-relaxed">
+                      <p className="font-semibold text-amber-50 mb-1">GPU marcada, mas ainda no CPU</p>
+                      <p>{kokoroAccel.hint || "Dependências de GPU não estão prontas."}</p>
+                    </div>
+                  )}
+                  {kokoroDevice === "gpu" && kokoroAccel?.gpuReady && (
+                    <div className="space-y-2">
+                      <p className="text-[11px] text-emerald-300/90 leading-relaxed">
+                        Runtime GPU pronto (
+                        {kokoroAccel.availableProviders
+                          .filter((p) => p !== "CPUExecutionProvider")
+                          .join(", ") || "GPU"}
+                        ).
+                      </p>
+                      <button
+                        type="button"
+                        disabled={warming || downloading || switching}
+                        onClick={() => startKokoroWarmup()}
+                        className="w-full inline-flex items-center justify-center gap-2 rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-100 hover:bg-emerald-500/20 disabled:opacity-50 transition-colors"
+                      >
+                        {warming ? (
+                          <>
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            Aquecendo GPU…
+                          </>
+                        ) : (
+                          "Aquecer GPU (pré-compilar)"
+                        )}
+                      </button>
+                      <p className="text-[11px] text-slate-500 leading-relaxed">
+                        Compila vários tamanhos de texto com todas as cores da CPU (
+                        <span className="font-mono">MIGRAPHX_GPU_COMPILE_PARALLEL</span>
+                        ). Pode levar vários minutos na 1ª vez; depois a narração fica bem mais rápida.
+                      </p>
+                      {(warming || warmup) && (
+                        <div className="rounded-xl border border-white/10 bg-slate-950/50 px-3 py-2 text-[11px] text-slate-300 space-y-1">
+                          <p>{warmup?.phase || "…"}</p>
+                          {typeof warmup?.current === "number" && typeof warmup?.total === "number" && warmup.total > 0 && (
+                            <p className="font-mono text-slate-400">
+                              {warmup.current}/{warmup.total}
+                              {warmup.elapsedMs
+                                ? ` · ${(warmup.elapsedMs / 1000).toFixed(0)}s`
+                                : ""}
+                              {warmup.done ? " · pronto" : ""}
+                            </p>
+                          )}
+                        </div>
                       )}
                     </div>
                   )}
-                </div>
+                </>
               )}
             </div>
           )}

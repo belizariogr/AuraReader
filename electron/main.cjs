@@ -118,7 +118,7 @@ function resolveAuraRoot() {
   if (hasBundledAura(fromMain) || hasProjectRoot(fromMain)) return fromMain;
 
   throw new Error(
-    `Pasta do projeto AuraReader não encontrada em:\n${fromMain}\n\n` +
+    `Pasta do projeto Aura Converter não encontrada em:\n${fromMain}\n\n` +
       `Esperado: package.json + electron/main.cjs + ` +
       (process.platform === "darwin"
         ? "qwen3-tts-apple-silicon/tts_server.py"
@@ -154,7 +154,7 @@ function spawnInherit(command, args, { cwd, env, name }) {
     if (shuttingDown) return;
     log(`${name} exited (code=${code}, signal=${signal}). Shutting down.`);
     dialog.showErrorBox(
-      "AuraReader",
+      "Aura Converter",
       `${name} encerrado inesperadamente (code=${code ?? "?"}). O app será fechado.`
     );
     shutdown(1);
@@ -296,7 +296,7 @@ function createWindow() {
     height: 840,
     minWidth: 900,
     minHeight: 600,
-    title: "AuraReader",
+    title: "Aura Converter",
     show: false,
     ...(icon ? { icon } : {}),
     webPreferences: {
@@ -453,7 +453,7 @@ async function startBackend(auraRoot) {
     },
   });
 
-  await waitForUrl(`${APP_URL}/api/health`, 30_000, "AuraReader server");
+  await waitForUrl(`${APP_URL}/api/health`, 30_000, "Aura Converter server");
 }
 
 app.whenReady().then(async () => {
@@ -466,7 +466,7 @@ app.whenReady().then(async () => {
     createWindow();
   } catch (err) {
     console.error("[electron] failed to start:", err);
-    dialog.showErrorBox("AuraReader — falha ao iniciar", err?.message || String(err));
+    dialog.showErrorBox("Aura Converter — falha ao iniciar", err?.message || String(err));
     shutdown(1);
   }
 

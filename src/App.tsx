@@ -598,6 +598,12 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   const [encodePercent, setEncodePercent] = useState<number | null>(null);
   const [currentChunk, setCurrentChunk] = useState<number>(0);
   const [totalChunks, setTotalChunks] = useState<number>(0);
+  /** Live (non-cached) TTS parts finished this run — used for ETA when resuming mid-narration. */
+  const [liveTtsCompleted, setLiveTtsCompleted] = useState(0);
+  const liveTtsCompletedRef = useRef(0);
+  const pendingLiveTtsRef = useRef(false);
+  const lastLivePartRef = useRef<number | null>(null);
+  const etaLiveStartedAtRef = useRef<number | null>(null);
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const [isStopping, setIsStopping] = useState<boolean>(false);
   const [processingFileIndex, setProcessingFileIndex] = useState<number>(0);
@@ -1457,6 +1463,11 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     setEncodePercent(null);
     setCurrentChunk(0);
     setTotalChunks(0);
+    liveTtsCompletedRef.current = 0;
+    setLiveTtsCompleted(0);
+    pendingLiveTtsRef.current = false;
+    lastLivePartRef.current = null;
+    etaLiveStartedAtRef.current = null;
     setIsStopping(false);
     isStoppingRef.current = false;
 
@@ -1539,6 +1550,38 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
             } else if (payload.step && payload.step !== "encoding") {
               setEncodePercent(null);
             }
+            // Track only real TTS work for ETA (cache replay must not dilute avg/part).
+            if (payload.step === "tts") {
+              if (payload.cached) {
+                if (pendingLiveTtsRef.current) {
+                  liveTtsCompletedRef.current += 1;
+                  setLiveTtsCompleted(liveTtsCompletedRef.current);
+                  pendingLiveTtsRef.current = false;
+                  lastLivePartRef.current = null;
+                }
+              } else if (typeof payload.current === "number") {
+                if (
+                  pendingLiveTtsRef.current &&
+                  lastLivePartRef.current !== null &&
+                  lastLivePartRef.current !== payload.current
+                ) {
+                  liveTtsCompletedRef.current += 1;
+                  setLiveTtsCompleted(liveTtsCompletedRef.current);
+                }
+                if (etaLiveStartedAtRef.current === null) {
+                  etaLiveStartedAtRef.current = Date.now();
+                }
+                lastLivePartRef.current = payload.current;
+                pendingLiveTtsRef.current = true;
+              }
+            } else if (
+              (payload.step === "encoding" || payload.step === "done") &&
+              pendingLiveTtsRef.current
+            ) {
+              liveTtsCompletedRef.current += 1;
+              setLiveTtsCompleted(liveTtsCompletedRef.current);
+              pendingLiveTtsRef.current = false;
+            }
             if (
               typeof payload.current === "number" &&
               typeof payload.total === "number" &&
@@ -1607,7 +1650,8 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
               audioId: typeof payload.audioId === "string" ? payload.audioId : undefined,
               audioData: typeof payload.audioData === "string" ? payload.audioData : undefined,
               fileName: downloadName,
-              saveCover: doc.exportCover,
+              // M4B already embeds artwork — no separate cover JPEG.
+              saveCover: doc.exportCover && fmt !== "m4b",
             });
             if (saved) {
               const label = saved.coverFileName
@@ -1977,39 +2021,53 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
     return stageBarPercent;
   };
 
-  // ETA: for TTS, average only completed parts and countdown between completions
-  // (recalculating every second from growing elapsed made the estimate climb).
+  // ETA: for TTS, average only live (non-cached) parts so resume mid-narration stays accurate.
   useEffect(() => {
     if (!loading || progressStep === "done") {
       setEtaLabel(null);
       return;
     }
 
-    const elapsed = (Date.now() - stageStartedAtRef.current) / 1000;
-    if (elapsed < 1.5) {
-      setEtaLabel(null);
-      return;
-    }
-
     if (progressStep === "tts" && totalChunks > 0) {
       const finished = Math.max(0, currentChunk - 1);
-      if (finished < 1) {
+      const remainingParts = Math.max(0, totalChunks - finished);
+
+      if (!etaLiveStartedAtRef.current) {
+        // Still replaying cache — no live synth yet
+        etaSecondsRef.current = null;
+        etaFinishedRef.current = 0;
+        setEtaLabel(null);
+        return;
+      }
+
+      if (liveTtsCompleted < 1) {
         etaSecondsRef.current = null;
         etaFinishedRef.current = 0;
         setEtaLabel("Estimando após a 1ª parte…");
         return;
       }
 
-      if (etaSecondsRef.current === null || finished !== etaFinishedRef.current) {
-        etaFinishedRef.current = finished;
-        const avgPerPart = elapsed / finished;
-        const remainingParts = Math.max(0, totalChunks - finished);
+      const liveElapsed = (Date.now() - etaLiveStartedAtRef.current) / 1000;
+      if (liveElapsed < 1.5) {
+        setEtaLabel("Estimando após a 1ª parte…");
+        return;
+      }
+
+      if (etaSecondsRef.current === null || liveTtsCompleted !== etaFinishedRef.current) {
+        etaFinishedRef.current = liveTtsCompleted;
+        const avgPerPart = liveElapsed / liveTtsCompleted;
         etaSecondsRef.current = avgPerPart * remainingParts;
       } else {
         etaSecondsRef.current = Math.max(0, etaSecondsRef.current - 1);
       }
 
       setEtaLabel(formatEta(etaSecondsRef.current));
+      return;
+    }
+
+    const elapsed = (Date.now() - stageStartedAtRef.current) / 1000;
+    if (elapsed < 1.5) {
+      setEtaLabel(null);
       return;
     }
 
@@ -2028,7 +2086,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
 
     setEtaLabel(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- recompute on tick / chunk / bar changes
-  }, [loading, progressStep, currentChunk, totalChunks, stageBarPercent, etaTick, progressStageKey, encodePercent]);
+  }, [loading, progressStep, currentChunk, totalChunks, liveTtsCompleted, stageBarPercent, etaTick, progressStageKey, encodePercent]);
 
   const getStageProgressLabel = () => {
     if (loadingMode === "extract") return "Extração";
@@ -2115,14 +2173,14 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
 
       {/* Modern minimalist Header */}
       <header className="relative z-10 backdrop-blur-md bg-slate-950/40 border-b border-white/10 px-6 py-4">
-        <div className="max-w-[1400px] mx-auto flex items-center justify-between">
+        <div className="w-full flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="bg-gradient-to-br from-blue-500 to-purple-600 text-white p-2.5 rounded-xl shadow-lg shadow-blue-500/10">
               <Sparkles className="w-5 h-5 animate-pulse" />
             </div>
             <div>
               <h1 className="text-lg font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-300">
-                Aura Reader
+                Aura Converter
               </h1>
               <p className="text-xs text-slate-400">PDF e EPUB em narração natural com IA</p>
             </div>
@@ -2134,7 +2192,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
             className="text-xs font-mono text-slate-300 bg-white/5 border border-white/10 px-3 py-1.5 rounded-full hover:bg-white/10 hover:text-white hover:border-white/20 transition-colors"
           >
             {ttsEngine === "kokoro"
-              ? `Kokoro · ${kokoroDevice === "gpu" ? "GPU" : "CPU"}`
+              ? `Kokoro · ${kokoroDevice === "gpu" ? "MLX" : "CPU"}`
               : "Qwen3 TTS · local"}
           </button>
         </div>
@@ -2716,7 +2774,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                   </h2>
                   <p className="text-xs text-slate-400 mb-4">
                     {ttsEngine === "kokoro"
-                      ? `Kokoro (${kokoroDevice === "gpu" ? "GPU" : "CPU"}). Escolha a voz neural para a narração.`
+                      ? `Kokoro (${kokoroDevice === "gpu" ? "MLX" : "CPU"}). Escolha a voz neural para a narração.`
                       : "Motor Qwen3. A prévia em cache mantém o mesmo tom em toda a narração."}
                   </p>
 

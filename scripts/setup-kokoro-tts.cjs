@@ -254,6 +254,17 @@ function writeAccelMarker(accel) {
 }
 
 async function main() {
+  if (process.platform === "darwin") {
+    console.log(
+      "[setup-kokoro-tts] No macOS o Kokoro usa MLX (não ONNX).\n" +
+        "  Instale o stack compartilhado:\n" +
+        "    cd qwen3-tts-apple-silicon && .venv/bin/pip install -r requirements.txt\n" +
+        "  Ou selecione Kokoro na UI — o app prepara o runtime MLX automaticamente.\n" +
+        "  Servidor: tts/kokoro/tts_server_mlx.py"
+    );
+    return;
+  }
+
   const { force, accel: accelArg } = parseArgs(process.argv.slice(2));
   const accel = resolveAccel(accelArg);
   console.log(`[setup-kokoro-tts] platform=${process.platform} accel=${accel}`);

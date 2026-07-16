@@ -1,5 +1,5 @@
 {
-  "name": "Aura Reader - Narrador Texto a Voz",
+  "name": "Aura Converter - Narrador Texto a Voz",
   "description": "Adicione um PDF, escolha a página inicial e gere a narração em áudio MP3 para ouvir e baixar.",
   "requestFramePermissions": [],
   "majorCapabilities": []

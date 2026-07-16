@@ -1,6 +1,6 @@
 /**
- * Probe whether Kokoro ONNX can actually use a GPU EP on this machine.
- * AMD needs system MIGraphX (libmigraphx_c); NVIDIA needs onnxruntime-gpu.
+ * Probe whether Kokoro can use GPU acceleration on this machine.
+ * macOS: MLX (Metal). Elsewhere: ONNX Runtime EPs (CUDA / MIGraphX / DirectML / CoreML).
  */
 import { execFileSync } from "child_process";
 import fs from "fs";
@@ -86,13 +86,59 @@ function amdGpuHint(missing: string[]): string {
   return `Libs AMD ausentes: ${missing.join(", ")}.`;
 }
 
+function mlxPython(auraRoot: string): string | null {
+  const candidates = [
+    path.join(auraRoot, "qwen3-tts-apple-silicon", ".venv", "bin", "python"),
+    path.join(
+      auraRoot,
+      "python",
+      "Python.framework",
+      "Versions",
+      "3.12",
+      "bin",
+      "python3.12"
+    ),
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return null;
+}
+
+function probeMlxReady(auraRoot: string): boolean {
+  const py = mlxPython(auraRoot);
+  if (!py) {
+    const site = path.join(auraRoot, "qwen3-tts-apple-silicon", "site-packages");
+    return (
+      fs.existsSync(path.join(site, "mlx")) &&
+      fs.existsSync(path.join(site, "mlx_audio")) &&
+      fs.existsSync(path.join(site, "misaki"))
+    );
+  }
+  try {
+    const site = path.join(auraRoot, "qwen3-tts-apple-silicon", "site-packages");
+    const env = { ...process.env } as NodeJS.ProcessEnv;
+    if (fs.existsSync(site)) {
+      env.PYTHONPATH = site;
+      env.PYTHONNOUSERSITE = "1";
+    }
+    execFileSync(py, ["-c", "import mlx, mlx_audio, misaki; print('ok')"], {
+      encoding: "utf8",
+      timeout: 20_000,
+      env,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function kokoroPython(auraRoot: string): string | null {
   const candidates = [
     path.join(auraRoot, "tts", "kokoro", ".venv", "bin", "python"),
     path.join(auraRoot, "tts", "kokoro", ".venv", "Scripts", "python.exe"),
-    path.join(auraRoot, "tts", "kokoro", "site-packages"), // marker only
   ];
-  for (const c of candidates.slice(0, 2)) {
+  for (const c of candidates) {
     if (fs.existsSync(c)) return c;
   }
   return null;
@@ -139,8 +185,22 @@ export function probeKokoroAccel(
       requested,
       effective: "cpu",
       gpuReady: false,
-      availableProviders: [],
+      availableProviders: process.platform === "darwin" ? ["MLX"] : [],
       hint: null,
+    };
+  }
+
+  // Apple Silicon: MLX / Metal (no ONNX in the macOS bundle).
+  if (process.platform === "darwin") {
+    const ready = probeMlxReady(auraRoot);
+    return {
+      requested,
+      effective: ready ? "gpu" : "cpu",
+      gpuReady: ready,
+      availableProviders: ["MLX"],
+      hint: ready
+        ? null
+        : "Runtime MLX do Kokoro ainda não está pronto (mlx-audio + misaki). Instale os modelos ou rode o setup MLX.",
     };
   }
 

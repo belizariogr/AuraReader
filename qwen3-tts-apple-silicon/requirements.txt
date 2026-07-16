@@ -60,3 +60,6 @@ urllib3==2.6.3
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 pydantic>=2.0.0
+# Kokoro MLX (shared Apple Silicon stack) — English G2P
+misaki[en]>=0.4.4
+en-core-web-sm==3.8.0

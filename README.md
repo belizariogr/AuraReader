@@ -1,4 +1,4 @@
-# AuraReader
+# Aura Converter
 
 Narrador de PDF/EPUB para **MP3** ou **M4B**. Extração de texto 100% local (pdf.js / epub2); síntese de voz com **Qwen3-TTS** local via MLX (`qwen3-tts-apple-silicon/`, modelos Lite 0.6B).
 
@@ -55,7 +55,7 @@ bun start
 Isso sobe:
 
 1. O servidor Qwen3 TTS em `http://127.0.0.1:8765`
-2. O app AuraReader em `http://0.0.0.0:3000` (após o TTS ficar pronto)
+2. O app Aura Converter em `http://0.0.0.0:3000` (após o TTS ficar pronto)
 
 ### Scripts úteis
 

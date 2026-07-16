@@ -28,6 +28,57 @@ const torchSrc = path.join(root, "tts", "torch");
 const kokoroSrc = path.join(root, "tts", "kokoro");
 const cacheDir = path.join(root, "build", "cache");
 
+/**
+ * Robust recursive delete — macOS often throws ENOTEMPTY on large trees
+ * (Python.framework / site-packages) with a single fs.rmSync.
+ */
+function removeDirRobust(dir) {
+  if (!fs.existsSync(dir)) return;
+
+  // Move aside first so mkdir can proceed even if unlink is slow/locked.
+  const trash = `${dir}.trash-${process.pid}-${Date.now()}`;
+  try {
+    fs.renameSync(dir, trash);
+  } catch (err) {
+    // Fallback: delete in place when rename fails (e.g. cross-device).
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      return;
+    } catch (err2) {
+      if (process.platform !== "win32") {
+        const r = spawnSync("rm", ["-rf", dir], { stdio: "ignore" });
+        if (r.status === 0) return;
+      }
+      throw err2;
+    }
+  }
+
+  const purge = (target) => {
+    try {
+      fs.rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch {
+      if (process.platform !== "win32") {
+        spawnSync("rm", ["-rf", target], { stdio: "ignore" });
+      }
+    }
+  };
+
+  // Best-effort sync purge; if it still fails, leave trash for next run / OS.
+  purge(trash);
+  // Clean leftover trash dirs from previous failed runs.
+  try {
+    const parent = path.dirname(dir);
+    const base = path.basename(dir);
+    for (const name of fs.readdirSync(parent)) {
+      if (name.startsWith(`${base}.trash-`)) {
+        purge(path.join(parent, name));
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
 /** Pinned portable CPython 3.12 (python-build-standalone). */
 const PBS_TAG = "20260303";
 const PBS_VERSION = "3.12.13";
@@ -182,33 +233,35 @@ function prepareDarwin() {
   console.log("[prepare-app-resources] Copying site-packages...");
   copyFiltered(siteSrc, path.join(qwenDst, "site-packages"));
 
-  ensureKokoroVenv("darwin", "cpu");
-  bundleKokoroRuntime("darwin");
+  // Kokoro on macOS shares the MLX stack — ship only the MLX server script (no ONNX).
+  mustExist(path.join(kokoroSrc, "tts_server_mlx.py"), "tts/kokoro/tts_server_mlx.py");
+  if (!fs.existsSync(path.join(siteSrc, "misaki"))) {
+    throw new Error(
+      "[prepare-app-resources] misaki missing from MLX site-packages. " +
+        "Install deps: cd qwen3-tts-apple-silicon && .venv/bin/pip install -r requirements.txt"
+    );
+  }
+  const kokoroDst = path.join(out, "tts", "kokoro");
+  fs.mkdirSync(kokoroDst, { recursive: true });
+  for (const file of ["tts_server_mlx.py", "README.md"]) {
+    const src = path.join(kokoroSrc, file);
+    if (fs.existsSync(src)) fs.copyFileSync(src, path.join(kokoroDst, file));
+  }
+  console.log(
+    "[prepare-app-resources] Bundled Kokoro MLX server only (no onnxruntime / kokoro_onnx)"
+  );
 
   const pyBin = path.join(frameworkDst, "Versions", "3.12", "bin", "python3.12");
   mustExist(pyBin, "bundled python3.12");
   try {
     execFileSync(
       pyBin,
-      ["-c", "import fastapi, uvicorn, mlx; print('ok', fastapi.__version__)"],
+      ["-c", "import fastapi, uvicorn, mlx, mlx_audio, misaki; print('ok', fastapi.__version__)"],
       {
         env: {
           ...process.env,
           PYTHONHOME: path.join(frameworkDst, "Versions", "3.12"),
           PYTHONPATH: path.join(qwenDst, "site-packages"),
-          PYTHONNOUSERSITE: "1",
-        },
-        stdio: "inherit",
-      }
-    );
-    execFileSync(
-      pyBin,
-      ["-c", "import fastapi, onnxruntime, kokoro_onnx; print('kokoro ok')"],
-      {
-        env: {
-          ...process.env,
-          PYTHONHOME: path.join(frameworkDst, "Versions", "3.12"),
-          PYTHONPATH: path.join(out, "tts", "kokoro", "site-packages"),
           PYTHONNOUSERSITE: "1",
         },
         stdio: "inherit",
@@ -628,7 +681,7 @@ async function main() {
   console.log(
     `[prepare-app-resources] Preparing ${out} (platform=${platform}, accel=${accel})`
   );
-  fs.rmSync(out, { recursive: true, force: true });
+  removeDirRobust(out);
   fs.mkdirSync(out, { recursive: true });
 
   seedCommon();

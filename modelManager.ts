@@ -1,6 +1,6 @@
 /**
  * Local TTS model install status + downloads (no Python).
- * Supports Qwen3 (HF repos by platform) and Kokoro (direct ONNX assets).
+ * Supports Qwen3 (HF repos by platform) and Kokoro (MLX on macOS, ONNX elsewhere).
  */
 import fs from "fs";
 import path from "path";
@@ -69,7 +69,7 @@ const TORCH_MODELS: ModelSpec[] = [
 const KOKORO_RELEASE =
   "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0";
 
-const KOKORO_MODELS: ModelSpec[] = [
+const KOKORO_ONNX_MODELS: ModelSpec[] = [
   {
     id: "kokoro",
     folder: "kokoro",
@@ -91,20 +91,46 @@ const KOKORO_MODELS: ModelSpec[] = [
   },
 ];
 
+/** Full-quality bf16 (not quantized) — same audio quality as the ONNX fp-ish release. */
+const KOKORO_MLX_MODELS: ModelSpec[] = [
+  {
+    id: "kokoro",
+    folder: "Kokoro-82M-bf16",
+    label: "Kokoro 82M (MLX bf16)",
+    repo: "mlx-community/Kokoro-82M-bf16",
+    approxBytes: 327_000_000,
+  },
+];
+
 export function isTorchTtsPlatform(platform = process.platform): boolean {
   return platform === "win32" || platform === "linux";
+}
+
+/** Kokoro uses MLX on Apple Silicon; ONNX on Windows/Linux. */
+export function isKokoroMlxPlatform(platform = process.platform): boolean {
+  return platform === "darwin";
 }
 
 export function getQwenModels(platform = process.platform): ModelSpec[] {
   return isTorchTtsPlatform(platform) ? TORCH_MODELS : MLX_MODELS;
 }
 
+export function getKokoroModels(platform = process.platform): ModelSpec[] {
+  return isKokoroMlxPlatform(platform) ? KOKORO_MLX_MODELS : KOKORO_ONNX_MODELS;
+}
+
 export function getRequiredModels(
   engine: TtsEngineId = "qwen3",
   platform = process.platform
 ): ModelSpec[] {
-  if (engine === "kokoro") return KOKORO_MODELS;
+  if (engine === "kokoro") return getKokoroModels(platform);
   return getQwenModels(platform);
+}
+
+/** Local folder for one Kokoro/Qwen model spec under the engine models root. */
+export function modelSpecLocalDir(modelsDir: string, spec: ModelSpec): string {
+  if (spec.files?.length) return modelsDir;
+  return path.join(modelsDir, spec.folder);
 }
 
 /** @deprecated Prefer getRequiredModels(readTtsEngine(...)) */
@@ -152,7 +178,7 @@ export function modelFolderReady(folderPath: string): boolean {
   return false;
 }
 
-export function kokoroAssetsReady(folderPath: string): boolean {
+export function kokoroOnnxAssetsReady(folderPath: string): boolean {
   if (!fs.existsSync(folderPath) || !fs.statSync(folderPath).isDirectory()) return false;
   const onnx = path.join(folderPath, "kokoro-v1.0.onnx");
   const voices = path.join(folderPath, "voices-v1.0.bin");
@@ -168,9 +194,45 @@ export function kokoroAssetsReady(folderPath: string): boolean {
   }
 }
 
+/** @deprecated Prefer kokoroOnnxAssetsReady / modelFolderReady by platform. */
+export function kokoroAssetsReady(folderPath: string): boolean {
+  if (isKokoroMlxPlatform()) {
+    const mlxDir = path.join(folderPath, "Kokoro-82M-bf16");
+    return modelFolderReady(mlxDir) || modelFolderReady(folderPath);
+  }
+  return kokoroOnnxAssetsReady(folderPath);
+}
+
 function specReady(spec: ModelSpec, folderPath: string): boolean {
-  if (spec.files?.length) return kokoroAssetsReady(folderPath);
+  if (spec.files?.length) return kokoroOnnxAssetsReady(folderPath);
   return modelFolderReady(folderPath);
+}
+
+function kokoroRootReady(modelsRoot: string): boolean {
+  for (const spec of getKokoroModels()) {
+    if (specReady(spec, modelSpecLocalDir(modelsRoot, spec))) return true;
+  }
+  return false;
+}
+
+/** Absolute path to Kokoro weights actually loaded by the TTS server. */
+export function resolveKokoroWeightsDir(
+  auraRoot: string,
+  auraDataDir: string
+): string {
+  if (process.env.KOKORO_MODEL_DIR) {
+    return path.resolve(process.env.KOKORO_MODEL_DIR);
+  }
+  const root = resolveModelsDir(auraRoot, auraDataDir, "kokoro");
+  const spec = getKokoroModels()[0];
+  if (!spec) return root;
+  return modelSpecLocalDir(root, spec);
+}
+
+export function kokoroBackendId(
+  platform = process.platform
+): "mlx" | "onnx" {
+  return isKokoroMlxPlatform(platform) ? "mlx" : "onnx";
 }
 
 export function projectModelsDir(
@@ -195,12 +257,20 @@ export function resolveModelsDir(
   const active = engine ?? readTtsEngine(auraDataDir);
   if (active === "kokoro") {
     if (process.env.KOKORO_MODEL_DIR) {
-      return path.resolve(process.env.KOKORO_MODEL_DIR);
+      const resolved = path.resolve(process.env.KOKORO_MODEL_DIR);
+      // Allow pointing at the bf16 leaf; status/download use the parent root.
+      if (
+        isKokoroMlxPlatform() &&
+        path.basename(resolved) === "Kokoro-82M-bf16"
+      ) {
+        return path.dirname(resolved);
+      }
+      return resolved;
     }
     const projectModels = projectModelsDir(auraRoot, "kokoro");
     const dataModels = path.join(auraDataDir, "models", "kokoro");
-    if (kokoroAssetsReady(projectModels)) return projectModels;
-    if (kokoroAssetsReady(dataModels)) return dataModels;
+    if (kokoroRootReady(projectModels)) return projectModels;
+    if (kokoroRootReady(dataModels)) return dataModels;
     if (path.resolve(auraDataDir) !== path.resolve(auraRoot)) return dataModels;
     return projectModels;
   }
@@ -230,8 +300,7 @@ function engineStatusBlock(
 ) {
   const modelsDir = resolveModelsDir(auraRoot, auraDataDir, engine);
   const models = getRequiredModels(engine).map((m) => {
-    const folderPath =
-      engine === "kokoro" ? modelsDir : path.join(modelsDir, m.folder);
+    const folderPath = modelSpecLocalDir(modelsDir, m);
     const present = specReady(m, folderPath);
     return {
       id: m.id,
@@ -288,12 +357,18 @@ export function getModelsStatus(auraRoot: string, auraDataDir: string) {
         models: kokoro.models,
         voices: kokoro.voices,
         label: "Kokoro",
-        description: "Rápido e leve (ONNX) — ideal em AMD/CPU.",
+        description: isKokoroMlxPlatform()
+          ? "Rápido no Apple Silicon (MLX bf16)."
+          : "Rápido e leve (ONNX) — ideal em AMD/CPU.",
       },
     },
     downloading: downloadActive,
     backend:
-      engine === "kokoro" ? "onnx" : isTorchTtsPlatform() ? "torch" : "mlx",
+      engine === "kokoro"
+        ? kokoroBackendId()
+        : isTorchTtsPlatform()
+          ? "torch"
+          : "mlx",
     platform: process.platform,
     gpu,
     voices: active.voices,
@@ -317,13 +392,18 @@ async function listRepoFiles(repo: string, signal: AbortSignal): Promise<HfTreeE
     throw new Error(`Falha ao listar ${repo}: HTTP ${res.status}`);
   }
   const tree = (await res.json()) as HfTreeEntry[];
-  return tree.filter(
-    (e) =>
-      e.type === "file" &&
-      !!e.path &&
-      !e.path.endsWith(".gitattributes") &&
-      path.basename(e.path) !== ".gitattributes"
-  );
+  return tree.filter((e) => {
+    if (e.type !== "file" || !e.path) return false;
+    if (e.path.endsWith(".gitattributes") || path.basename(e.path) === ".gitattributes") {
+      return false;
+    }
+    // Kokoro MLX: skip demo samples + torch .pt duplicates (safetensors is enough).
+    if (/Kokoro/i.test(repo)) {
+      if (e.path.startsWith("samples/")) return false;
+      if (e.path.endsWith(".pt")) return false;
+    }
+    return true;
+  });
 }
 
 function ensureParentDir(filePath: string) {
@@ -459,7 +539,11 @@ export async function downloadMissingModels(options: {
         modelsDir,
         engine,
         backend:
-          engine === "kokoro" ? "onnx" : isTorchTtsPlatform() ? "torch" : "mlx",
+          engine === "kokoro"
+            ? kokoroBackendId()
+            : isTorchTtsPlatform()
+              ? "torch"
+              : "mlx",
       },
       true
     );
@@ -475,8 +559,7 @@ export async function downloadMissingModels(options: {
     for (const spec of getRequiredModels(engine)) {
       if (abort.signal.aborted) throw new Error("Download cancelado.");
 
-      const localDir =
-        engine === "kokoro" ? modelsDir : path.join(modelsDir, spec.folder);
+      const localDir = modelSpecLocalDir(modelsDir, spec);
       if (specReady(spec, localDir)) {
         emit(
           {
@@ -769,11 +852,10 @@ export function deleteModels(
 
   const deleted: string[] = [];
   for (const spec of targets) {
-    const folderPath =
-      active === "kokoro" ? modelsDir : path.join(modelsDir, spec.folder);
+    const folderPath = modelSpecLocalDir(modelsDir, spec);
     if (fs.existsSync(folderPath)) {
-      if (active === "kokoro") {
-        for (const f of spec.files || []) {
+      if (spec.files?.length) {
+        for (const f of spec.files) {
           const p = path.join(folderPath, f.name);
           if (fs.existsSync(p)) fs.rmSync(p, { force: true });
           if (fs.existsSync(`${p}.partial`)) fs.rmSync(`${p}.partial`, { force: true });

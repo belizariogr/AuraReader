@@ -1,7 +1,7 @@
 {
-  "name": "aura-reader",
+  "name": "aura-converer",
   "private": true,
-  "version": "0.0.1",
+  "version": "1.0.0",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -15,6 +15,7 @@
     "setup:tts:kokoro": "node scripts/setup-kokoro-tts.cjs",
     "start:tts:torch": "cd tts/torch && (.venv/bin/python tts_server.py 2>/dev/null || .venv/Scripts/python.exe tts_server.py)",
     "start:tts:kokoro": "cd tts/kokoro && (.venv/bin/python tts_server.py 2>/dev/null || .venv/Scripts/python.exe tts_server.py)",
+    "start:tts:kokoro:mlx": "cd tts/kokoro && ../../qwen3-tts-apple-silicon/.venv/bin/python tts_server_mlx.py",
     "start:app": "bun run server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "build:app": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --external:vite --external:@napi-rs/canvas --external:@napi-rs/canvas-* --external:pdfjs-dist --sourcemap --outfile=dist/server.cjs",
@@ -69,7 +70,7 @@
   },
   "build": {
     "appId": "dev.aura.reader",
-    "productName": "AuraReader",
+    "productName": "Aura Converter",
     "directories": {
       "output": "release",
       "buildResources": "assets"
@@ -123,10 +124,10 @@
     "linux": {
       "icon": "icon.png",
       "category": "AudioVideo",
-      "executableName": "AuraReader",
+      "executableName": "AuraConverter",
       "desktop": {
         "entry": {
-          "Name": "AuraReader",
+          "Name": "Aura Converter",
           "Comment": "PDF/EPUB narrator with local Qwen3-TTS",
           "Categories": "AudioVideo;Office;"
         }

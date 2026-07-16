@@ -1,5 +1,5 @@
 /**
- * Detect / prepare TTS Python runtimes (Kokoro ONNX, Qwen Torch/MLX).
+ * Detect / prepare TTS Python runtimes (Kokoro ONNX/MLX, Qwen Torch/MLX).
  * Called during model install so users don't need a separate CLI setup step.
  */
 import { spawn, type ChildProcess } from "child_process";
@@ -25,8 +25,32 @@ function hasPythonAt(...candidates: string[]): boolean {
   return candidates.some((p) => fs.existsSync(p));
 }
 
-export function isKokoroRuntimeReady(auraRoot: string): boolean {
+function hasMisakiMarker(auraRoot: string): boolean {
+  const candidates = [
+    path.join(auraRoot, "qwen3-tts-apple-silicon", "site-packages", "misaki"),
+    path.join(
+      auraRoot,
+      "qwen3-tts-apple-silicon",
+      ".venv",
+      "lib",
+      "python3.12",
+      "site-packages",
+      "misaki"
+    ),
+  ];
+  return candidates.some((p) => fs.existsSync(p));
+}
+
+export function isKokoroRuntimeReady(
+  auraRoot: string,
+  platform = process.platform
+): boolean {
   const ttsDir = path.join(auraRoot, "tts", "kokoro");
+  if (platform === "darwin") {
+    if (!fs.existsSync(path.join(ttsDir, "tts_server_mlx.py"))) return false;
+    // Shared MLX stack with Qwen; misaki is required for Kokoro G2P.
+    return isQwenMlxRuntimeReady(auraRoot) && hasMisakiMarker(auraRoot);
+  }
   if (!fs.existsSync(path.join(ttsDir, "tts_server.py"))) return false;
   if (fs.existsSync(path.join(ttsDir, "site-packages"))) return true;
   return hasPythonAt(
@@ -57,7 +81,7 @@ export function isEngineRuntimeReady(
   engine: TtsEngineId,
   platform = process.platform
 ): boolean {
-  if (engine === "kokoro") return isKokoroRuntimeReady(auraRoot);
+  if (engine === "kokoro") return isKokoroRuntimeReady(auraRoot, platform);
   if (platform === "win32" || platform === "linux") {
     return isQwenTorchRuntimeReady(auraRoot);
   }
@@ -294,13 +318,13 @@ async function ensureMlxRuntime(options: {
     type: "runtime_log",
     label: "Qwen3 (MLX)",
     phase: "Instalando dependências MLX (pode demorar)…",
-    line: "pip install -r requirements.txt fastapi uvicorn",
+    line: "pip install -r requirements.txt",
   });
 
   await new Promise<void>((resolve, reject) => {
     const child = spawn(
       venvPy,
-      ["-m", "pip", "install", "-r", "requirements.txt", "fastapi", "uvicorn[standard]"],
+      ["-m", "pip", "install", "-r", "requirements.txt"],
       {
         cwd: ttsDir,
         env: { ...process.env, PIP_DISABLE_PIP_VERSION_CHECK: "1" },
@@ -386,6 +410,18 @@ export async function ensureEngineRuntime(options: {
   }
 
   if (engine === "kokoro") {
+    // macOS: reuse the shared MLX venv (mlx-audio + misaki); no ONNX install.
+    if (process.platform === "darwin") {
+      await ensureMlxRuntime({ auraRoot, onEvent, signal });
+      if (!isKokoroRuntimeReady(auraRoot)) {
+        throw new Error(
+          "Runtime Kokoro (MLX) ainda incompleto após a preparação. " +
+            "Confirme misaki[en] em qwen3-tts-apple-silicon/requirements.txt."
+        );
+      }
+      return;
+    }
+
     const script = setupScriptPath(auraRoot, "setup-kokoro-tts.cjs");
     if (!script) {
       throw new Error(
