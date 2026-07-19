@@ -16,7 +16,6 @@ import {
   deleteModels,
   downloadMissingModels,
   getModelsStatus as getModelsStatusFromManager,
-  isKokoroMlxPlatform,
   isModelDownloadActive,
   resolveKokoroWeightsDir,
   resolveModelsDir,
@@ -30,6 +29,9 @@ import {
   readKokoroDevice,
   writeKokoroDevice,
   isKokoroDeviceId,
+  isKokoroBackendId,
+  readKokoroBackend,
+  writeKokoroBackend,
   type TtsEngineId,
 } from "./ttsEngine";
 import {
@@ -145,9 +147,9 @@ function resolveKokoroLaunch(): {
   const ttsDir = path.join(AURA_ROOT, "tts", "kokoro");
   const modelsDir = resolveKokoroWeightsDir(AURA_ROOT, AURA_DATA_DIR);
   const kokoroDevice = readKokoroDevice(AURA_DATA_DIR);
+  const kokoroBackend = readKokoroBackend(AURA_DATA_DIR);
 
-  // macOS: Kokoro runs on the shared Qwen MLX Python stack (no ONNX in the bundle).
-  if (isKokoroMlxPlatform()) {
+  if (kokoroBackend === "mlx" && process.platform === "darwin") {
     const mlxDir = path.join(AURA_ROOT, "qwen3-tts-apple-silicon");
     const sitePackages = path.join(mlxDir, "site-packages");
     const scriptName = "tts_server_mlx.py";
@@ -203,7 +205,7 @@ function resolveKokoroLaunch(): {
     );
   }
 
-  // Windows / Linux: ONNX Runtime (+ CUDA / MIGraphX / DirectML).
+  // ONNX Runtime (+ Core ML / CUDA / MIGraphX / DirectML / CPU).
   const sitePackages = path.join(ttsDir, "site-packages");
   const cacheRoot = path.join(AURA_DATA_DIR, "kokoro-ort-cache");
   const baseEnv: NodeJS.ProcessEnv = {
@@ -1578,9 +1580,13 @@ async function saveVoicePreviewToDisk(
   transcript: string
 ): Promise<void> {
   await fs.promises.mkdir(VOICE_PREVIEW_DIR, { recursive: true });
-  await fs.promises.writeFile(voicePreviewWavPath(voiceKey), wav);
+  const wavPath = voicePreviewWavPath(voiceKey);
+  await fs.promises.writeFile(wavPath, wav);
   // Transcript must match the WAV for ICL voice reference (ref_text).
   await fs.promises.writeFile(voicePreviewTextPath(voiceKey), `${transcript.trim()}\n`, "utf8");
+  console.log(
+    `[VoicePreview] Áudio salvo: nome="${path.basename(wavPath)}" caminho="${path.resolve(wavPath)}"`
+  );
 }
 
 /**
@@ -1630,7 +1636,6 @@ async function ensureVoicePreview(
   const wavBuffer = encodePcmToWav(samples, sampleRate);
   voicePreviewCache.set(cacheKey, wavBuffer.toString("base64"));
   await saveVoicePreviewToDisk(cacheKey, wavBuffer, VOICE_PREVIEW_TEXT);
-  console.log(`[VoicePreview] Saved ICL anchor: ${wavPath}`);
   return {
     refAudioPath: wavPath,
     refText: VOICE_PREVIEW_TEXT,
@@ -1646,35 +1651,6 @@ app.post("/api/voice-preview", async (req, res) => {
     const voiceName =
       String(req.body?.voiceName || "").trim() ||
       (engine === "kokoro" ? "af_heart" : "Vivian");
-
-    // Kokoro: synthesize a short clip on the fly (no ICL disk anchor).
-    if (engine === "kokoro") {
-      const { pcm, sampleRate } = await synthesizeWithTts(
-        VOICE_PREVIEW_TEXT,
-        voiceName,
-        undefined,
-        undefined,
-        { skipIcl: true }
-      );
-      didGenerate = true;
-      if (pcm.length === 0) {
-        throw new Error("Prévia Kokoro vazia.");
-      }
-      const samples = new Int16Array(
-        pcm.buffer,
-        pcm.byteOffset,
-        Math.floor(pcm.byteLength / 2)
-      );
-      const wavBuffer = encodePcmToWav(samples, sampleRate);
-      return res.json({
-        audioData: wavBuffer.toString("base64"),
-        mimeType: "audio/wav",
-        voiceName,
-        cached: false,
-        source: "generated",
-        engine,
-      });
-    }
 
     const cacheKey = voiceName.toLowerCase();
 
@@ -1701,6 +1677,40 @@ app.post("/api/voice-preview", async (req, res) => {
         voiceName,
         cached: true,
         source: "disk",
+        filePath: voicePreviewWavPath(cacheKey),
+        textPath: voicePreviewTextPath(cacheKey),
+        engine,
+      });
+    }
+
+    // Kokoro: synthesize a short clip and persist it to disk (no ICL, so the
+    // saved WAV is just a reusable preview rather than a voice-clone anchor).
+    if (engine === "kokoro") {
+      const { pcm, sampleRate } = await synthesizeWithTts(
+        VOICE_PREVIEW_TEXT,
+        voiceName,
+        undefined,
+        undefined,
+        { skipIcl: true }
+      );
+      didGenerate = true;
+      if (pcm.length === 0) {
+        throw new Error("Prévia Kokoro vazia.");
+      }
+      const samples = trimTrailingSilence(
+        new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.byteLength / 2)),
+        sampleRate
+      );
+      const wavBuffer = encodePcmToWav(samples, sampleRate);
+      const audioData = wavBuffer.toString("base64");
+      voicePreviewCache.set(cacheKey, audioData);
+      await saveVoicePreviewToDisk(cacheKey, wavBuffer, VOICE_PREVIEW_TEXT);
+      return res.json({
+        audioData,
+        mimeType: "audio/wav",
+        voiceName,
+        cached: false,
+        source: "generated",
         filePath: voicePreviewWavPath(cacheKey),
         textPath: voicePreviewTextPath(cacheKey),
         engine,
@@ -1747,6 +1757,7 @@ app.get("/api/tts-engine", (_req, res) => {
       voices: status.voices,
       ready: status.ready,
       kokoroDevice: status.kokoroDevice,
+      kokoroBackend: status.kokoroBackend,
       kokoroAccel: status.kokoroAccel,
     });
   } catch (err: any) {
@@ -1758,8 +1769,10 @@ app.post("/api/tts-engine", async (req, res) => {
   try {
     const nextEngine = req.body?.engine;
     const nextDevice = req.body?.kokoroDevice;
+    const nextBackend = req.body?.kokoroBackend;
     const hasEngine = nextEngine !== undefined && nextEngine !== null;
     const hasDevice = nextDevice !== undefined && nextDevice !== null;
+    const hasBackend = nextBackend !== undefined && nextBackend !== null;
 
     if (hasEngine && !isTtsEngineId(nextEngine)) {
       return res.status(400).json({ error: 'engine must be "qwen3" or "kokoro"' });
@@ -1767,24 +1780,34 @@ app.post("/api/tts-engine", async (req, res) => {
     if (hasDevice && !isKokoroDeviceId(nextDevice)) {
       return res.status(400).json({ error: 'kokoroDevice must be "cpu" or "gpu"' });
     }
-    if (!hasEngine && !hasDevice) {
+    if (hasBackend && !isKokoroBackendId(nextBackend)) {
+      return res.status(400).json({ error: 'kokoroBackend must be "mlx" or "onnx"' });
+    }
+    if (hasBackend && nextBackend === "mlx" && process.platform !== "darwin") {
+      return res.status(400).json({ error: "MLX Kokoro is available only on macOS" });
+    }
+    if (!hasEngine && !hasDevice && !hasBackend) {
       return res.status(400).json({
-        error: 'Provide "engine" and/or "kokoroDevice"',
+        error: 'Provide "engine", "kokoroDevice" and/or "kokoroBackend"',
       });
     }
 
     const prevEngine = activeTtsEngine();
     const prevDevice = readKokoroDevice(AURA_DATA_DIR);
+    const prevBackend = readKokoroBackend(AURA_DATA_DIR);
 
     if (hasEngine) writeTtsEngine(AURA_DATA_DIR, nextEngine);
     if (hasDevice) writeKokoroDevice(AURA_DATA_DIR, nextDevice);
+    if (hasBackend) writeKokoroBackend(AURA_DATA_DIR, nextBackend);
 
     const engineChanged = hasEngine && prevEngine !== nextEngine;
     const deviceChanged = hasDevice && prevDevice !== nextDevice;
-    // Restart TTS if engine changed, or Kokoro device changed while Kokoro is active.
+    const backendChanged = hasBackend && prevBackend !== nextBackend;
+    // Restart TTS if engine changed, or Kokoro configuration changed while active.
     const needRestart =
       engineChanged ||
-      (deviceChanged && (hasEngine ? nextEngine === "kokoro" : prevEngine === "kokoro"));
+      ((deviceChanged || backendChanged) &&
+        (hasEngine ? nextEngine === "kokoro" : prevEngine === "kokoro"));
 
     if (needRestart) {
       await unloadTtsModel().catch(() => undefined);
@@ -1798,6 +1821,7 @@ app.post("/api/tts-engine", async (req, res) => {
       voices: status.voices,
       ready: status.ready,
       kokoroDevice: status.kokoroDevice,
+      kokoroBackend: status.kokoroBackend,
       kokoroAccel: status.kokoroAccel,
       restarted: needRestart,
     });
@@ -2723,7 +2747,7 @@ app.post("/api/narrate-stream", async (req, res) => {
       pcmPath,
       mp3Path,
       sampleRate,
-      128,
+      192,
       (percent) => {
         sendEvent({
           type: "status",
@@ -2840,6 +2864,9 @@ app.post("/api/narrate-stream", async (req, res) => {
       coverPath,
       mimeType,
     });
+    console.log(
+      `[NarrateStream] Áudio salvo: nome="${path.basename(finalAudioPath)}" caminho="${path.resolve(finalAudioPath)}"`
+    );
     // PCM no longer needed after encode
     await fs.promises.unlink(pcmPath).catch(() => undefined);
     // Chunk cache was consumed into the final audio — clear after use
@@ -2967,6 +2994,9 @@ app.post("/api/narrate", async (req, res) => {
       fileName: sanitizeDownloadBaseName(pagesNarrated),
       createdAt: Date.now(),
     });
+    console.log(
+      `[NarrateLegacy] Áudio salvo: nome="${path.basename(mp3Path)}" caminho="${path.resolve(mp3Path)}"`
+    );
 
     res.json({
       audioId,

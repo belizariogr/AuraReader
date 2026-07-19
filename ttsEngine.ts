@@ -7,12 +7,15 @@ import path from "path";
 export type TtsEngineId = "qwen3" | "kokoro";
 /** Kokoro ONNX Runtime target: force CPU, or prefer GPU EP when available. */
 export type KokoroDeviceId = "cpu" | "gpu";
+/** Kokoro implementation. ONNX is offered alongside MLX on macOS. */
+export type KokoroBackendId = "mlx" | "onnx";
 
 const ENGINE_FILE = "tts-engine.json";
 
 type EngineFile = {
   engine?: string;
   kokoroDevice?: string;
+  kokoroBackend?: string;
   updatedAt?: string;
 };
 
@@ -22,6 +25,14 @@ export function isTtsEngineId(value: unknown): value is TtsEngineId {
 
 export function isKokoroDeviceId(value: unknown): value is KokoroDeviceId {
   return value === "cpu" || value === "gpu";
+}
+
+export function isKokoroBackendId(value: unknown): value is KokoroBackendId {
+  return value === "mlx" || value === "onnx";
+}
+
+export function defaultKokoroBackend(platform = process.platform): KokoroBackendId {
+  return platform === "darwin" ? "mlx" : "onnx";
 }
 
 export function ttsEnginePath(auraDataDir: string): string {
@@ -50,6 +61,9 @@ function writeEngineFile(auraDataDir: string, patch: EngineFile): void {
   };
   if (!isTtsEngineId(next.engine)) next.engine = "qwen3";
   if (!isKokoroDeviceId(next.kokoroDevice)) next.kokoroDevice = "gpu";
+  if (!isKokoroBackendId(next.kokoroBackend)) {
+    next.kokoroBackend = defaultKokoroBackend();
+  }
   fs.writeFileSync(ttsEnginePath(auraDataDir), JSON.stringify(next, null, 2));
 }
 
@@ -69,6 +83,20 @@ export function readKokoroDevice(auraDataDir: string): KokoroDeviceId {
 
 export function writeKokoroDevice(auraDataDir: string, device: KokoroDeviceId): void {
   writeEngineFile(auraDataDir, { kokoroDevice: device });
+}
+
+export function readKokoroBackend(auraDataDir: string): KokoroBackendId {
+  const raw = readEngineFile(auraDataDir);
+  return isKokoroBackendId(raw.kokoroBackend)
+    ? raw.kokoroBackend
+    : defaultKokoroBackend();
+}
+
+export function writeKokoroBackend(
+  auraDataDir: string,
+  backend: KokoroBackendId
+): void {
+  writeEngineFile(auraDataDir, { kokoroBackend: backend });
 }
 
 /** Friendly voice catalog for Kokoro (English subset used in the UI). */

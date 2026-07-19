@@ -10,8 +10,11 @@ import type { ReadableStream as WebReadableStream } from "stream/web";
 import { detectGpu, type GpuDetectResult } from "./gpuDetect";
 import { probeKokoroAccel } from "./kokoroAccel";
 import {
+  defaultKokoroBackend,
+  readKokoroBackend,
   readTtsEngine,
   readKokoroDevice,
+  type KokoroBackendId,
   type TtsEngineId,
   voicesForEngine,
 } from "./ttsEngine";
@@ -115,15 +118,21 @@ export function getQwenModels(platform = process.platform): ModelSpec[] {
   return isTorchTtsPlatform(platform) ? TORCH_MODELS : MLX_MODELS;
 }
 
-export function getKokoroModels(platform = process.platform): ModelSpec[] {
-  return isKokoroMlxPlatform(platform) ? KOKORO_MLX_MODELS : KOKORO_ONNX_MODELS;
+export function getKokoroModels(
+  platform = process.platform,
+  backend: KokoroBackendId = defaultKokoroBackend(platform)
+): ModelSpec[] {
+  return backend === "mlx" && isKokoroMlxPlatform(platform)
+    ? KOKORO_MLX_MODELS
+    : KOKORO_ONNX_MODELS;
 }
 
 export function getRequiredModels(
   engine: TtsEngineId = "qwen3",
-  platform = process.platform
+  platform = process.platform,
+  kokoroBackend: KokoroBackendId = defaultKokoroBackend(platform)
 ): ModelSpec[] {
-  if (engine === "kokoro") return getKokoroModels(platform);
+  if (engine === "kokoro") return getKokoroModels(platform, kokoroBackend);
   return getQwenModels(platform);
 }
 
@@ -208,8 +217,11 @@ function specReady(spec: ModelSpec, folderPath: string): boolean {
   return modelFolderReady(folderPath);
 }
 
-function kokoroRootReady(modelsRoot: string): boolean {
-  for (const spec of getKokoroModels()) {
+function kokoroRootReady(
+  modelsRoot: string,
+  backend: KokoroBackendId
+): boolean {
+  for (const spec of getKokoroModels(process.platform, backend)) {
     if (specReady(spec, modelSpecLocalDir(modelsRoot, spec))) return true;
   }
   return false;
@@ -224,15 +236,19 @@ export function resolveKokoroWeightsDir(
     return path.resolve(process.env.KOKORO_MODEL_DIR);
   }
   const root = resolveModelsDir(auraRoot, auraDataDir, "kokoro");
-  const spec = getKokoroModels()[0];
+  const spec = getKokoroModels(
+    process.platform,
+    readKokoroBackend(auraDataDir)
+  )[0];
   if (!spec) return root;
   return modelSpecLocalDir(root, spec);
 }
 
 export function kokoroBackendId(
-  platform = process.platform
+  platform = process.platform,
+  preferred: KokoroBackendId = defaultKokoroBackend(platform)
 ): "mlx" | "onnx" {
-  return isKokoroMlxPlatform(platform) ? "mlx" : "onnx";
+  return preferred === "mlx" && isKokoroMlxPlatform(platform) ? "mlx" : "onnx";
 }
 
 export function projectModelsDir(
@@ -256,11 +272,15 @@ export function resolveModelsDir(
 ): string {
   const active = engine ?? readTtsEngine(auraDataDir);
   if (active === "kokoro") {
+    const backend = kokoroBackendId(
+      process.platform,
+      readKokoroBackend(auraDataDir)
+    );
     if (process.env.KOKORO_MODEL_DIR) {
       const resolved = path.resolve(process.env.KOKORO_MODEL_DIR);
       // Allow pointing at the bf16 leaf; status/download use the parent root.
       if (
-        isKokoroMlxPlatform() &&
+        backend === "mlx" &&
         path.basename(resolved) === "Kokoro-82M-bf16"
       ) {
         return path.dirname(resolved);
@@ -269,8 +289,8 @@ export function resolveModelsDir(
     }
     const projectModels = projectModelsDir(auraRoot, "kokoro");
     const dataModels = path.join(auraDataDir, "models", "kokoro");
-    if (kokoroRootReady(projectModels)) return projectModels;
-    if (kokoroRootReady(dataModels)) return dataModels;
+    if (kokoroRootReady(projectModels, backend)) return projectModels;
+    if (kokoroRootReady(dataModels, backend)) return dataModels;
     if (path.resolve(auraDataDir) !== path.resolve(auraRoot)) return dataModels;
     return projectModels;
   }
@@ -296,10 +316,15 @@ export function resolveModelsDir(
 function engineStatusBlock(
   auraRoot: string,
   auraDataDir: string,
-  engine: TtsEngineId
+  engine: TtsEngineId,
+  kokoroBackend: KokoroBackendId
 ) {
   const modelsDir = resolveModelsDir(auraRoot, auraDataDir, engine);
-  const models = getRequiredModels(engine).map((m) => {
+  const models = getRequiredModels(
+    engine,
+    process.platform,
+    kokoroBackend
+  ).map((m) => {
     const folderPath = modelSpecLocalDir(modelsDir, m);
     const present = specReady(m, folderPath);
     return {
@@ -311,7 +336,12 @@ function engineStatusBlock(
       path: folderPath,
     };
   });
-  const runtimeReady = isEngineRuntimeReady(auraRoot, engine);
+  const runtimeReady = isEngineRuntimeReady(
+    auraRoot,
+    engine,
+    process.platform,
+    kokoroBackend
+  );
   const modelsReady = models.every((m) => m.present);
   return {
     ready: modelsReady && runtimeReady,
@@ -326,9 +356,13 @@ function engineStatusBlock(
 export function getModelsStatus(auraRoot: string, auraDataDir: string) {
   const engine = readTtsEngine(auraDataDir);
   const kokoroDevice = readKokoroDevice(auraDataDir);
-  const active = engineStatusBlock(auraRoot, auraDataDir, engine);
-  const qwen3 = engineStatusBlock(auraRoot, auraDataDir, "qwen3");
-  const kokoro = engineStatusBlock(auraRoot, auraDataDir, "kokoro");
+  const kokoroBackend = kokoroBackendId(
+    process.platform,
+    readKokoroBackend(auraDataDir)
+  );
+  const active = engineStatusBlock(auraRoot, auraDataDir, engine, kokoroBackend);
+  const qwen3 = engineStatusBlock(auraRoot, auraDataDir, "qwen3", kokoroBackend);
+  const kokoro = engineStatusBlock(auraRoot, auraDataDir, "kokoro", kokoroBackend);
   const gpu: GpuDetectResult = detectGpu(auraRoot);
   return {
     ready: active.ready,
@@ -336,6 +370,7 @@ export function getModelsStatus(auraRoot: string, auraDataDir: string) {
     runtimeReady: active.runtimeReady,
     engine,
     kokoroDevice,
+    kokoroBackend,
     modelsDir: active.modelsDir,
     models: active.models.map((m) => ({ ...m, downloading: downloadActive })),
     engines: {
@@ -357,22 +392,22 @@ export function getModelsStatus(auraRoot: string, auraDataDir: string) {
         models: kokoro.models,
         voices: kokoro.voices,
         label: "Kokoro",
-        description: isKokoroMlxPlatform()
+        description: kokoroBackend === "mlx"
           ? "Rápido no Apple Silicon (MLX bf16)."
-          : "Rápido e leve (ONNX) — ideal em AMD/CPU.",
+          : "Qualidade máxima (ONNX fp32) com Core ML/CPU.",
       },
     },
     downloading: downloadActive,
     backend:
       engine === "kokoro"
-        ? kokoroBackendId()
+        ? kokoroBackend
         : isTorchTtsPlatform()
           ? "torch"
           : "mlx",
     platform: process.platform,
     gpu,
     voices: active.voices,
-    kokoroAccel: probeKokoroAccel(auraRoot, kokoroDevice),
+    kokoroAccel: probeKokoroAccel(auraRoot, kokoroDevice, kokoroBackend),
   };
 }
 
@@ -512,6 +547,10 @@ export async function downloadMissingModels(options: {
   }
 
   const engine = options.engine ?? readTtsEngine(options.auraDataDir);
+  const kokoroBackend = kokoroBackendId(
+    process.platform,
+    readKokoroBackend(options.auraDataDir)
+  );
   const modelsDir = resolveModelsDir(options.auraRoot, options.auraDataDir, engine);
   fs.mkdirSync(modelsDir, { recursive: true });
 
@@ -540,7 +579,7 @@ export async function downloadMissingModels(options: {
         engine,
         backend:
           engine === "kokoro"
-            ? kokoroBackendId()
+            ? kokoroBackend
             : isTorchTtsPlatform()
               ? "torch"
               : "mlx",
@@ -552,11 +591,12 @@ export async function downloadMissingModels(options: {
     await ensureEngineRuntime({
       auraRoot: options.auraRoot,
       engine,
+      kokoroBackend,
       signal: abort.signal,
       onEvent: (evt) => emit(evt, true),
     });
 
-    for (const spec of getRequiredModels(engine)) {
+    for (const spec of getRequiredModels(engine, process.platform, kokoroBackend)) {
       if (abort.signal.aborted) throw new Error("Download cancelado.");
 
       const localDir = modelSpecLocalDir(modelsDir, spec);
@@ -846,8 +886,12 @@ export function deleteModels(
     throw new Error("Cancele o download antes de excluir modelos.");
   }
   const active = engine ?? readTtsEngine(auraDataDir);
+  const kokoroBackend = kokoroBackendId(
+    process.platform,
+    readKokoroBackend(auraDataDir)
+  );
   const modelsDir = resolveModelsDir(auraRoot, auraDataDir, active);
-  const all = getRequiredModels(active);
+  const all = getRequiredModels(active, process.platform, kokoroBackend);
   const targets = ids && ids.length ? all.filter((m) => ids.includes(m.id)) : all;
 
   const deleted: string[] = [];

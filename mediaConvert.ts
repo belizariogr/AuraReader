@@ -231,7 +231,7 @@ export async function mp3ToM4b(opts: {
     args.push("-map", `${i + 1}:v`);
   }
 
-  args.push("-c:a", "aac", "-b:a", "128k");
+  args.push("-c:a", "aac", "-b:a", "192k");
   if (artworks.length > 0) {
     args.push("-c:v", "mjpeg");
   }
@@ -269,7 +269,7 @@ export async function m4bToMp3AndCover(opts: {
   const totalSec = await probeDurationSeconds(opts.m4bPath);
 
   await runFfmpeg(
-    ["-i", opts.m4bPath, "-vn", "-c:a", "libmp3lame", "-b:a", "128k", mp3Path],
+    ["-i", opts.m4bPath, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", mp3Path],
     { totalSec, onProgress: opts.onProgress, signal: opts.signal }
   );
 

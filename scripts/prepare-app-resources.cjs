@@ -233,23 +233,39 @@ function prepareDarwin() {
   console.log("[prepare-app-resources] Copying site-packages...");
   copyFiltered(siteSrc, path.join(qwenDst, "site-packages"));
 
-  // Kokoro on macOS shares the MLX stack — ship only the MLX server script (no ONNX).
+  // Ship both Kokoro backends: MLX plus full-quality ONNX/Core ML.
   mustExist(path.join(kokoroSrc, "tts_server_mlx.py"), "tts/kokoro/tts_server_mlx.py");
+  mustExist(path.join(kokoroSrc, "tts_server.py"), "tts/kokoro/tts_server.py");
   if (!fs.existsSync(path.join(siteSrc, "misaki"))) {
     throw new Error(
       "[prepare-app-resources] misaki missing from MLX site-packages. " +
         "Install deps: cd qwen3-tts-apple-silicon && .venv/bin/pip install -r requirements.txt"
     );
   }
+  const kokoroOnnxSiteSrc = path.join(
+    kokoroSrc,
+    ".venv",
+    "lib",
+    "python3.12",
+    "site-packages"
+  );
+  mustExist(
+    kokoroOnnxSiteSrc,
+    "Kokoro ONNX site-packages (run: bun run setup:tts:kokoro)"
+  );
   const kokoroDst = path.join(out, "tts", "kokoro");
   fs.mkdirSync(kokoroDst, { recursive: true });
-  for (const file of ["tts_server_mlx.py", "README.md"]) {
+  for (const file of [
+    "tts_server_mlx.py",
+    "tts_server.py",
+    "requirements.txt",
+    "README.md",
+  ]) {
     const src = path.join(kokoroSrc, file);
     if (fs.existsSync(src)) fs.copyFileSync(src, path.join(kokoroDst, file));
   }
-  console.log(
-    "[prepare-app-resources] Bundled Kokoro MLX server only (no onnxruntime / kokoro_onnx)"
-  );
+  copyFiltered(kokoroOnnxSiteSrc, path.join(kokoroDst, "site-packages"));
+  console.log("[prepare-app-resources] Bundled Kokoro MLX + ONNX/Core ML runtimes");
 
   const pyBin = path.join(frameworkDst, "Versions", "3.12", "bin", "python3.12");
   mustExist(pyBin, "bundled python3.12");
@@ -262,6 +278,22 @@ function prepareDarwin() {
           ...process.env,
           PYTHONHOME: path.join(frameworkDst, "Versions", "3.12"),
           PYTHONPATH: path.join(qwenDst, "site-packages"),
+          PYTHONNOUSERSITE: "1",
+        },
+        stdio: "inherit",
+      }
+    );
+    execFileSync(
+      pyBin,
+      [
+        "-c",
+        "import fastapi, uvicorn, onnxruntime as ort, kokoro_onnx; print('ok', ort.get_available_providers())",
+      ],
+      {
+        env: {
+          ...process.env,
+          PYTHONHOME: path.join(frameworkDst, "Versions", "3.12"),
+          PYTHONPATH: path.join(kokoroDst, "site-packages"),
           PYTHONNOUSERSITE: "1",
         },
         stdio: "inherit",

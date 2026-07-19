@@ -5,7 +5,11 @@
 import { spawn, type ChildProcess } from "child_process";
 import fs from "fs";
 import path from "path";
-import type { TtsEngineId } from "./ttsEngine";
+import {
+  defaultKokoroBackend,
+  type KokoroBackendId,
+  type TtsEngineId,
+} from "./ttsEngine";
 
 export type RuntimeProgressEvent = Record<string, unknown>;
 
@@ -43,10 +47,11 @@ function hasMisakiMarker(auraRoot: string): boolean {
 
 export function isKokoroRuntimeReady(
   auraRoot: string,
-  platform = process.platform
+  platform = process.platform,
+  backend: KokoroBackendId = defaultKokoroBackend(platform)
 ): boolean {
   const ttsDir = path.join(auraRoot, "tts", "kokoro");
-  if (platform === "darwin") {
+  if (backend === "mlx" && platform === "darwin") {
     if (!fs.existsSync(path.join(ttsDir, "tts_server_mlx.py"))) return false;
     // Shared MLX stack with Qwen; misaki is required for Kokoro G2P.
     return isQwenMlxRuntimeReady(auraRoot) && hasMisakiMarker(auraRoot);
@@ -79,9 +84,12 @@ export function isQwenMlxRuntimeReady(auraRoot: string): boolean {
 export function isEngineRuntimeReady(
   auraRoot: string,
   engine: TtsEngineId,
-  platform = process.platform
+  platform = process.platform,
+  kokoroBackend: KokoroBackendId = defaultKokoroBackend(platform)
 ): boolean {
-  if (engine === "kokoro") return isKokoroRuntimeReady(auraRoot, platform);
+  if (engine === "kokoro") {
+    return isKokoroRuntimeReady(auraRoot, platform, kokoroBackend);
+  }
   if (platform === "win32" || platform === "linux") {
     return isQwenTorchRuntimeReady(auraRoot);
   }
@@ -394,12 +402,15 @@ async function ensureMlxRuntime(options: {
 export async function ensureEngineRuntime(options: {
   auraRoot: string;
   engine: TtsEngineId;
+  kokoroBackend?: KokoroBackendId;
   onEvent: (evt: RuntimeProgressEvent) => void;
   signal?: AbortSignal;
 }): Promise<void> {
   const { auraRoot, engine, onEvent, signal } = options;
+  const kokoroBackend =
+    options.kokoroBackend ?? defaultKokoroBackend(process.platform);
 
-  if (isEngineRuntimeReady(auraRoot, engine)) {
+  if (isEngineRuntimeReady(auraRoot, engine, process.platform, kokoroBackend)) {
     onEvent({
       type: "runtime_skip",
       engine,
@@ -410,10 +421,9 @@ export async function ensureEngineRuntime(options: {
   }
 
   if (engine === "kokoro") {
-    // macOS: reuse the shared MLX venv (mlx-audio + misaki); no ONNX install.
-    if (process.platform === "darwin") {
+    if (kokoroBackend === "mlx" && process.platform === "darwin") {
       await ensureMlxRuntime({ auraRoot, onEvent, signal });
-      if (!isKokoroRuntimeReady(auraRoot)) {
+      if (!isKokoroRuntimeReady(auraRoot, process.platform, kokoroBackend)) {
         throw new Error(
           "Runtime Kokoro (MLX) ainda incompleto após a preparação. " +
             "Confirme misaki[en] em qwen3-tts-apple-silicon/requirements.txt."
@@ -436,7 +446,7 @@ export async function ensureEngineRuntime(options: {
       onEvent,
       signal,
     });
-    if (!isKokoroRuntimeReady(auraRoot)) {
+    if (!isKokoroRuntimeReady(auraRoot, process.platform, kokoroBackend)) {
       throw new Error("Runtime Kokoro ainda incompleto após a preparação.");
     }
     return;

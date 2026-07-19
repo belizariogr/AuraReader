@@ -422,6 +422,7 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
   const [voices, setVoices] = useState<Voice[]>(FALLBACK_QWEN_VOICES);
   const [ttsEngine, setTtsEngine] = useState<"qwen3" | "kokoro">("qwen3");
   const [kokoroDevice, setKokoroDevice] = useState<"cpu" | "gpu">("gpu");
+  const [kokoroBackend, setKokoroBackend] = useState<"mlx" | "onnx">("mlx");
   const [selectedVoice, setSelectedVoice] = useState<string>("Vivian");
 
   const completedDocs = documents.filter((d) => d.audioUrl);
@@ -447,6 +448,9 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
         setTtsEngine(engine);
         if (body.kokoroDevice === "cpu" || body.kokoroDevice === "gpu") {
           setKokoroDevice(body.kokoroDevice);
+        }
+        if (body.kokoroBackend === "mlx" || body.kokoroBackend === "onnx") {
+          setKokoroBackend(body.kokoroBackend);
         }
         setVoices(list);
         setSelectedVoice((prev) => {
@@ -2192,7 +2196,9 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
             className="text-xs font-mono text-slate-300 bg-white/5 border border-white/10 px-3 py-1.5 rounded-full hover:bg-white/10 hover:text-white hover:border-white/20 transition-colors"
           >
             {ttsEngine === "kokoro"
-              ? `Kokoro · ${kokoroDevice === "gpu" ? "MLX" : "CPU"}`
+              ? `Kokoro · ${kokoroBackend === "mlx" ? "MLX" : "ONNX fp32"} · ${
+                  kokoroDevice === "gpu" ? "GPU" : "CPU"
+                }`
               : "Qwen3 TTS · local"}
           </button>
         </div>
@@ -2774,7 +2780,9 @@ export default function App({ onManageModels }: { onManageModels?: () => void })
                   </h2>
                   <p className="text-xs text-slate-400 mb-4">
                     {ttsEngine === "kokoro"
-                      ? `Kokoro (${kokoroDevice === "gpu" ? "MLX" : "CPU"}). Escolha a voz neural para a narração.`
+                      ? `Kokoro (${kokoroBackend === "mlx" ? "MLX" : "ONNX fp32"} · ${
+                          kokoroDevice === "gpu" ? "GPU" : "CPU"
+                        }). Escolha a voz neural para a narração.`
                       : "Motor Qwen3. A prévia em cache mantém o mesmo tom em toda a narração."}
                   </p>
 

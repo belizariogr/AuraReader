@@ -22,6 +22,7 @@ type ModelInfo = {
 
 type EngineId = "qwen3" | "kokoro";
 type KokoroDeviceId = "cpu" | "gpu";
+type KokoroBackendId = "mlx" | "onnx";
 
 type GpuInfo = {
   supported: boolean;
@@ -132,7 +133,9 @@ export default function ModelSetup({
   engine: engineProp = "qwen3",
   engines: enginesProp,
   kokoroDevice: kokoroDeviceProp = "gpu",
+  kokoroBackend: kokoroBackendProp = "mlx",
   kokoroAccel: kokoroAccelProp,
+  platform,
   runtimeReady: runtimeReadyProp = true,
   onComplete,
   onStatusChange,
@@ -144,7 +147,9 @@ export default function ModelSetup({
   engine?: EngineId;
   engines?: { qwen3: EngineInfo; kokoro: EngineInfo };
   kokoroDevice?: KokoroDeviceId;
+  kokoroBackend?: KokoroBackendId;
   kokoroAccel?: KokoroAccelInfo | null;
+  platform?: string;
   runtimeReady?: boolean;
   onComplete: () => void;
   onStatusChange?: (
@@ -156,6 +161,7 @@ export default function ModelSetup({
       engine?: EngineId;
       engines?: { qwen3: EngineInfo; kokoro: EngineInfo };
       kokoroDevice?: KokoroDeviceId;
+      kokoroBackend?: KokoroBackendId;
       kokoroAccel?: KokoroAccelInfo | null;
       ready?: boolean;
       modelsReady?: boolean;
@@ -172,6 +178,8 @@ export default function ModelSetup({
   const [engine, setEngine] = useState<EngineId>(engineProp);
   const [engines, setEngines] = useState(enginesProp);
   const [kokoroDevice, setKokoroDevice] = useState<KokoroDeviceId>(kokoroDeviceProp);
+  const [kokoroBackend, setKokoroBackend] =
+    useState<KokoroBackendId>(kokoroBackendProp);
   const [kokoroAccel, setKokoroAccel] = useState<KokoroAccelInfo | null | undefined>(
     kokoroAccelProp
   );
@@ -207,6 +215,10 @@ export default function ModelSetup({
   }, [kokoroDeviceProp]);
 
   useEffect(() => {
+    setKokoroBackend(kokoroBackendProp);
+  }, [kokoroBackendProp]);
+
+  useEffect(() => {
     setKokoroAccel(kokoroAccelProp);
   }, [kokoroAccelProp]);
 
@@ -228,11 +240,7 @@ export default function ModelSetup({
 
   const showGpu = Boolean(gpu?.supported) && engine === "qwen3";
   const isTorch = backend === "torch" || (showGpu && engine === "qwen3");
-  const kokoroIsMlx =
-    engine === "kokoro" &&
-    (backend === "mlx" ||
-      (kokoroAccel?.availableProviders?.length === 1 &&
-        kokoroAccel.availableProviders[0] === "MLX"));
+  const kokoroIsMlx = engine === "kokoro" && kokoroBackend === "mlx";
   const badge = vendorBadge(gpu?.primary ?? null);
   const accelMismatch =
     showGpu &&
@@ -252,6 +260,7 @@ export default function ModelSetup({
         engine: body.engine,
         engines: body.engines,
         kokoroDevice: body.kokoroDevice,
+        kokoroBackend: body.kokoroBackend,
         kokoroAccel: body.kokoroAccel ?? null,
         ready: body.ready,
         modelsReady: body.modelsReady,
@@ -265,6 +274,9 @@ export default function ModelSetup({
     if (typeof body.runtimeReady === "boolean") setRuntimeReady(body.runtimeReady);
     if (body.kokoroDevice === "cpu" || body.kokoroDevice === "gpu") {
       setKokoroDevice(body.kokoroDevice);
+    }
+    if (body.kokoroBackend === "mlx" || body.kokoroBackend === "onnx") {
+      setKokoroBackend(body.kokoroBackend);
     }
     if (body.kokoroAccel) setKokoroAccel(body.kokoroAccel);
     return body;
@@ -310,12 +322,35 @@ export default function ModelSetup({
       if (body.kokoroAccel) setKokoroAccel(body.kokoroAccel);
       onStatusChange?.(localModels, localDir, {
         gpu: gpu ?? null,
-        backend,
+        backend: kokoroBackend,
         engine,
         engines,
         kokoroDevice: next,
+        kokoroBackend,
         kokoroAccel: body.kokoroAccel ?? null,
       });
+    } catch (err: any) {
+      setError(err?.message || String(err));
+    } finally {
+      setSwitching(false);
+    }
+  }
+
+  async function selectKokoroBackend(next: KokoroBackendId) {
+    if (next === kokoroBackend || downloading || switching) return;
+    setSwitching(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/tts-engine", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kokoroBackend: next }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+      setKokoroBackend(next);
+      await refreshStatus();
+      setProgress(emptyProgress());
     } catch (err: any) {
       setError(err?.message || String(err));
     } finally {
@@ -630,9 +665,9 @@ export default function ModelSetup({
                   title: engines?.kokoro?.label || "Kokoro",
                   desc:
                     engines?.kokoro?.description ||
-                    (backend === "mlx"
+                    (kokoroBackend === "mlx"
                       ? "Rápido no Apple Silicon (MLX bf16)."
-                      : "Rápido e leve (ONNX) — ideal em AMD/CPU."),
+                      : "Qualidade máxima (ONNX fp32) com Core ML/CPU."),
                   ready: engines?.kokoro?.ready,
                 },
               ] as const
@@ -669,6 +704,53 @@ export default function ModelSetup({
 
           {engine === "kokoro" && (
             <div className="mb-6 rounded-2xl border border-white/10 bg-slate-900/50 p-4 space-y-3">
+              {platform === "darwin" && (
+                <>
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="w-3.5 h-3.5 text-slate-400" />
+                    <span className="text-xs text-slate-300 font-medium">
+                      Versão do Kokoro
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {(
+                      [
+                        {
+                          id: "mlx" as const,
+                          title: "MLX",
+                          desc: "bf16 otimizado para Apple Silicon",
+                        },
+                        {
+                          id: "onnx" as const,
+                          title: "Não MLX",
+                          desc: "ONNX fp32 — modelo de maior qualidade",
+                        },
+                      ] as const
+                    ).map((opt) => {
+                      const selected = kokoroBackend === opt.id;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          disabled={downloading || switching}
+                          onClick={() => selectKokoroBackend(opt.id)}
+                          className={`text-left rounded-xl border px-3 py-2.5 transition-colors disabled:opacity-50 ${
+                            selected
+                              ? "border-blue-400/45 bg-blue-500/10"
+                              : "border-white/10 bg-slate-950/40 hover:bg-white/5"
+                          }`}
+                        >
+                          <span className="text-sm font-semibold text-white">{opt.title}</span>
+                          <p className="text-[11px] text-slate-400 leading-snug mt-0.5">
+                            {opt.desc}
+                          </p>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="border-t border-white/10" />
+                </>
+              )}
               <div className="flex items-center gap-2">
                 <Cpu className="w-3.5 h-3.5 text-slate-400" />
                 <span className="text-xs text-slate-300 font-medium">Aceleração Kokoro</span>
@@ -730,7 +812,10 @@ export default function ModelSetup({
                         {
                           id: "gpu" as const,
                           title: "GPU",
-                          desc: "MIGraphX / CUDA / DirectML quando disponível",
+                          desc:
+                            platform === "darwin"
+                              ? "Core ML quando disponível"
+                              : "MIGraphX / CUDA / DirectML quando disponível",
                         },
                         {
                           id: "cpu" as const,
@@ -759,8 +844,11 @@ export default function ModelSetup({
                     })}
                   </div>
                   <p className="text-[11px] text-slate-500 leading-relaxed">
-                    Em AMD, GPU exige o pacote de sistema <span className="font-mono">migraphx</span>.
-                    Sem ele, o Kokoro cai automaticamente para CPU.
+                    {platform === "darwin" ? (
+                      <>A versão Não MLX usa o modelo Kokoro v1.0 fp32 completo e cai para CPU se o Core ML não estiver disponível.</>
+                    ) : (
+                      <>Em AMD, GPU exige o pacote de sistema <span className="font-mono">migraphx</span>. Sem ele, o Kokoro cai automaticamente para CPU.</>
+                    )}
                   </p>
                   {kokoroDevice === "gpu" && kokoroAccel && !kokoroAccel.gpuReady && (
                     <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100 leading-relaxed">
@@ -768,7 +856,9 @@ export default function ModelSetup({
                       <p>{kokoroAccel.hint || "Dependências de GPU não estão prontas."}</p>
                     </div>
                   )}
-                  {kokoroDevice === "gpu" && kokoroAccel?.gpuReady && (
+                  {platform !== "darwin" &&
+                    kokoroDevice === "gpu" &&
+                    kokoroAccel?.gpuReady && (
                     <div className="space-y-2">
                       <p className="text-[11px] text-emerald-300/90 leading-relaxed">
                         Runtime GPU pronto (
@@ -812,7 +902,7 @@ export default function ModelSetup({
                         </div>
                       )}
                     </div>
-                  )}
+                    )}
                 </>
               )}
             </div>
@@ -1025,7 +1115,9 @@ export default function ModelSetup({
           <p className="text-center text-[11px] text-slate-500 mt-4">
             Na instalação o app prepara o runtime Python e baixa os pesos (precisa de internet).
             {engine === "kokoro"
-              ? " Kokoro usa ONNX — rápido mesmo sem CUDA/ROCm."
+              ? kokoroIsMlx
+                ? " Kokoro usa MLX no Apple Silicon."
+                : " Kokoro usa o modelo ONNX fp32 completo."
               : isTorch
                 ? " Windows/Linux: o setup escolhe CUDA (NVIDIA), ROCm (AMD) ou CPU automaticamente."
                 : " Apple Silicon recomendado."}

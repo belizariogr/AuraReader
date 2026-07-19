@@ -161,8 +161,17 @@ def unload_model() -> bool:
 
 def float_to_pcm16_b64(audio: np.ndarray) -> str:
     audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-    audio = np.clip(audio, -1.0, 1.0)
-    pcm = (audio * 32767.0).astype(np.int16)
+    # Kokoro's iSTFT vocoder can emit peaks above full-scale. Hard-clipping them
+    # flat-tops the waveform and produces harsh distortion ("estouro"). Instead we
+    # only attenuate when the signal overshoots, leaving a hair of headroom. Gain
+    # is never boosted, so loudness stays consistent across separately synthesized
+    # chunks of the same book.
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak > 1.0:
+        audio = audio * (0.99 / peak)
+    else:
+        audio = np.clip(audio, -1.0, 1.0)
+    pcm = np.round(audio * 32767.0).astype(np.int16)
     return base64.b64encode(pcm.tobytes()).decode("ascii")
 
 

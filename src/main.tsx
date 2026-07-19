@@ -39,6 +39,7 @@ type ModelsStatus = {
   modelsDir: string;
   engine?: EngineId;
   kokoroDevice?: "cpu" | "gpu";
+  kokoroBackend?: "mlx" | "onnx";
   kokoroAccel?: {
     requested: "cpu" | "gpu";
     effective: "gpu" | "cpu";
@@ -47,6 +48,7 @@ type ModelsStatus = {
     hint: string | null;
   };
   backend?: "torch" | "mlx" | "onnx";
+  platform?: string;
   gpu?: GpuInfo;
   engines?: {
     qwen3: EngineInfo;
@@ -132,7 +134,11 @@ function Root() {
         engine={status.engine || "qwen3"}
         engines={status.engines}
         kokoroDevice={status.kokoroDevice || "gpu"}
+        kokoroBackend={
+          status.kokoroBackend || (status.platform === "darwin" ? "mlx" : "onnx")
+        }
         kokoroAccel={status.kokoroAccel}
+        platform={status.platform}
         runtimeReady={status.runtimeReady !== false}
         onStatusChange={(models, modelsDir, extra) => {
           setStatus((s) =>
@@ -158,6 +164,9 @@ function Root() {
                   ...(extra?.engine ? { engine: extra.engine } : {}),
                   ...(extra?.engines ? { engines: extra.engines } : {}),
                   ...(extra?.kokoroDevice ? { kokoroDevice: extra.kokoroDevice } : {}),
+                  ...(extra?.kokoroBackend
+                    ? { kokoroBackend: extra.kokoroBackend }
+                    : {}),
                   ...(extra?.kokoroAccel !== undefined
                     ? { kokoroAccel: extra.kokoroAccel ?? undefined }
                     : {}),

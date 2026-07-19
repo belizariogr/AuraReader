@@ -5,7 +5,11 @@
 import { execFileSync } from "child_process";
 import fs from "fs";
 import path from "path";
-import type { KokoroDeviceId } from "./ttsEngine";
+import {
+  defaultKokoroBackend,
+  type KokoroBackendId,
+  type KokoroDeviceId,
+} from "./ttsEngine";
 
 export type KokoroAccelProbe = {
   requested: KokoroDeviceId;
@@ -178,20 +182,23 @@ export function kokoroGpuLibraryPath(): string {
 
 export function probeKokoroAccel(
   auraRoot: string,
-  requested: KokoroDeviceId
+  requested: KokoroDeviceId,
+  backend: KokoroBackendId = defaultKokoroBackend()
 ): KokoroAccelProbe {
   if (requested === "cpu") {
     return {
       requested,
       effective: "cpu",
       gpuReady: false,
-      availableProviders: process.platform === "darwin" ? ["MLX"] : [],
+      availableProviders:
+        process.platform === "darwin" && backend === "mlx"
+          ? ["MLX"]
+          : listOrtProviders(auraRoot),
       hint: null,
     };
   }
 
-  // Apple Silicon: MLX / Metal (no ONNX in the macOS bundle).
-  if (process.platform === "darwin") {
+  if (process.platform === "darwin" && backend === "mlx") {
     const ready = probeMlxReady(auraRoot);
     return {
       requested,
@@ -219,7 +226,9 @@ export function probeKokoroAccel(
       gpuReady: false,
       availableProviders: providers,
       hint:
-        "O runtime ONNX do Kokoro foi instalado só com CPU. Rode: bun run setup:tts:kokoro -- --force --accel=rocm (AMD) ou --accel=cuda (NVIDIA).",
+        process.platform === "darwin"
+          ? "O Core ML não está disponível neste runtime ONNX; o Kokoro usará CPU."
+          : "O runtime ONNX do Kokoro foi instalado só com CPU. Rode: bun run setup:tts:kokoro -- --force --accel=rocm (AMD) ou --accel=cuda (NVIDIA).",
     };
   }
 
