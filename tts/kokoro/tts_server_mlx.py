@@ -164,17 +164,15 @@ def float_to_pcm16_b64(audio: np.ndarray) -> str:
     if not audio.size:
         return ""
 
-    # Prevent invalid model output from wrapping or producing conversion warnings.
     audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # Kokoro's iSTFT vocoder can emit peaks above full-scale. Attenuating the
-    # complete signal preserves the waveform, unlike hard clipping, while never
-    # boosting quieter chunks. Use the full PCM16 range without extra attenuation.
+    # Apply the same fixed -1 dB gain to every chunk, reserving codec headroom
+    # without changing relative chunk loudness. Only attenuate further if the
+    # vocoder overshoots after that gain; never hard-clip the waveform.
+    audio *= np.float32(10.0 ** (-1.0 / 20.0))
     peak = float(np.max(np.abs(audio)))
     if peak > 1.0:
-        audio *= 1.0 / peak
+        audio *= np.float32(0.999 / peak)
 
-    # Symmetric scaling avoids introducing a DC bias and preserves silence.
     pcm = np.rint(audio * 32767.0).astype(np.int16)
     return base64.b64encode(pcm.tobytes()).decode("ascii")
 

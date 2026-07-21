@@ -2,12 +2,10 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import os from "os";
-import { once } from "events";
 import { createHash } from "crypto";
 import { spawn, type ChildProcess } from "child_process";
 import multer from "multer";
 import dotenv from "dotenv";
-import { Mp3Encoder } from "./lamejsBridge";
 import { PDFDocument } from "pdf-lib";
 // @ts-ignore
 import { EPub } from "epub2";
@@ -45,6 +43,8 @@ import {
   ensureFfmpeg,
   m4bToMp3AndCover,
   mp3ToM4b,
+  pcmToM4b,
+  pcmToMp3,
 } from "./mediaConvert";
 
 /** Packaged app root (Resources/aura) or project cwd. */
@@ -919,6 +919,13 @@ async function synthesizeWithTts(
   };
 
   const cancelled = !!body.cancelled;
+  const sampleRate = Number(body.sampleRate || 24000);
+  if (body.format && body.format !== "pcm_s16le") {
+    throw new Error(`Formato de áudio TTS inesperado: ${body.format}.`);
+  }
+  if (!Number.isInteger(sampleRate) || sampleRate < 8000 || sampleRate > 192000) {
+    throw new Error(`Sample rate TTS inválido: ${body.sampleRate}.`);
+  }
   if (body.voice && body.voice.toLowerCase() !== voice.toLowerCase().replace(/\s+/g, "_")) {
     console.warn(
       `[TTS] Voice mismatch: requested=${voice} resolved=${body.voice}`
@@ -927,15 +934,19 @@ async function synthesizeWithTts(
   if (!body.audioData) {
     return {
       pcm: Buffer.alloc(0),
-      sampleRate: body.sampleRate || 24000,
+      sampleRate,
       cancelled,
       icl: !!body.icl,
     };
   }
 
+  const pcm = Buffer.from(body.audioData, "base64");
+  if (pcm.length % 2 !== 0) {
+    throw new Error(`PCM16 TTS inválido: ${pcm.length} bytes.`);
+  }
   return {
-    pcm: Buffer.from(body.audioData, "base64"),
-    sampleRate: body.sampleRate || 24000,
+    pcm,
+    sampleRate,
     cancelled,
     icl: !!body.icl,
   };
@@ -1214,28 +1225,6 @@ function splitTextIntoChunks(text: string, maxChunkLength = 240): string[] {
   return chunks;
 }
 
-// Helper: Convert PCM samples to MP3 using lamejs (small clips / voice previews)
-function encodePcmToMp3(samples: Int16Array, sampleRate = 24000, kbps = 128): Buffer {
-  const mp3encoder = new Mp3Encoder(1, sampleRate, kbps);
-  const mp3Data: Buffer[] = [];
-
-  const sampleBlockSize = 1152;
-  for (let i = 0; i < samples.length; i += sampleBlockSize) {
-    const sampleChunk = samples.subarray(i, i + sampleBlockSize);
-    const mp3buf = mp3encoder.encodeBuffer(sampleChunk);
-    if (mp3buf.length > 0) {
-      mp3Data.push(Buffer.from(mp3buf));
-    }
-  }
-
-  const mp3buf = mp3encoder.flush();
-  if (mp3buf.length > 0) {
-    mp3Data.push(Buffer.from(mp3buf));
-  }
-
-  return Buffer.concat(mp3Data);
-}
-
 type NarrationArtifact = {
   /** Primary audio file (mp3 or m4b). */
   mp3Path: string;
@@ -1379,26 +1368,98 @@ async function saveChunkPcm(
   return meta;
 }
 
+/**
+ * Fade only discontinuous endpoints to zero over a few milliseconds. This
+ * removes clicks without overlapping independently synthesized phonemes.
+ */
+function declickPcmBoundary(previous: Buffer, next: Buffer, sampleRate: number): void {
+  if (previous.length < 2 || next.length < 2) return;
+  const previousEnd = previous.readInt16LE(previous.length - 2);
+  const nextStart = next.readInt16LE(0);
+  if (Math.abs(previousEnd - nextStart) < 64) return;
+
+  const fadeSamples = Math.max(1, Math.round(sampleRate * 0.005));
+  const previousSamples = Math.floor(previous.length / 2);
+  const nextSamples = Math.floor(next.length / 2);
+  const tailCount = Math.min(fadeSamples, previousSamples);
+  const headCount = Math.min(fadeSamples, nextSamples);
+
+  for (let i = 0; i < tailCount; i++) {
+    const sampleIndex = previousSamples - tailCount + i;
+    const gain = (tailCount - i - 1) / tailCount;
+    previous.writeInt16LE(Math.round(previous.readInt16LE(sampleIndex * 2) * gain), sampleIndex * 2);
+  }
+  for (let i = 0; i < headCount; i++) {
+    const gain = (i + 1) / headCount;
+    next.writeInt16LE(Math.round(next.readInt16LE(i * 2) * gain), i * 2);
+  }
+}
+
+async function appendPcmWithDeclick(
+  outPath: string,
+  pcm: Buffer,
+  sampleRate: number
+): Promise<void> {
+  if (pcm.length === 0) return;
+  let file: fs.promises.FileHandle;
+  try {
+    file = await fs.promises.open(outPath, "r+");
+  } catch (err: any) {
+    if (err?.code === "ENOENT") {
+      await fs.promises.writeFile(outPath, pcm);
+      return;
+    }
+    throw err;
+  }
+
+  try {
+    const stat = await file.stat();
+    if (stat.size >= 2) {
+      const fadeBytes = Math.min(
+        stat.size - (stat.size % 2),
+        Math.max(2, Math.round(sampleRate * 0.005) * 2)
+      );
+      const tail = Buffer.alloc(fadeBytes);
+      await file.read(tail, 0, fadeBytes, stat.size - fadeBytes);
+      declickPcmBoundary(tail, pcm, sampleRate);
+      await file.write(tail, 0, fadeBytes, stat.size - fadeBytes);
+    }
+  } finally {
+    await file.close();
+  }
+  await fs.promises.appendFile(outPath, pcm);
+}
+
 async function concatCachedChunksToPcm(
   docId: string,
   totalChunks: number,
-  outPath: string
+  outPath: string,
+  sampleRate: number
 ): Promise<{ bytes: number; parts: number }> {
   const out = await fs.promises.open(outPath, "w");
   let bytes = 0;
   let parts = 0;
+  let pending: Buffer | null = null;
   try {
     for (let i = 0; i < totalChunks; i++) {
       const chunkPath = chunkPcmPath(docId, i);
       try {
         const pcm = await fs.promises.readFile(chunkPath);
         if (pcm.length === 0) continue;
-        await out.write(pcm);
-        bytes += pcm.length;
+        if (pending) {
+          declickPcmBoundary(pending, pcm, sampleRate);
+          await out.write(pending);
+          bytes += pending.length;
+        }
+        pending = pcm;
         parts += 1;
       } catch {
         throw new Error(`Bloco ${i + 1} ausente no cache de narração.`);
       }
+    }
+    if (pending) {
+      await out.write(pending);
+      bytes += pending.length;
     }
   } finally {
     await out.close();
@@ -1425,67 +1486,6 @@ async function chunkCacheStatus(docId: string): Promise<{
     voice: meta.voice,
     engine: meta.engine,
   };
-}
-
-/** Stream-encode a PCM s16le file to MP3 on disk (avoids holding the whole book in RAM). */
-async function encodePcmFileToMp3File(
-  pcmPath: string,
-  mp3Path: string,
-  sampleRate = 24000,
-  kbps = 128,
-  onProgress?: (percent: number) => void
-): Promise<number> {
-  const mp3encoder = new Mp3Encoder(1, sampleRate, kbps);
-  const out = fs.createWriteStream(mp3Path);
-  const sampleBlockSize = 1152;
-  const bytesPerBlock = sampleBlockSize * 2;
-  const fd = await fs.promises.open(pcmPath, "r");
-  let written = 0;
-  let lastEmit = 0;
-  try {
-    const buf = Buffer.alloc(bytesPerBlock);
-    let position = 0;
-    const stat = await fd.stat();
-    const total = Math.max(1, stat.size);
-    while (position < stat.size) {
-      const { bytesRead } = await fd.read(buf, 0, bytesPerBlock, position);
-      if (bytesRead <= 0) break;
-      position += bytesRead;
-      const usable = bytesRead - (bytesRead % 2);
-      if (usable <= 0) continue;
-      const samples = new Int16Array(usable / 2);
-      for (let i = 0; i < samples.length; i++) {
-        samples[i] = buf.readInt16LE(i * 2);
-      }
-      const mp3buf = mp3encoder.encodeBuffer(samples);
-      if (mp3buf.length > 0) {
-        const chunk = Buffer.from(mp3buf);
-        written += chunk.length;
-        if (!out.write(chunk)) await once(out, "drain");
-      }
-      if (onProgress) {
-        const now = Date.now();
-        if (now - lastEmit >= 150 || position >= stat.size) {
-          lastEmit = now;
-          onProgress(Math.min(99, Math.round((position / total) * 100)));
-        }
-      }
-    }
-    const flush = mp3encoder.flush();
-    if (flush.length > 0) {
-      const chunk = Buffer.from(flush);
-      written += chunk.length;
-      if (!out.write(chunk)) await once(out, "drain");
-    }
-    onProgress?.(100);
-  } finally {
-    await fd.close();
-    await new Promise<void>((resolve, reject) => {
-      out.end(() => resolve());
-      out.on("error", reject);
-    });
-  }
-  return written;
 }
 
 async function cleanupNarrationArtifact(id: string) {
@@ -2659,7 +2659,7 @@ app.post("/api/narrate-stream", async (req, res) => {
         completedSet.add(i);
       } else if (pcm.length > 0 && !docId) {
         // Fallback without doc UUID: append to ephemeral PCM (no resume)
-        await fs.promises.appendFile(pcmPath, pcm);
+        await appendPcmWithDeclick(pcmPath, pcm, sampleRate);
         completedSet.add(i);
       }
     }
@@ -2712,7 +2712,7 @@ app.post("/api/narrate-stream", async (req, res) => {
     let pcmBytes = 0;
     let pcmParts = completedCount;
     if (docId) {
-      const concat = await concatCachedChunksToPcm(docId, totalChunks, pcmPath);
+      const concat = await concatCachedChunksToPcm(docId, totalChunks, pcmPath, sampleRate);
       pcmBytes = concat.bytes;
       pcmParts = concat.parts;
       if (cacheMeta) {
@@ -2736,29 +2736,6 @@ app.post("/api/narrate-stream", async (req, res) => {
       });
       return res.end();
     }
-
-    const mp3Bytes = await encodePcmFileToMp3File(
-      pcmPath,
-      mp3Path,
-      sampleRate,
-      192,
-      (percent) => {
-        sendEvent({
-          type: "status",
-          step: "encoding",
-          current: pcmParts,
-          total: totalChunks,
-          percent: outputFormat === "m4b" ? Math.round(percent * 0.7) : percent,
-          message:
-            outputFormat === "m4b"
-              ? `Codificando MP3… ${percent}%`
-              : `Codificando MP3… ${percent}%`,
-        });
-      }
-    );
-    console.log(
-      `[NarrateStream] Encoded MP3 ${mp3Bytes} bytes from ${pcmBytes} PCM bytes (${pcmParts} parts)`
-    );
 
     const bookStem = sanitizeDownloadBaseName(
       String(sourceFileName || "")
@@ -2798,21 +2775,14 @@ app.post("/api/narrate-stream", async (req, res) => {
     let finalFormat: "mp3" | "m4b" = "mp3";
     let mimeType = "audio/mpeg";
 
-    if (outputFormat === "m4b") {
-      try {
-        await ensureFfmpeg();
+    try {
+      await ensureFfmpeg();
+      if (outputFormat === "m4b") {
         const m4bPath = path.join(NARRATION_TMP_DIR, `${audioId}.m4b`);
-        sendEvent({
-          type: "status",
-          step: "encoding",
-          current: pcmParts,
-          total: totalChunks,
-          percent: 70,
-          message: "Montando arquivo M4B…",
-        });
-        await mp3ToM4b({
-          mp3Path,
+        await pcmToM4b({
+          pcmPath,
           outputPath: m4bPath,
+          sampleRate,
           artworkPaths:
             type === "epub"
               ? artworkPaths
@@ -2821,8 +2791,7 @@ app.post("/api/narrate-stream", async (req, res) => {
                 : [],
           title: bookStem,
           onProgress: (p) => {
-            const pct =
-              p.percent != null ? Math.round(70 + p.percent * 0.3) : null;
+            const pct = p.percent != null ? Math.round(p.percent) : null;
             sendEvent({
               type: "status",
               step: "encoding",
@@ -2831,23 +2800,50 @@ app.post("/api/narrate-stream", async (req, res) => {
               percent: pct,
               message:
                 p.percent != null
-                  ? `Montando M4B… ${Math.round(p.percent)}%`
-                  : "Montando M4B…",
+                  ? `Normalizando e codificando M4B… ${Math.round(p.percent)}%`
+                  : "Normalizando e codificando M4B…",
             });
           },
+          signal: taskAbort?.signal,
         });
-        await fs.promises.unlink(mp3Path).catch(() => undefined);
         finalAudioPath = m4bPath;
         finalFormat = "m4b";
         mimeType = "audio/mp4";
-      } catch (m4bErr: any) {
-        sendEvent({
-          type: "error",
-          error: m4bErr?.message || "Falha ao gerar o arquivo M4B.",
+      } else {
+        await pcmToMp3({
+          pcmPath,
+          outputPath: mp3Path,
+          sampleRate,
+          onProgress: (p) => {
+            const pct = p.percent != null ? Math.round(p.percent) : null;
+            sendEvent({
+              type: "status",
+              step: "encoding",
+              current: pcmParts,
+              total: totalChunks,
+              percent: pct,
+              message:
+                p.percent != null
+                  ? `Normalizando e codificando MP3… ${Math.round(p.percent)}%`
+                  : "Normalizando e codificando MP3…",
+            });
+          },
+          signal: taskAbort?.signal,
         });
-        return res.end();
       }
+    } catch (encodeErr: any) {
+      sendEvent({
+        type: "error",
+        error:
+          encodeErr?.message ||
+          `Falha ao gerar o arquivo ${outputFormat === "m4b" ? "M4B" : "MP3"}.`,
+      });
+      return res.end();
     }
+    const encodedBytes = (await fs.promises.stat(finalAudioPath)).size;
+    console.log(
+      `[NarrateStream] Encoded ${finalFormat.toUpperCase()} ${encodedBytes} bytes from ${pcmBytes} PCM bytes (${pcmParts} parts)`
+    );
 
     narrationArtifacts.set(audioId, {
       mp3Path: finalAudioPath,
@@ -2934,6 +2930,7 @@ app.post("/api/narrate", async (req, res) => {
     const mp3Path = path.join(NARRATION_TMP_DIR, `${audioId}.mp3`);
     let pcmBytes = 0;
     let sampleRate = 24000;
+    let failedChunk: number | null = null;
 
     for (let i = 0; i < textChunks.length; i++) {
       const chunk = textChunks[i];
@@ -2943,7 +2940,7 @@ app.post("/api/narrate", async (req, res) => {
         if (breakSeconds != null) {
           const pcm = silencePcmS16le(sampleRate, breakSeconds);
           if (pcm.length > 0) {
-            await fs.promises.appendFile(pcmPath, pcm);
+            await appendPcmWithDeclick(pcmPath, pcm, sampleRate);
             pcmBytes += pcm.length;
           }
           continue;
@@ -2963,12 +2960,21 @@ app.post("/api/narrate", async (req, res) => {
         );
         sampleRate = sr;
         if (pcm.length > 0) {
-          await fs.promises.appendFile(pcmPath, pcm);
+          await appendPcmWithDeclick(pcmPath, pcm, sampleRate);
           pcmBytes += pcm.length;
         }
       } catch (ttsErr: any) {
         console.warn(`[Narrate Legacy] Chunk ${i + 1} failed:`, ttsErr?.message || ttsErr);
+        failedChunk = i + 1;
+        break;
       }
+    }
+
+    if (failedChunk != null) {
+      await fs.promises.unlink(pcmPath).catch(() => undefined);
+      return res.status(500).json({
+        error: `Narração incompleta: falha no bloco ${failedChunk} de ${textChunks.length}.`,
+      });
     }
 
     if (pcmBytes === 0) {
@@ -2978,7 +2984,8 @@ app.post("/api/narrate", async (req, res) => {
       });
     }
 
-    await encodePcmFileToMp3File(pcmPath, mp3Path, sampleRate, 128);
+    await ensureFfmpeg();
+    await pcmToMp3({ pcmPath, outputPath: mp3Path, sampleRate });
     await fs.promises.unlink(pcmPath).catch(() => undefined);
     narrationArtifacts.set(audioId, {
       mp3Path,

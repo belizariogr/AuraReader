@@ -168,8 +168,15 @@ def resolve_model_path(folder_name: str) -> str:
 
 def float_to_pcm16_b64(audio: np.ndarray) -> str:
     audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-    audio = np.clip(audio, -1.0, 1.0)
-    pcm = (audio * 32767.0).astype(np.int16)
+    if not audio.size:
+        return ""
+    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+    # Keep consistent codec headroom and attenuate overshoots without hard clipping.
+    audio *= np.float32(10.0 ** (-1.0 / 20.0))
+    peak = float(np.max(np.abs(audio)))
+    if peak > 1.0:
+        audio *= np.float32(0.999 / peak)
+    pcm = np.rint(audio * 32767.0).astype(np.int16)
     return base64.b64encode(pcm.tobytes()).decode("ascii")
 
 
