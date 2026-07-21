@@ -202,127 +202,8 @@ function runFfmpeg(
   });
 }
 
-type LoudnessMeasurement = {
-  inputI: number;
-  inputTp: number;
-  inputLra: number;
-  inputThresh: number;
-  targetOffset: number;
-};
-
-const NARRATION_LOUDNESS_I = -19;
-const NARRATION_TRUE_PEAK = -1.5;
-const NARRATION_LRA = 11;
-
 function pcmDurationSeconds(pcmPath: string, sampleRate: number): Promise<number> {
   return fs.promises.stat(pcmPath).then((stat) => stat.size / (sampleRate * 2));
-}
-
-/** First loudnorm pass. The measured values let the encode pass preserve dynamics. */
-async function analyzePcmLoudness(
-  pcmPath: string,
-  sampleRate: number,
-  signal?: AbortSignal
-): Promise<LoudnessMeasurement | null> {
-  await ensureFfmpeg();
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new DOMException("Conversão cancelada.", "AbortError"));
-      return;
-    }
-
-    const child = spawn(
-      ffmpegBin(),
-      [
-        "-hide_banner",
-        "-nostats",
-        "-f",
-        "s16le",
-        "-ar",
-        String(sampleRate),
-        "-ac",
-        "1",
-        "-i",
-        pcmPath,
-        "-af",
-        `loudnorm=I=${NARRATION_LOUDNESS_I}:TP=${NARRATION_TRUE_PEAK}:LRA=${NARRATION_LRA}:print_format=json`,
-        "-f",
-        "null",
-        "-",
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] }
-    );
-    let stderr = "";
-    let settled = false;
-
-    const cleanup = () => signal?.removeEventListener("abort", onAbort);
-    const onAbort = () => child.kill("SIGKILL");
-    signal?.addEventListener("abort", onAbort);
-
-    child.stderr?.on("data", (data) => {
-      stderr += String(data);
-    });
-    child.on("error", (err) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(err);
-    });
-    child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (signal?.aborted) {
-        reject(new DOMException("Conversão cancelada.", "AbortError"));
-        return;
-      }
-      if (code !== 0) {
-        reject(new Error(`Análise de loudness falhou (código ${code}): ${stderr.slice(-1200)}`));
-        return;
-      }
-
-      const blocks = stderr.match(/\{[\s\S]*?\}/g);
-      const raw = blocks?.at(-1);
-      if (!raw) {
-        reject(new Error("O ffmpeg não retornou as medições de loudness."));
-        return;
-      }
-      try {
-        const parsed = JSON.parse(raw) as Record<string, string>;
-        const measurement: LoudnessMeasurement = {
-          inputI: Number(parsed.input_i),
-          inputTp: Number(parsed.input_tp),
-          inputLra: Number(parsed.input_lra),
-          inputThresh: Number(parsed.input_thresh),
-          targetOffset: Number(parsed.target_offset),
-        };
-        if (Object.values(measurement).some((value) => !Number.isFinite(value))) {
-          // Very short or silent inputs do not have an integrated loudness value.
-          resolve(null);
-          return;
-        }
-        resolve(measurement);
-      } catch (err: any) {
-        reject(new Error(`Falha ao interpretar loudness: ${err?.message || err}`));
-      }
-    });
-  });
-}
-
-function measuredLoudnormFilter(measured: LoudnessMeasurement | null): string {
-  if (!measured) return "anull";
-  return [
-    `loudnorm=I=${NARRATION_LOUDNESS_I}`,
-    `TP=${NARRATION_TRUE_PEAK}`,
-    `LRA=${NARRATION_LRA}`,
-    `measured_I=${measured.inputI}`,
-    `measured_TP=${measured.inputTp}`,
-    `measured_LRA=${measured.inputLra}`,
-    `measured_thresh=${measured.inputThresh}`,
-    `offset=${measured.targetOffset}`,
-    "linear=true",
-    "print_format=summary",
-  ].join(":");
 }
 
 export async function pcmToMp3(opts: {
@@ -336,7 +217,6 @@ export async function pcmToMp3(opts: {
   const out = opts.outputPath || uniqueMediaPath("mp3");
   const sampleRate = opts.sampleRate || 24000;
   const totalSec = await pcmDurationSeconds(opts.pcmPath, sampleRate);
-  const measured = await analyzePcmLoudness(opts.pcmPath, sampleRate, opts.signal);
 
   await runFfmpeg(
     [
@@ -348,8 +228,6 @@ export async function pcmToMp3(opts: {
       "1",
       "-i",
       opts.pcmPath,
-      "-af",
-      measuredLoudnormFilter(measured),
       "-ar",
       String(sampleRate),
       "-ac",
@@ -358,6 +236,8 @@ export async function pcmToMp3(opts: {
       "libmp3lame",
       "-b:a",
       "160k",
+      "-compression_level",
+      "0",
       "-write_xing",
       "1",
       out,
@@ -380,7 +260,6 @@ export async function pcmToM4b(opts: {
   const out = opts.outputPath || uniqueMediaPath("m4b");
   const sampleRate = opts.sampleRate || 24000;
   const totalSec = await pcmDurationSeconds(opts.pcmPath, sampleRate);
-  const measured = await analyzePcmLoudness(opts.pcmPath, sampleRate, opts.signal);
   const artworks = (opts.artworkPaths || []).filter((p) => p && fs.existsSync(p));
   const args = [
     "-f",
@@ -397,8 +276,6 @@ export async function pcmToM4b(opts: {
   args.push("-map", "0:a");
   for (let i = 0; i < artworks.length; i++) args.push("-map", `${i + 1}:v`);
   args.push(
-    "-af",
-    measuredLoudnormFilter(measured),
     "-ar",
     String(sampleRate),
     "-ac",
@@ -408,7 +285,9 @@ export async function pcmToM4b(opts: {
     "-profile:a",
     "aac_low",
     "-b:a",
-    "128k"
+    "128k",
+    "-aac_coder",
+    "twoloop"
   );
   if (artworks.length > 0) args.push("-c:v", "mjpeg");
   for (let i = 0; i < artworks.length; i++) {
@@ -450,7 +329,7 @@ export async function mp3ToM4b(opts: {
     args.push("-map", `${i + 1}:v`);
   }
 
-  args.push("-c:a", "aac", "-b:a", "192k");
+  args.push("-c:a", "aac", "-b:a", "192k", "-aac_coder", "twoloop");
   if (artworks.length > 0) {
     args.push("-c:v", "mjpeg");
   }
@@ -488,7 +367,20 @@ export async function m4bToMp3AndCover(opts: {
   const totalSec = await probeDurationSeconds(opts.m4bPath);
 
   await runFfmpeg(
-    ["-i", opts.m4bPath, "-vn", "-c:a", "libmp3lame", "-q:a", "2", "-write_xing", "1", mp3Path],
+    [
+      "-i",
+      opts.m4bPath,
+      "-vn",
+      "-c:a",
+      "libmp3lame",
+      "-q:a",
+      "0",
+      "-compression_level",
+      "0",
+      "-write_xing",
+      "1",
+      mp3Path,
+    ],
     { totalSec, onProgress: opts.onProgress, signal: opts.signal }
   );
 

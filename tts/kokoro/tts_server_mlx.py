@@ -165,10 +165,8 @@ def float_to_pcm16_b64(audio: np.ndarray) -> str:
         return ""
 
     audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
-    # Apply the same fixed -1 dB gain to every chunk, reserving codec headroom
-    # without changing relative chunk loudness. Only attenuate further if the
-    # vocoder overshoots after that gain; never hard-clip the waveform.
-    audio *= np.float32(10.0 ** (-1.0 / 20.0))
+    # Preserve the model's original level. Only attenuate true overshoots so the
+    # int16 conversion cannot wrap; never hard-clip or boost the waveform.
     peak = float(np.max(np.abs(audio)))
     if peak > 1.0:
         audio *= np.float32(0.999 / peak)

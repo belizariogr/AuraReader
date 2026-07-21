@@ -1368,98 +1368,26 @@ async function saveChunkPcm(
   return meta;
 }
 
-/**
- * Fade only discontinuous endpoints to zero over a few milliseconds. This
- * removes clicks without overlapping independently synthesized phonemes.
- */
-function declickPcmBoundary(previous: Buffer, next: Buffer, sampleRate: number): void {
-  if (previous.length < 2 || next.length < 2) return;
-  const previousEnd = previous.readInt16LE(previous.length - 2);
-  const nextStart = next.readInt16LE(0);
-  if (Math.abs(previousEnd - nextStart) < 64) return;
-
-  const fadeSamples = Math.max(1, Math.round(sampleRate * 0.005));
-  const previousSamples = Math.floor(previous.length / 2);
-  const nextSamples = Math.floor(next.length / 2);
-  const tailCount = Math.min(fadeSamples, previousSamples);
-  const headCount = Math.min(fadeSamples, nextSamples);
-
-  for (let i = 0; i < tailCount; i++) {
-    const sampleIndex = previousSamples - tailCount + i;
-    const gain = (tailCount - i - 1) / tailCount;
-    previous.writeInt16LE(Math.round(previous.readInt16LE(sampleIndex * 2) * gain), sampleIndex * 2);
-  }
-  for (let i = 0; i < headCount; i++) {
-    const gain = (i + 1) / headCount;
-    next.writeInt16LE(Math.round(next.readInt16LE(i * 2) * gain), i * 2);
-  }
-}
-
-async function appendPcmWithDeclick(
-  outPath: string,
-  pcm: Buffer,
-  sampleRate: number
-): Promise<void> {
-  if (pcm.length === 0) return;
-  let file: fs.promises.FileHandle;
-  try {
-    file = await fs.promises.open(outPath, "r+");
-  } catch (err: any) {
-    if (err?.code === "ENOENT") {
-      await fs.promises.writeFile(outPath, pcm);
-      return;
-    }
-    throw err;
-  }
-
-  try {
-    const stat = await file.stat();
-    if (stat.size >= 2) {
-      const fadeBytes = Math.min(
-        stat.size - (stat.size % 2),
-        Math.max(2, Math.round(sampleRate * 0.005) * 2)
-      );
-      const tail = Buffer.alloc(fadeBytes);
-      await file.read(tail, 0, fadeBytes, stat.size - fadeBytes);
-      declickPcmBoundary(tail, pcm, sampleRate);
-      await file.write(tail, 0, fadeBytes, stat.size - fadeBytes);
-    }
-  } finally {
-    await file.close();
-  }
-  await fs.promises.appendFile(outPath, pcm);
-}
-
 async function concatCachedChunksToPcm(
   docId: string,
   totalChunks: number,
-  outPath: string,
-  sampleRate: number
+  outPath: string
 ): Promise<{ bytes: number; parts: number }> {
   const out = await fs.promises.open(outPath, "w");
   let bytes = 0;
   let parts = 0;
-  let pending: Buffer | null = null;
   try {
     for (let i = 0; i < totalChunks; i++) {
       const chunkPath = chunkPcmPath(docId, i);
       try {
         const pcm = await fs.promises.readFile(chunkPath);
         if (pcm.length === 0) continue;
-        if (pending) {
-          declickPcmBoundary(pending, pcm, sampleRate);
-          await out.write(pending);
-          bytes += pending.length;
-        }
-        pending = pcm;
+        await out.write(pcm);
+        bytes += pcm.length;
         parts += 1;
       } catch {
         throw new Error(`Bloco ${i + 1} ausente no cache de narração.`);
       }
-    }
-    if (pending) {
-      await out.write(pending);
-      bytes += pending.length;
     }
   } finally {
     await out.close();
@@ -2659,7 +2587,7 @@ app.post("/api/narrate-stream", async (req, res) => {
         completedSet.add(i);
       } else if (pcm.length > 0 && !docId) {
         // Fallback without doc UUID: append to ephemeral PCM (no resume)
-        await appendPcmWithDeclick(pcmPath, pcm, sampleRate);
+        await fs.promises.appendFile(pcmPath, pcm);
         completedSet.add(i);
       }
     }
@@ -2712,7 +2640,7 @@ app.post("/api/narrate-stream", async (req, res) => {
     let pcmBytes = 0;
     let pcmParts = completedCount;
     if (docId) {
-      const concat = await concatCachedChunksToPcm(docId, totalChunks, pcmPath, sampleRate);
+      const concat = await concatCachedChunksToPcm(docId, totalChunks, pcmPath);
       pcmBytes = concat.bytes;
       pcmParts = concat.parts;
       if (cacheMeta) {
@@ -2940,7 +2868,7 @@ app.post("/api/narrate", async (req, res) => {
         if (breakSeconds != null) {
           const pcm = silencePcmS16le(sampleRate, breakSeconds);
           if (pcm.length > 0) {
-            await appendPcmWithDeclick(pcmPath, pcm, sampleRate);
+            await fs.promises.appendFile(pcmPath, pcm);
             pcmBytes += pcm.length;
           }
           continue;
@@ -2960,7 +2888,7 @@ app.post("/api/narrate", async (req, res) => {
         );
         sampleRate = sr;
         if (pcm.length > 0) {
-          await appendPcmWithDeclick(pcmPath, pcm, sampleRate);
+          await fs.promises.appendFile(pcmPath, pcm);
           pcmBytes += pcm.length;
         }
       } catch (ttsErr: any) {

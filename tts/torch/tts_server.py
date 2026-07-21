@@ -256,9 +256,7 @@ def float_to_pcm16_b64(audio: np.ndarray) -> str:
     if not audio.size:
         return ""
     audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
-    # Fixed -1 dB headroom is identical for every chunk. Attenuate exceptional
-    # vocoder overshoots instead of hard-clipping them.
-    audio *= np.float32(10.0 ** (-1.0 / 20.0))
+    # Preserve the original level and attenuate only exceptional overshoots.
     peak = float(np.max(np.abs(audio)))
     if peak > 1.0:
         audio *= np.float32(0.999 / peak)
