@@ -206,6 +206,14 @@ function pcmDurationSeconds(pcmPath: string, sampleRate: number): Promise<number
   return fs.promises.stat(pcmPath).then((stat) => stat.size / (sampleRate * 2));
 }
 
+/**
+ * MP3/AAC use fixed block sizes in samples, so at 24 kHz each block spans twice
+ * as much time as at 48 kHz and plosives ("t", "k") smear into a "ch"-like
+ * pre-echo. Upsampling 2x before the codec halves the block duration and keeps
+ * transients crisp; it adds no fake frequency content.
+ */
+const ENCODE_SAMPLE_RATE = 48000;
+
 export async function pcmToMp3(opts: {
   pcmPath: string;
   outputPath?: string;
@@ -228,14 +236,14 @@ export async function pcmToMp3(opts: {
       "1",
       "-i",
       opts.pcmPath,
-      "-ar",
-      String(sampleRate),
+      "-af",
+      `aresample=${ENCODE_SAMPLE_RATE}:filter_size=64:cutoff=0.97`,
       "-ac",
       "1",
       "-c:a",
       "libmp3lame",
-      "-b:a",
-      "160k",
+      "-q:a",
+      "0",
       "-compression_level",
       "0",
       "-write_xing",
@@ -276,8 +284,8 @@ export async function pcmToM4b(opts: {
   args.push("-map", "0:a");
   for (let i = 0; i < artworks.length; i++) args.push("-map", `${i + 1}:v`);
   args.push(
-    "-ar",
-    String(sampleRate),
+    "-af",
+    `aresample=${ENCODE_SAMPLE_RATE}:filter_size=64:cutoff=0.97`,
     "-ac",
     "1",
     "-c:a",
@@ -285,7 +293,7 @@ export async function pcmToM4b(opts: {
     "-profile:a",
     "aac_low",
     "-b:a",
-    "128k",
+    "160k",
     "-aac_coder",
     "twoloop"
   );
