@@ -619,19 +619,18 @@ function stripHtml(html: string): string {
   return sanitizeExtractedText(text);
 }
 
-const QWEN_PAUSE_MARK = "...";
 const BREAK_LINE_RE = /^<break\s+time="([\d.]+)s"\s*\/?\s*>$/i;
 
-function formatKokoroBreak(seconds: number): string {
-  const clamped = Math.min(1, Math.max(0.25, seconds));
+function formatBreak(seconds: number): string {
+  const clamped = Math.min(10, Math.max(0.25, seconds));
   const label = Number.isInteger(clamped) ? String(clamped) : clamped.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
   return `<break time="${label}s" />`;
 }
 
-/** 2 line-breaks → 0.25s; +0.25s per extra break; capped at 1s. */
+/** Each empty line → 0.25s. Break markers are only emitted when this exceeds 1s. */
 function pauseSecondsForEmptyLines(emptyLineCount: number): number {
   if (emptyLineCount < 1) return 0;
-  return Math.min(1, emptyLineCount * 0.25);
+  return emptyLineCount * 0.25;
 }
 
 function isPauseLine(line: string): boolean {
@@ -643,30 +642,28 @@ function parseBreakSeconds(line: string): number | null {
   const m = line.trim().match(BREAK_LINE_RE);
   if (!m) return null;
   const sec = Number(m[1]);
-  return Number.isFinite(sec) && sec > 0 ? Math.min(1, sec) : 0.25;
+  return Number.isFinite(sec) && sec > 0 ? Math.min(10, sec) : 0.25;
 }
 
 function pauseSecondsFromMarker(line: string): number {
   return parseBreakSeconds(line) ?? 0.25;
 }
 
-/** Silent PCM s16le for Kokoro pause markers (engine does not honor SSML). */
+/** Silent PCM s16le for `<break>` markers (TTS engines do not honor SSML). */
 function silencePcmS16le(sampleRate: number, seconds: number): Buffer {
   const samples = Math.max(0, Math.floor(sampleRate * seconds));
   return Buffer.alloc(samples * 2);
 }
 
-function pushOrMergePause(collapsed: string[], mark: string, engine: TtsEngineId): void {
+function pushOrMergePause(collapsed: string[], mark: string): void {
   if (collapsed.length === 0) return; // drop leading pauses
   const last = collapsed[collapsed.length - 1];
   if (isPauseLine(last)) {
-    if (engine === "kokoro") {
-      const merged = Math.min(
-        1,
-        Math.max(pauseSecondsFromMarker(last), pauseSecondsFromMarker(mark))
-      );
-      collapsed[collapsed.length - 1] = formatKokoroBreak(merged);
-    }
+    const merged = Math.min(
+      10,
+      Math.max(pauseSecondsFromMarker(last), pauseSecondsFromMarker(mark))
+    );
+    collapsed[collapsed.length - 1] = formatBreak(merged);
     return;
   }
   collapsed.push(mark);
@@ -675,8 +672,6 @@ function pushOrMergePause(collapsed: string[], mark: string, engine: TtsEngineId
 /** Remove control chars, markup leftovers, and OCR/LLM junk before TTS and display. */
 function sanitizeExtractedText(raw: string): string {
   if (!raw) return "";
-
-  const engine = activeTtsEngine();
 
   let text = decodeHtmlEntities(raw)
     // Strip Markdown code fences and heading markers often added by LLMs
@@ -709,12 +704,17 @@ function sanitizeExtractedText(raw: string): string {
 
   const flushEmptyRun = () => {
     if (emptyRun < 1) return;
-    const seconds = pauseSecondsForEmptyLines(emptyRun);
+    const count = emptyRun;
+    const seconds = pauseSecondsForEmptyLines(count);
     emptyRun = 0;
-    if (seconds <= 0) return;
-    const mark =
-      engine === "kokoro" ? formatKokoroBreak(seconds) : QWEN_PAUSE_MARK;
-    pushOrMergePause(collapsed, mark, engine);
+    // Only inject silence when the gap is longer than 1s; otherwise keep plain \n.
+    if (seconds > 1) {
+      pushOrMergePause(collapsed, formatBreak(seconds));
+      return;
+    }
+    for (let i = 0; i < count; i++) {
+      collapsed.push("");
+    }
   };
 
   for (const line of lines) {
@@ -724,11 +724,7 @@ function sanitizeExtractedText(raw: string): string {
     }
     flushEmptyRun();
     if (isPauseLine(line)) {
-      const mark =
-        engine === "kokoro"
-          ? formatKokoroBreak(pauseSecondsFromMarker(line))
-          : QWEN_PAUSE_MARK;
-      pushOrMergePause(collapsed, mark, engine);
+      pushOrMergePause(collapsed, formatBreak(pauseSecondsFromMarker(line)));
       continue;
     }
     collapsed.push(line);
@@ -1153,7 +1149,7 @@ async function extractDocumentText(options: {
 
 // Helper: Split text into natural chunks of maximum character count (approx. natural sentence/paragraph bounds)
 // Qwen lite works well with moderate length (~5–20s of speech ≈ 120–280 chars).
-// Pause markers (`...` or Kokoro <break>) stay as their own chunks.
+// Pause markers (`...` or `<break time="…" />`) stay as their own chunks.
 function splitTextIntoChunks(text: string, maxChunkLength = 240): string[] {
   const paragraphs = text.split(/\n+/);
   const chunks: string[] = [];
@@ -2592,9 +2588,7 @@ app.post("/api/narrate-stream", async (req, res) => {
       });
 
       const breakSeconds =
-        engine === "kokoro"
-          ? parseBreakSeconds(chunk) ?? (chunk.trim() === "..." ? 0.25 : null)
-          : null;
+        parseBreakSeconds(chunk) ?? (chunk.trim() === "..." ? 0.25 : null);
 
       let pcm: Buffer = Buffer.alloc(0);
       let cancelled = false;
@@ -2945,9 +2939,7 @@ app.post("/api/narrate", async (req, res) => {
       const chunk = textChunks[i];
       try {
         const breakSeconds =
-          engine === "kokoro"
-            ? parseBreakSeconds(chunk) ?? (chunk.trim() === "..." ? 0.25 : null)
-            : null;
+          parseBreakSeconds(chunk) ?? (chunk.trim() === "..." ? 0.25 : null);
         if (breakSeconds != null) {
           const pcm = silencePcmS16le(sampleRate, breakSeconds);
           if (pcm.length > 0) {
